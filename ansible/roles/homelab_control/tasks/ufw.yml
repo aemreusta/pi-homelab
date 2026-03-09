@@ -1,0 +1,9 @@
+---
+- name: Allow homelab control API through UFW (LAN only)
+  community.general.ufw:
+    rule: allow
+    port: "{{ homelab_control_port | string }}"
+    proto: tcp
+    from_ip: 192.168.1.0/24
+    comment: Homelab Control API (LAN only)
+  become: true

@@ -1,0 +1,6 @@
+---
+- name: Deploy Maintainerr media cleanup
+  hosts: pi
+  become: true
+  roles:
+    - maintainerr

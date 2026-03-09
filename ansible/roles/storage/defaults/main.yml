@@ -1,0 +1,13 @@
+---
+storage_owner: emre
+storage_group: emre
+
+storage_directories:
+  - /srv/docker
+  - /srv/media
+  - /srv/media/movies
+  - /srv/media/series
+  - /srv/downloads
+  - /srv/downloads/incomplete
+  - /srv/downloads/complete
+  - /srv/backups

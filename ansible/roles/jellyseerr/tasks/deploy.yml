@@ -1,0 +1,32 @@
+---
+- name: Create Jellyseerr compose directory
+  ansible.builtin.file:
+    path: "{{ jellyseerr_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create Jellyseerr config directory
+  ansible.builtin.file:
+    path: "{{ jellyseerr_config_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Copy Jellyseerr docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ jellyseerr_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart jellyseerr
+
+- name: Start Jellyseerr container
+  community.docker.docker_compose_v2:
+    project_src: "{{ jellyseerr_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

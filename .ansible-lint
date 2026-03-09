@@ -1,0 +1,33 @@
+---
+offline: true
+
+exclude_paths:
+  - ansible/roles/*/tests/
+
+mock_roles:
+  - common
+  - security
+  - storage
+  - docker
+  - adguard
+  - portainer
+  - media
+  - watchtower
+  - homepage
+  - glances
+  - filebrowser
+  - homelab_control
+  - tailscale
+  - traefik
+  - maintainerr
+  - jellyseerr
+
+mock_modules:
+  - community.general.timezone
+  - community.general.ufw
+  - ansible.posix.sysctl
+  - community.docker.docker_compose_v2
+
+# args[module] fires false positives for mocked modules in offline mode
+warn_list:
+  - args[module]

@@ -1,0 +1,4 @@
+---
+homelab_control_dir: /opt/homelab/control
+homelab_control_port: 9099
+homelab_control_token: "{{ vault_homelab_control_token }}"

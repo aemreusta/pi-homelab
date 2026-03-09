@@ -1,0 +1,24 @@
+---
+timezone: Europe/Istanbul
+
+base_packages:
+  - git
+  - curl
+  - htop
+  - vim
+  - ca-certificates
+  - gnupg
+  - lsb-release
+
+sysctl_settings:
+  # Docker networking — required for container traffic forwarding
+  net.ipv4.ip_forward: 1
+  # network hardening
+  net.ipv4.tcp_syncookies: 1
+  net.ipv4.conf.all.rp_filter: 1
+  net.ipv4.conf.default.rp_filter: 1
+  net.ipv4.icmp_echo_ignore_broadcasts: 1
+  # memory / IO tuning (SSD + Docker friendly)
+  vm.swappiness: 10
+  vm.dirty_background_ratio: 5
+  vm.dirty_ratio: 20

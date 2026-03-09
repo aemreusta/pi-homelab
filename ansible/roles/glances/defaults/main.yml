@@ -1,0 +1,3 @@
+---
+glances_compose_dir: /home/{{ docker_user }}/docker/core/glances
+glances_tz: "{{ timezone }}"

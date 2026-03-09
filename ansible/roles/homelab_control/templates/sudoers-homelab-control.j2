@@ -1,0 +1,3 @@
+# Allow homelab control scripts to run without password
+{{ docker_user }} ALL=(ALL) NOPASSWD: {{ homelab_control_dir }}/shutdown.sh
+{{ docker_user }} ALL=(ALL) NOPASSWD: {{ homelab_control_dir }}/restart.sh

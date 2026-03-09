@@ -1,0 +1,6 @@
+---
+filebrowser_compose_dir: /home/{{ docker_user }}/docker/core/filebrowser
+filebrowser_config_dir: /home/{{ docker_user }}/docker/core/filebrowser/config
+filebrowser_tz: "{{ timezone }}"
+# Root directory exposed by FileBrowser
+filebrowser_root: /srv

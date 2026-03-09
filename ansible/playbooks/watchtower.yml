@@ -1,0 +1,6 @@
+---
+- name: Deploy Watchtower auto-updater
+  hosts: pi
+  become: true
+  roles:
+    - watchtower

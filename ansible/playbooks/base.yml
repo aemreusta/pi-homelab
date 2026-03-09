@@ -1,0 +1,10 @@
+---
+- name: Base provisioning
+  hosts: pi
+  become: true
+
+  roles:
+    - common
+    - security
+    - storage
+    - docker

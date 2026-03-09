@@ -1,0 +1,123 @@
+---
+# Media stack - all services share /srv as a single mount point
+# so hardlinks work between /downloads and /media (same filesystem + mount).
+#
+# Workflow:
+#   1. Prowlarr provides indexers to Sonarr/Radarr
+#   2. Sonarr/Radarr search via Prowlarr, send to qBittorrent
+#   3. qBittorrent downloads to /data/downloads/incomplete
+#   4. qBittorrent moves completed to /data/downloads/complete
+#   5. Sonarr/Radarr imports with hardlinks to /data/media/{movies,series}
+#   6. Jellyfin scans /data/media library
+#
+# CRITICAL: /srv is mounted as /data in all containers.
+# This ensures hardlinks work because source and target are on the
+# same mount point from the container's perspective.
+
+services:
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    restart: unless-stopped
+    environment:
+      - PUID={{ media_puid }}
+      - PGID={{ media_pgid }}
+      - TZ={{ media_tz }}
+      - WEBUI_PORT=8181
+    ports:
+      - "8181:8181"
+      - "6881:6881"
+      - "6881:6881/udp"
+    volumes:
+      - {{ media_config_dir }}/qbittorrent:/config
+      - /srv:/data
+    networks:
+      - media_net
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    restart: unless-stopped
+    environment:
+      - PUID={{ media_puid }}
+      - PGID={{ media_pgid }}
+      - TZ={{ media_tz }}
+    ports:
+      - "8989:8989"
+    volumes:
+      - {{ media_config_dir }}/sonarr:/config
+      - /srv:/data
+    networks:
+      - media_net
+    depends_on:
+      - qbittorrent
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    restart: unless-stopped
+    environment:
+      - PUID={{ media_puid }}
+      - PGID={{ media_pgid }}
+      - TZ={{ media_tz }}
+    ports:
+      - "7878:7878"
+    volumes:
+      - {{ media_config_dir }}/radarr:/config
+      - /srv:/data
+    networks:
+      - media_net
+    depends_on:
+      - qbittorrent
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    restart: unless-stopped
+    environment:
+      - PUID={{ media_puid }}
+      - PGID={{ media_pgid }}
+      - TZ={{ media_tz }}
+    ports:
+      - "9696:9696"
+    volumes:
+      - {{ media_config_dir }}/prowlarr:/config
+    networks:
+      - media_net
+    depends_on:
+      - flaresolverr
+
+  # Headless browser to solve Cloudflare challenges for Prowlarr indexers
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=info
+      - TZ={{ media_tz }}
+    ports:
+      - "8191:8191"
+    networks:
+      - media_net
+
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    environment:
+      - PUID={{ media_puid }}
+      - PGID={{ media_pgid }}
+      - TZ={{ media_tz }}
+      - JELLYFIN_PublishedServerUrl=jellyfin.homelab
+    ports:
+      - "8096:8096"
+    volumes:
+      - {{ media_config_dir }}/jellyfin:/config
+      - /srv/media:/data/media:ro
+    # No hardware transcoding — Pi 4B direct play only (HEVC/x265)
+    networks:
+      - media_net
+
+networks:
+  media_net:
+    driver: bridge

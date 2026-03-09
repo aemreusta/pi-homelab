@@ -1,0 +1,26 @@
+---
+homepage_compose_dir: /home/{{ docker_user }}/docker/core/homepage
+homepage_config_dir: /home/{{ docker_user }}/docker/core/homepage/config
+
+# Dashboard assets
+homepage_background_url: "https://cdn.trabzonspor.org.tr/183b32fd24a448ac945ef429da96e59e.jpg"
+homepage_logo_url: "https://cdn.trabzonspor.org.tr/trabzonspor_2bf6f45f5cc14cbe815f9466832042c9.png"
+
+# Service widget credentials (sourced from vault.yml)
+homepage_qbittorrent_username: "{{ vault_qbittorrent_username }}"
+homepage_qbittorrent_password: "{{ vault_qbittorrent_password }}"
+
+# Media service API keys (sourced from vault.yml)
+homepage_jellyfin_api_key: "{{ vault_jellyfin_api_key }}"
+homepage_sonarr_api_key: "{{ vault_sonarr_api_key }}"
+homepage_radarr_api_key: "{{ vault_radarr_api_key }}"
+homepage_prowlarr_api_key: "{{ vault_prowlarr_api_key }}"
+homepage_jellyseerr_api_key: "{{ vault_jellyseerr_api_key }}"
+
+# NextDNS
+homepage_nextdns_profile: "814aa4"
+homepage_nextdns_api_key: "{{ vault_nextdns_api_key }}"
+
+# Control API
+homepage_control_port: 9099
+homepage_control_token: "{{ vault_homelab_control_token }}"

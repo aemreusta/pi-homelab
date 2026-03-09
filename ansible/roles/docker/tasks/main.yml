@@ -1,0 +1,9 @@
+---
+- name: Include Docker install tasks
+  ansible.builtin.include_tasks: install.yml
+
+- name: Include Docker config tasks
+  ansible.builtin.include_tasks: config.yml
+
+- name: Include Docker firewall tasks
+  ansible.builtin.include_tasks: firewall.yml

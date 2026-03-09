@@ -1,0 +1,74 @@
+---
+- name: Create Homepage compose directory
+  ansible.builtin.file:
+    path: "{{ homepage_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create Homepage config directory
+  ansible.builtin.file:
+    path: "{{ homepage_config_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Copy Homepage docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ homepage_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart homepage
+
+- name: Create Homepage images directory
+  ansible.builtin.file:
+    path: "{{ homepage_config_dir }}/images"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Download dashboard background image
+  ansible.builtin.get_url:
+    url: "{{ homepage_background_url }}"
+    dest: "{{ homepage_config_dir }}/images/background.jpg"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+    force: false
+
+- name: Download Trabzonspor logo
+  ansible.builtin.get_url:
+    url: "{{ homepage_logo_url }}"
+    dest: "{{ homepage_config_dir }}/images/ts-logo.png"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+    force: false
+
+- name: Copy Homepage configuration files
+  ansible.builtin.template:
+    src: "{{ item }}"
+    dest: "{{ homepage_config_dir }}/{{ item | replace('.j2', '') }}"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  loop:
+    - services.yaml.j2
+    - settings.yaml.j2
+    - docker.yaml.j2
+    - widgets.yaml.j2
+    - bookmarks.yaml.j2
+    - custom.css.j2
+  notify: Restart homepage
+
+- name: Start Homepage container
+  community.docker.docker_compose_v2:
+    project_src: "{{ homepage_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

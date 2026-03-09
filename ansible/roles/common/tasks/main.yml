@@ -1,0 +1,15 @@
+---
+- name: Include package tasks
+  ansible.builtin.include_tasks: packages.yml
+
+- name: Include timezone tasks
+  ansible.builtin.include_tasks: timezone.yml
+
+- name: Include sysctl tasks
+  ansible.builtin.include_tasks: sysctl.yml
+
+- name: Include DNS fallback tasks
+  ansible.builtin.include_tasks: dns.yml
+
+- name: Include WiFi disable tasks
+  ansible.builtin.include_tasks: wifi.yml

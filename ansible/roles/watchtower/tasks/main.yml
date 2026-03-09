@@ -1,0 +1,6 @@
+---
+- name: Include Watchtower deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+
+# Watchtower does not expose any ports (communicates via Docker socket only),
+# so no UFW rules are needed.

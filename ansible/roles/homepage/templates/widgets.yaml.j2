@@ -1,0 +1,32 @@
+---
+- logo:
+    icon: /images/ts-logo.png
+
+- greeting:
+    text_size: xl
+    text: Homelab
+
+- datetime:
+    text_size: lg
+    format:
+      timeStyle: short
+      dateStyle: long
+      hourCycle: h23
+
+- openmeteo:
+    label: Istanbul
+    latitude: 41.01
+    longitude: 28.97
+    timezone: {{ timezone }}
+    units: metric
+
+- search:
+    provider: google
+    target: _blank
+
+- resources:
+    cpu: true
+    memory: true
+    cputemp: true
+    uptime: true
+    disk: /

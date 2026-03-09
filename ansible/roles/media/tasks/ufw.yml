@@ -1,0 +1,35 @@
+---
+- name: Allow qBittorrent WebUI through UFW
+  community.general.ufw:
+    rule: allow
+    port: "8181"
+    proto: tcp
+    comment: qBittorrent WebUI
+
+- name: Allow Sonarr through UFW
+  community.general.ufw:
+    rule: allow
+    port: "8989"
+    proto: tcp
+    comment: Sonarr
+
+- name: Allow Radarr through UFW
+  community.general.ufw:
+    rule: allow
+    port: "7878"
+    proto: tcp
+    comment: Radarr
+
+- name: Allow Prowlarr through UFW
+  community.general.ufw:
+    rule: allow
+    port: "9696"
+    proto: tcp
+    comment: Prowlarr
+
+- name: Allow Jellyfin HTTP through UFW
+  community.general.ufw:
+    rule: allow
+    port: "8096"
+    proto: tcp
+    comment: Jellyfin HTTP

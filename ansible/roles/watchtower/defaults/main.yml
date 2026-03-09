@@ -1,0 +1,5 @@
+---
+watchtower_compose_dir: /home/{{ docker_user }}/docker/core/watchtower
+watchtower_tz: "{{ timezone }}"
+# Check for updates once per day (86400 seconds)
+watchtower_interval: "86400"

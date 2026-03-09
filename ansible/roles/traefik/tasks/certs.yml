@@ -1,0 +1,37 @@
+---
+# Generate TLS certificates using Tailscale's built-in cert authority.
+# Requires Tailscale to be running and HTTPS enabled in admin console.
+# Certs are valid for 90 days and auto-renewed by tailscaled.
+
+- name: Generate Tailscale TLS certificate # noqa: command-instead-of-module no-changed-when
+  ansible.builtin.command:
+    cmd: >-
+      tailscale cert
+      --cert-file={{ traefik_certs_dir }}/{{ traefik_tailscale_fqdn }}.crt
+      --key-file={{ traefik_certs_dir }}/{{ traefik_tailscale_fqdn }}.key
+      {{ traefik_tailscale_fqdn }}
+  notify: Restart traefik
+
+- name: Set certificate file permissions
+  ansible.builtin.file:
+    path: "{{ item }}"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0600"
+  loop:
+    - "{{ traefik_certs_dir }}/{{ traefik_tailscale_fqdn }}.crt"
+    - "{{ traefik_certs_dir }}/{{ traefik_tailscale_fqdn }}.key"
+
+- name: Set up monthly TLS certificate renewal cron
+  ansible.builtin.cron:
+    name: "Renew Tailscale TLS cert for Traefik"
+    minute: "0"
+    hour: "3"
+    day: "1"
+    job: >-
+      tailscale cert
+      --cert-file={{ traefik_certs_dir }}/{{ traefik_tailscale_fqdn }}.crt
+      --key-file={{ traefik_certs_dir }}/{{ traefik_tailscale_fqdn }}.key
+      {{ traefik_tailscale_fqdn }}
+      && docker restart traefik
+      >> /var/log/tailscale-cert-renew.log 2>&1

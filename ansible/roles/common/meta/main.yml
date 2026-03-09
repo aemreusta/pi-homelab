@@ -1,0 +1,15 @@
+---
+galaxy_info:
+  author: emre
+  description: Common base configuration for Raspberry Pi
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+  galaxy_tags:
+    - raspberry
+    - homelab
+
+dependencies: []

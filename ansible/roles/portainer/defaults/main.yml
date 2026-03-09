@@ -1,0 +1,4 @@
+---
+portainer_compose_dir: /home/{{ docker_user }}/docker/core/portainer
+portainer_data_dir: /home/{{ docker_user }}/docker/core/portainer/data
+portainer_tz: "{{ timezone }}"

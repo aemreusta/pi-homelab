@@ -1,0 +1,14 @@
+---
+# Traefik — reverse proxy for *.homelab domains
+# network_mode: host — all backend services publish on localhost ports
+
+services:
+  traefik:
+    image: {{ traefik_image }}
+    container_name: traefik
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - {{ traefik_config_dir }}/traefik.yml:/etc/traefik/traefik.yml:ro
+      - {{ traefik_config_dir }}/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - {{ traefik_certs_dir }}:/certs:ro

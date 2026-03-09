@@ -1,0 +1,44 @@
+# === OS ===
+.DS_Store
+._*
+Thumbs.db
+*~
+
+# === Editors / IDEs ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Ansible ===
+*.retry
+.ansible/
+ansible/**/*.vault
+ansible/**/*vault*
+!ansible/**/*vault*.example
+
+# === Secrets / credentials ===
+*.pem
+*.key
+*.crt
+*.p12
+.env
+.env.*
+!.env.example
+secrets/
+id_rsa*
+id_ed25519*
+
+# === Python ===
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# === Docker ===
+docker-compose.override.yml
+
+# === Misc ===
+*.log
+*.bak
+*.tmp

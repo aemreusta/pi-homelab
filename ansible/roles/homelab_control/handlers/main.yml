@@ -1,0 +1,7 @@
+---
+- name: Restart homelab-control
+  ansible.builtin.systemd:
+    name: homelab-control
+    state: restarted
+    daemon_reload: true
+  become: true

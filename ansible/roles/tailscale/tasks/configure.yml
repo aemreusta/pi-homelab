@@ -1,0 +1,32 @@
+---
+- name: Check Tailscale status # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: tailscale status --json
+  register: tailscale_status
+  changed_when: false
+  failed_when: false
+
+- name: Set Tailscale connection state
+  ansible.builtin.set_fact:
+    tailscale_needs_auth: >-
+      {{ tailscale_status.rc != 0 or
+         (tailscale_status.stdout | from_json).BackendState != "Running" }}
+
+- name: Authenticate and configure Tailscale # noqa: command-instead-of-module no-changed-when
+  ansible.builtin.command:
+    cmd: >-
+      tailscale up
+      --authkey={{ tailscale_auth_key }}
+      --hostname={{ tailscale_hostname }}
+      --advertise-routes={{ tailscale_advertise_routes }}
+      --accept-routes
+      {% if tailscale_accept_dns %}--accept-dns{% endif %}
+      {% if tailscale_exit_node %}--advertise-exit-node{% endif %}
+  when: tailscale_needs_auth | bool
+
+- name: Enable IPv6 forwarding for subnet router
+  ansible.posix.sysctl:
+    name: net.ipv6.conf.all.forwarding
+    value: "1"
+    sysctl_set: true
+    reload: true

@@ -1,0 +1,9 @@
+---
+- name: Include Tailscale install tasks
+  ansible.builtin.include_tasks: install.yml
+
+- name: Include Tailscale configure tasks
+  ansible.builtin.include_tasks: configure.yml
+
+- name: Include Tailscale UFW tasks
+  ansible.builtin.include_tasks: ufw.yml

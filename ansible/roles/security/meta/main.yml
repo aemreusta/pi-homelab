@@ -1,0 +1,16 @@
+---
+galaxy_info:
+  author: emre
+  description: Security hardening for Raspberry Pi (SSH, UFW, fail2ban)
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+  galaxy_tags:
+    - security
+    - firewall
+    - homelab
+
+dependencies: []

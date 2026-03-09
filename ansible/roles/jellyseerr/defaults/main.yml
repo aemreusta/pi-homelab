@@ -1,0 +1,5 @@
+---
+jellyseerr_compose_dir: /home/{{ docker_user }}/docker/media/jellyseerr
+jellyseerr_config_dir: /home/{{ docker_user }}/docker/media/jellyseerr/config
+jellyseerr_tz: "{{ timezone }}"
+jellyseerr_port: "5055"

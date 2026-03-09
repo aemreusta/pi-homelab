@@ -1,0 +1,13 @@
+---
+media_compose_dir: /home/{{ docker_user }}/docker/media
+media_config_dir: /home/{{ docker_user }}/docker/media/config
+
+# Container user/group — must match host user for volume permissions
+media_puid: "1000"
+media_pgid: "1000"
+media_tz: "{{ timezone }}"
+
+# Host paths — all on same filesystem for hardlinks
+media_downloads_path: /srv/downloads
+media_movies_path: /srv/media/movies
+media_series_path: /srv/media/series

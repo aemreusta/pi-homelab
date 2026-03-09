@@ -1,0 +1,15 @@
+---
+docker_user: emre
+docker_data_root: /srv/docker
+docker_log_max_size: "10m"
+docker_log_max_file: "3"
+
+# Docker repo doesn't support trixie yet; fall back to bookworm
+docker_repo_release: bookworm
+
+# Networks allowed to reach Docker containers via DOCKER-USER chain
+docker_trusted_networks:
+  - 192.168.0.0/16
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 100.64.0.0/10  # Tailscale CGNAT range

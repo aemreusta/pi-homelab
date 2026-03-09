@@ -1,0 +1,56 @@
+# Traefik dynamic configuration
+# Managed by Ansible — do not edit manually
+
+http:
+  routers:
+{% for svc in traefik_services %}
+    {{ svc.name }}:
+      rule: "Host(`{{ svc.name }}.homelab`)"
+      entryPoints:
+        - web
+      service: {{ svc.name }}
+{% endfor %}
+
+    # Dashboard
+    traefik-dashboard:
+      rule: "Host(`traefik.homelab`)"
+      entryPoints:
+        - web
+      service: api@internal
+
+{% if traefik_tailscale_fqdn | length > 0 %}
+    # Tailscale HTTPS routers
+{% for svc in traefik_services %}
+    {{ svc.name }}-ts:
+      rule: "Host(`{{ traefik_tailscale_fqdn }}`) && PathPrefix(`/{{ svc.name }}`)"
+      entryPoints:
+        - websecure
+      service: {{ svc.name }}
+      tls: {}
+      middlewares:
+        - {{ svc.name }}-strip
+{% endfor %}
+
+  middlewares:
+{% for svc in traefik_services %}
+    {{ svc.name }}-strip:
+      stripPrefix:
+        prefixes:
+          - "/{{ svc.name }}"
+{% endfor %}
+{% endif %}
+
+  services:
+{% for svc in traefik_services %}
+    {{ svc.name }}:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:{{ svc.port }}"
+{% endfor %}
+
+{% if traefik_tailscale_fqdn | length > 0 %}
+tls:
+  certificates:
+    - certFile: /certs/{{ traefik_tailscale_fqdn }}.crt
+      keyFile: /certs/{{ traefik_tailscale_fqdn }}.key
+{% endif %}

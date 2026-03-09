@@ -1,0 +1,9 @@
+---
+- name: Include AdGuard deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+
+- name: Include AdGuard configuration tasks
+  ansible.builtin.include_tasks: configure.yml
+
+- name: Include AdGuard UFW tasks
+  ansible.builtin.include_tasks: ufw.yml

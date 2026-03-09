@@ -1,0 +1,7 @@
+---
+- name: Allow Maintainerr through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ maintainerr_port }}"
+    proto: tcp
+    comment: Maintainerr web UI

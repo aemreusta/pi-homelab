@@ -1,0 +1,174 @@
+---
+- System:
+    - Homelab:
+        icon: mdi-raspberry-pi
+        href: http://glances.homelab
+        description: "{{ ansible_hostname }} · {{ ansible_default_ipv4.address }}"
+        widget:
+            type: glances
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:61208
+            version: 4
+            metric: process
+    - Glances:
+        icon: glances.png
+        href: http://glances.homelab
+        description: System Monitor
+        server: my-docker
+        container: glances
+        widget:
+            type: glances
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:61208
+            version: 4
+            metric: cpu
+    - CPU Temp:
+        icon: mdi-thermometer
+        href: http://glances.homelab
+        description: Raspberry Pi 4B
+        widget:
+            type: glances
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:61208
+            version: 4
+            metric: "sensor:cpu_thermal 0"
+    - Disk I/O:
+        icon: mdi-harddisk
+        href: http://glances.homelab
+        description: SSD Read/Write
+        widget:
+            type: glances
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:61208
+            version: 4
+            metric: "disk:sda"
+
+- Media:
+    - Jellyfin:
+        icon: jellyfin.png
+        href: http://jellyfin.homelab
+        description: Media Server
+        server: my-docker
+        container: jellyfin
+        widget:
+            type: jellyfin
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:8096
+            key: "{{ homepage_jellyfin_api_key }}"
+            enableBlocks: true
+            enableNowPlaying: true
+    - Sonarr:
+        icon: sonarr.png
+        href: http://sonarr.homelab
+        description: TV Series
+        server: my-docker
+        container: sonarr
+        widget:
+            type: sonarr
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:8989
+            key: "{{ homepage_sonarr_api_key }}"
+    - Radarr:
+        icon: radarr.png
+        href: http://radarr.homelab
+        description: Movies
+        server: my-docker
+        container: radarr
+        widget:
+            type: radarr
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:7878
+            key: "{{ homepage_radarr_api_key }}"
+    - Prowlarr:
+        icon: prowlarr.png
+        href: http://prowlarr.homelab
+        description: Indexers
+        server: my-docker
+        container: prowlarr
+        widget:
+            type: prowlarr
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:9696
+            key: "{{ homepage_prowlarr_api_key }}"
+    - qBittorrent:
+        icon: qbittorrent.png
+        href: http://qbittorrent.homelab
+        description: Torrents
+        server: my-docker
+        container: qbittorrent
+        widget:
+            type: qbittorrent
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:8181
+            username: "{{ homepage_qbittorrent_username }}"
+            password: "{{ homepage_qbittorrent_password }}"
+    - Jellyseerr:
+        icon: jellyseerr.png
+        href: http://jellyseerr.homelab
+        description: Media Requests
+        server: my-docker
+        container: jellyseerr
+        widget:
+            type: jellyseerr
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:5055
+            key: "{{ homepage_jellyseerr_api_key }}"
+    - Maintainerr:
+        icon: maintainerr.png
+        href: http://maintainerr.homelab
+        description: Media Cleanup
+        server: my-docker
+        container: maintainerr
+
+- Network:
+    - AdGuard Home:
+        icon: adguard-home.png
+        href: http://adguard.homelab
+        description: Local DNS
+        server: my-docker
+        container: adguard
+        widget:
+            type: adguard
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:8080
+    - NextDNS:
+        icon: sh-nextdns
+        href: https://my.nextdns.io/{{ homepage_nextdns_profile }}/analytics
+        description: DNS Security
+        widget:
+            type: nextdns
+            profile: "{{ homepage_nextdns_profile }}"
+            key: "{{ homepage_nextdns_api_key }}"
+    - Traefik:
+        icon: traefik.png
+        href: http://traefik.homelab:8180
+        description: Reverse Proxy
+        server: my-docker
+        container: traefik
+        widget:
+            type: traefik
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:8180
+    - Tailscale:
+        icon: tailscale.png
+        href: https://login.tailscale.com/admin/machines
+        description: VPN Mesh
+
+- Infrastructure:
+    - Portainer:
+        icon: portainer.png
+        href: http://portainer.homelab
+        description: Containers
+        server: my-docker
+        container: portainer
+    - FileBrowser:
+        icon: filebrowser.png
+        href: http://filebrowser.homelab
+        description: File Manager
+        server: my-docker
+        container: filebrowser
+    - Watchtower:
+        icon: watchtower.png
+        description: Auto Updates
+        server: my-docker
+        container: watchtower
+    - Control API:
+        icon: mdi-remote
+        href: "http://control.homelab:{{ homepage_control_port | default(9099) }}/?token={{ homepage_control_token }}"
+        description: Shutdown · Restart · Update
+        widget:
+            type: customapi
+            url: http://{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:9099/health
+            method: GET
+            mappings:
+                - field: status
+                  label: Status
+                  format: text

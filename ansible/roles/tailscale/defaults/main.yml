@@ -1,0 +1,16 @@
+---
+# Tailscale auth key (from vault) — create a reusable key at:
+# https://login.tailscale.com/admin/settings/keys
+tailscale_auth_key: "{{ vault_tailscale_auth_key }}"
+
+# Subnet to advertise for subnet router mode
+tailscale_advertise_routes: "192.168.1.0/24"
+
+# Whether to act as an exit node
+tailscale_exit_node: false
+
+# Whether to accept DNS from tailnet (MagicDNS)
+tailscale_accept_dns: true
+
+# Tailscale hostname for this machine
+tailscale_hostname: homelab

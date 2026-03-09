@@ -1,0 +1,26 @@
+---
+# Homepage — application dashboard
+# https://gethomepage.dev
+
+services:
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    container_name: homepage
+    restart: unless-stopped
+    # Run as root so the process can read the Docker socket.
+    # The socket is mounted read-only; Homepage only queries container status.
+    user: "0:0"
+    environment:
+      - HOMEPAGE_ALLOWED_HOSTS=homepage.homelab:3001,homepage.homelab,{{ adguard_host_ip | default(ansible_default_ipv4.address) }}:3001
+    ports:
+      - "3001:3000"
+    volumes:
+      - {{ homepage_config_dir }}:/app/config
+      - {{ homepage_config_dir }}/images:/app/public/images
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - homepage_net
+
+networks:
+  homepage_net:
+    driver: bridge

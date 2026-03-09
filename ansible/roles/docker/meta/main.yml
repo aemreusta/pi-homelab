@@ -1,0 +1,15 @@
+---
+galaxy_info:
+  author: emre
+  description: Docker engine and compose installation with custom data root
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+  galaxy_tags:
+    - docker
+    - homelab
+
+dependencies: []

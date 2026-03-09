@@ -1,0 +1,53 @@
+---
+# AdGuard Home configuration
+# Managed by Ansible - manual changes will be overwritten
+
+http:
+  pprof:
+    port: 6060
+    enabled: false
+  address: 0.0.0.0:80
+  session_ttl: 720h
+
+dns:
+  bind_hosts:
+    - 0.0.0.0
+  port: 53
+  upstream_dns:
+{% for dns in adguard_upstream_dns %}
+    - {{ dns }}
+{% endfor %}
+  bootstrap_dns:
+{% for dns in adguard_bootstrap_dns %}
+    - {{ dns }}
+{% endfor %}
+  fastest_addr: true
+  all_servers: false
+  cache_size: 4194304
+  cache_ttl_min: 300
+  cache_ttl_max: 86400
+  ratelimit: 0
+  blocked_response_ttl: 10
+  protection_enabled: true
+  blocking_mode: default
+
+filtering:
+  enabled: true
+  url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+  name: AdGuard DNS filter
+  filtering_enabled: true
+  parental_enabled: false
+  safebrowsing_enabled: false
+  safesearch:
+    enabled: false
+
+# Local DNS rewrites: *.homelab → Pi IP
+rewrites:
+{% for entry in adguard_dns_rewrites %}
+  - domain: "{{ entry.domain }}"
+    answer: "{{ adguard_host_ip }}"
+{% endfor %}
+
+user_rules: []
+
+schema_version: 28

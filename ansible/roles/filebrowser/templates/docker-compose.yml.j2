@@ -1,0 +1,23 @@
+---
+# FileBrowser — web-based file manager
+# https://filebrowser.org
+
+services:
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    container_name: filebrowser
+    restart: unless-stopped
+    user: "{{ media_puid | default('1000') }}:{{ media_pgid | default('1000') }}"
+    environment:
+      - TZ={{ filebrowser_tz }}
+    ports:
+      - "8082:80"
+    volumes:
+      - {{ filebrowser_root }}:/srv
+      - {{ filebrowser_config_dir }}:/config
+    networks:
+      - filebrowser_net
+
+networks:
+  filebrowser_net:
+    driver: bridge

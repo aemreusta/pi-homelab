@@ -1,0 +1,7 @@
+---
+- name: Restart glances
+  community.docker.docker_compose_v2:
+    project_src: "{{ glances_compose_dir }}"
+    state: restarted
+  become: true
+  become_user: "{{ docker_user }}"

@@ -1,0 +1,6 @@
+---
+- name: Deploy Glances system monitoring
+  hosts: pi
+  become: true
+  roles:
+    - glances

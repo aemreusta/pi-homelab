@@ -1,0 +1,6 @@
+---
+- name: Reload ethernet connection # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: nmcli connection up "{{ common_ethernet_connection }}"
+  changed_when: false
+  failed_when: false

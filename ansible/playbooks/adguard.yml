@@ -1,0 +1,6 @@
+---
+- name: Deploy AdGuard Home DNS server
+  hosts: pi
+  become: true
+  roles:
+    - adguard

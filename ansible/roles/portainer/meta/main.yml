@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  author: emre
+  description: Portainer container management UI
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+
+dependencies:
+  - docker

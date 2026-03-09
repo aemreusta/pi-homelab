@@ -1,0 +1,12 @@
+#!/bin/bash
+# Safe homelab shutdown: power off and let systemd handle Docker.
+#
+# NOTE: We intentionally do NOT run "docker stop" here.
+# The "unless-stopped" restart policy only auto-starts containers
+# that were NOT explicitly stopped via "docker stop". By letting
+# systemd send SIGTERM to Docker during shutdown, containers are
+# treated as "crashed" and will auto-restart on next power-on.
+set -euo pipefail
+
+echo "Powering off..."
+shutdown -h now

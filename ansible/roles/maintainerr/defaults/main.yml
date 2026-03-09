@@ -1,0 +1,5 @@
+---
+maintainerr_compose_dir: /home/{{ docker_user }}/docker/media/maintainerr
+maintainerr_config_dir: /home/{{ docker_user }}/docker/media/maintainerr/config
+maintainerr_tz: "{{ timezone }}"
+maintainerr_port: "6246"

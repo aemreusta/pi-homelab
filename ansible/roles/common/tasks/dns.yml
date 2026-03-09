@@ -1,0 +1,55 @@
+---
+# Configure DNS fallback so the Pi has internet even when AdGuard is down.
+#
+# The router DHCP assigns 192.168.1.100 (the Pi itself / AdGuard) as the
+# DNS server for all LAN devices. This creates a boot-time chicken-and-egg
+# problem: Docker needs DNS to work, but DNS (AdGuard) runs in Docker.
+#
+# Fix: Tell NetworkManager to use localhost (AdGuard) as primary DNS,
+# with public fallback servers (1.1.1.1, 9.9.9.9) so DNS works even
+# before AdGuard starts or if it crashes.
+
+- name: Get active ethernet connection name # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: nmcli -t -f NAME,TYPE connection show --active
+  register: common_nm_connections
+  changed_when: false
+
+- name: Set ethernet connection name
+  ansible.builtin.set_fact:
+    common_ethernet_connection: >-
+      {{ common_nm_connections.stdout_lines
+         | select('search', ':802-3-ethernet$')
+         | reject('search', '^veth')
+         | map('regex_replace', ':802-3-ethernet$', '')
+         | first
+         | default('') }}
+
+- name: Check current DNS settings # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: >-
+      nmcli -g ipv4.dns,ipv4.ignore-auto-dns connection show
+      "{{ common_ethernet_connection }}"
+  register: common_current_dns
+  changed_when: false
+  when: common_ethernet_connection | length > 0
+
+- name: Set desired DNS config fact
+  ansible.builtin.set_fact:
+    common_dns_needs_update: >-
+      {{ common_ethernet_connection | length > 0 and
+         (common_current_dns.stdout_lines | default([])
+          != ['127.0.0.1,1.1.1.1,9.9.9.9', 'yes']) }}
+
+- name: Configure DNS with fallback on ethernet connection # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: >-
+      nmcli connection modify "{{ common_ethernet_connection }}"
+      ipv4.dns "127.0.0.1 1.1.1.1 9.9.9.9"
+      ipv4.ignore-auto-dns yes
+  changed_when: true
+  when: common_dns_needs_update | bool
+  notify: Reload ethernet connection
+
+- name: Flush handlers to apply DNS changes immediately
+  ansible.builtin.meta: flush_handlers

@@ -1,0 +1,7 @@
+---
+- name: Allow Jellyseerr through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ jellyseerr_port }}"
+    proto: tcp
+    comment: Jellyseerr web UI

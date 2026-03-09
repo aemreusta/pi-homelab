@@ -1,0 +1,69 @@
+---
+# AdGuard Home configuration via REST API.
+# The YAML config file is managed by AdGuard itself at runtime;
+# we use the API to configure DNS rewrites and upstream settings.
+
+- name: Wait for AdGuard API to be available
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:8080/control/status"
+    method: GET
+    status_code: 200
+  register: adguard_api_check
+  until: adguard_api_check.status == 200
+  retries: 10
+  delay: 3
+
+- name: Get current DNS rewrites
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:8080/control/rewrite/list"
+    method: GET
+    return_content: true
+  register: adguard_current_rewrites
+
+- name: Build desired rewrites list
+  ansible.builtin.set_fact:
+    adguard_desired_rewrites: >-
+      {{ adguard_dns_rewrites | map('combine', {'answer': adguard_host_ip}) | list }}
+
+- name: Remove stale DNS rewrites (wrong IP or not in desired list)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:8080/control/rewrite/delete"
+    method: POST
+    body_format: json
+    body:
+      domain: "{{ item.domain }}"
+      answer: "{{ item.answer }}"
+    status_code: 200
+  loop: "{{ adguard_current_rewrites.content | from_json }}"
+  loop_control:
+    label: "{{ item.domain }} → {{ item.answer }}"
+  when: >-
+    item.answer != adguard_host_ip or
+    item.domain not in (adguard_desired_rewrites | map(attribute='domain') | list)
+
+- name: Add DNS rewrites for local services
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:8080/control/rewrite/add"
+    method: POST
+    body_format: json
+    body:
+      domain: "{{ item.domain }}"
+      answer: "{{ adguard_host_ip }}"
+    status_code: 200
+  loop: "{{ adguard_dns_rewrites }}"
+  loop_control:
+    label: "{{ item.domain }} → {{ adguard_host_ip }}"
+  when: >-
+    item.domain not in (adguard_current_rewrites.content | from_json
+    | selectattr('answer', 'equalto', adguard_host_ip)
+    | map(attribute='domain') | list)
+
+- name: Configure upstream DNS servers
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:8080/control/dns_config"
+    method: POST
+    body_format: json
+    body:
+      upstream_dns: "{{ adguard_upstream_dns }}"
+      bootstrap_dns: "{{ adguard_bootstrap_dns }}"
+    status_code: 200

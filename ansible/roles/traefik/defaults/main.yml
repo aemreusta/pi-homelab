@@ -1,0 +1,46 @@
+---
+traefik_compose_dir: /home/{{ docker_user }}/docker/network/traefik
+traefik_config_dir: /home/{{ docker_user }}/docker/network/traefik/config
+traefik_certs_dir: /home/{{ docker_user }}/docker/network/traefik/certs
+
+# Traefik image version
+traefik_image: traefik:v3.3
+
+# Entrypoint ports
+traefik_http_port: 80
+traefik_https_port: 443
+traefik_dashboard_port: 8180
+
+# Tailscale FQDN for TLS certs (e.g. homelab.tail1234.ts.net)
+# Leave empty to skip TLS cert generation
+traefik_tailscale_fqdn: "{{ vault_tailscale_fqdn | default('') }}"
+
+# Services to reverse proxy — each entry generates a routing rule
+# subdomain.homelab → 127.0.0.1:port
+traefik_services:
+  - name: jellyfin
+    port: 8096
+  - name: sonarr
+    port: 8989
+  - name: radarr
+    port: 7878
+  - name: prowlarr
+    port: 9696
+  - name: qbittorrent
+    port: 8181
+  - name: homepage
+    port: 3001
+  - name: glances
+    port: 61208
+  - name: filebrowser
+    port: 8082
+  - name: adguard
+    port: 8080
+  - name: portainer
+    port: 9000
+  - name: control
+    port: 9099
+  - name: maintainerr
+    port: 6246
+  - name: jellyseerr
+    port: 5055

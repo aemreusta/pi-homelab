@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+"""Homelab Control API — lightweight HTTP service for safe system management.
+
+Endpoints:
+    GET  /                → Web control panel (token required via query param)
+    GET  /health          → 200 OK (no auth required)
+    POST /shutdown        → stop containers, power off
+    POST /restart         → stop containers, reboot
+    POST /update          → pull & restart containers
+    POST /clean           → prune unused Docker resources
+
+All POST endpoints require: Authorization: Bearer <token>
+Web panel requires: /?token=<token>
+"""
+
+import http.server
+import json
+import os
+import subprocess
+import sys
+from urllib.parse import parse_qs, urlparse
+
+TOKEN = "{{ homelab_control_token }}"
+PORT = {{ homelab_control_port }}
+
+# Compose project directories managed by Ansible
+COMPOSE_DIRS = [
+    "/home/{{ docker_user }}/docker/network/adguard",
+    "/home/{{ docker_user }}/docker/core/portainer",
+    "/home/{{ docker_user }}/docker/core/glances",
+    "/home/{{ docker_user }}/docker/core/homepage",
+    "/home/{{ docker_user }}/docker/core/filebrowser",
+    "/home/{{ docker_user }}/docker/core/watchtower",
+    "/home/{{ docker_user }}/docker/media",
+]
+
+PANEL_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Homelab Control</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .container {
+    width: 100%;
+    max-width: 480px;
+    padding: 24px;
+  }
+  .header {
+    text-align: center;
+    margin-bottom: 32px;
+  }
+  .header h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: #f8fafc;
+    margin-bottom: 4px;
+  }
+  .header p {
+    font-size: 0.875rem;
+    color: #64748b;
+  }
+  .status-bar {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #22c55e;
+    flex-shrink: 0;
+    animation: pulse 2s infinite;
+  }
+  .status-dot.error { background: #ef4444; animation: none; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+  .status-text {
+    font-size: 0.875rem;
+    color: #94a3b8;
+  }
+  .status-text strong {
+    color: #e2e8f0;
+  }
+  .actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 20px 16px;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    background: #1e293b;
+    color: #e2e8f0;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: inherit;
+    font-size: 0.875rem;
+    font-weight: 500;
+  }
+  .btn:hover { background: #334155; border-color: #475569; transform: translateY(-1px); }
+  .btn:active { transform: translateY(0); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+  .btn .icon { font-size: 1.5rem; }
+  .btn.danger { border-color: #7f1d1d; }
+  .btn.danger:hover { background: #7f1d1d; border-color: #991b1b; }
+  .btn.warn { border-color: #78350f; }
+  .btn.warn:hover { background: #78350f; border-color: #92400e; }
+
+  .log {
+    margin-top: 24px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 16px;
+    display: none;
+  }
+  .log.visible { display: block; }
+  .log-title {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #64748b;
+    margin-bottom: 8px;
+  }
+  .log-body {
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+    font-size: 0.8rem;
+    color: #94a3b8;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 200px;
+    overflow-y: auto;
+    line-height: 1.6;
+  }
+  .log-body .ok { color: #22c55e; }
+  .log-body .err { color: #ef4444; }
+  .log-body .info { color: #38bdf8; }
+
+  .confirm-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    backdrop-filter: blur(4px);
+  }
+  .confirm-overlay.visible { display: flex; }
+  .confirm-box {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 16px;
+    padding: 24px;
+    width: 90%;
+    max-width: 360px;
+    text-align: center;
+  }
+  .confirm-box h3 {
+    font-size: 1.1rem;
+    margin-bottom: 8px;
+    color: #f8fafc;
+  }
+  .confirm-box p {
+    font-size: 0.875rem;
+    color: #94a3b8;
+    margin-bottom: 20px;
+  }
+  .confirm-actions {
+    display: flex;
+    gap: 12px;
+  }
+  .confirm-actions button {
+    flex: 1;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid #334155;
+    font-family: inherit;
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-cancel {
+    background: #1e293b;
+    color: #e2e8f0;
+  }
+  .btn-cancel:hover { background: #334155; }
+  .btn-confirm {
+    background: #dc2626;
+    color: #fff;
+    border-color: #dc2626;
+  }
+  .btn-confirm:hover { background: #b91c1c; }
+  .btn-confirm.safe {
+    background: #2563eb;
+    border-color: #2563eb;
+  }
+  .btn-confirm.safe:hover { background: #1d4ed8; }
+
+  /* Reboot overlay */
+  .reboot-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.95);
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+    backdrop-filter: blur(8px);
+  }
+  .reboot-overlay.visible { display: flex; }
+  .reboot-content {
+    text-align: center;
+    max-width: 360px;
+    padding: 32px;
+  }
+  .reboot-icon {
+    font-size: 3rem;
+    margin-bottom: 20px;
+    display: inline-block;
+  }
+  .reboot-icon.spinning {
+    animation: spin 2s linear infinite;
+  }
+  @keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
+  .reboot-title {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: #f8fafc;
+    margin-bottom: 8px;
+  }
+  .reboot-desc {
+    font-size: 0.875rem;
+    color: #94a3b8;
+    margin-bottom: 24px;
+    line-height: 1.5;
+  }
+  .reboot-progress {
+    width: 100%;
+    height: 4px;
+    background: #334155;
+    border-radius: 2px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .reboot-progress-bar {
+    height: 100%;
+    background: #3b82f6;
+    border-radius: 2px;
+    width: 0%;
+    transition: width 0.5s ease;
+  }
+  .reboot-progress-bar.waiting {
+    width: 100%;
+    animation: shimmer 1.5s ease-in-out infinite;
+    background: linear-gradient(90deg, #3b82f6 0%, #60a5fa 50%, #3b82f6 100%);
+    background-size: 200% 100%;
+  }
+  @keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+  .reboot-status {
+    font-size: 0.8rem;
+    color: #64748b;
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+  }
+  .reboot-dots::after {
+    content: '';
+    animation: dots 1.5s steps(4, end) infinite;
+  }
+  @keyframes dots {
+    0% { content: ''; }
+    25% { content: '.'; }
+    50% { content: '..'; }
+    75% { content: '...'; }
+  }
+  .reboot-success {
+    animation: fadeInUp 0.5s ease;
+  }
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .reboot-counter {
+    font-size: 0.75rem;
+    color: #475569;
+    margin-top: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>&#127968; Homelab Control</h1>
+    <p>Raspberry Pi 4B &middot; {{ ansible_default_ipv4.address | default('192.168.1.100') }}</p>
+  </div>
+
+  <div class="status-bar" id="statusBar">
+    <div class="status-dot" id="statusDot"></div>
+    <div class="status-text" id="statusText">Checking...</div>
+  </div>
+
+  <div class="actions">
+    <button class="btn warn" onclick="confirmAction('restart', '&#128260; Restart', 'All containers will stop and the system will reboot.')">
+      <span class="icon">&#128260;</span> Restart
+    </button>
+    <button class="btn danger" onclick="confirmAction('shutdown', '&#9211;&#65039; Shutdown', 'All containers will stop and the system will power off.')">
+      <span class="icon">&#9211;&#65039;</span> Shutdown
+    </button>
+    <button class="btn" onclick="confirmAction('update', '&#128230; Update', 'Docker images will be pulled and containers restarted.', true)">
+      <span class="icon">&#128230;</span> Update
+    </button>
+    <button class="btn" onclick="confirmAction('clean', '&#129529; Clean', 'Unused Docker images and networks will be pruned.', true)">
+      <span class="icon">&#129529;</span> Clean
+    </button>
+  </div>
+
+  <div class="log" id="logBox">
+    <div class="log-title">Output</div>
+    <div class="log-body" id="logBody"></div>
+  </div>
+
+  <div class="confirm-overlay" id="confirmOverlay">
+    <div class="confirm-box">
+      <h3 id="confirmTitle"></h3>
+      <p id="confirmDesc"></p>
+      <div class="confirm-actions">
+        <button class="btn-cancel" onclick="hideConfirm()">Cancel</button>
+        <button class="btn-confirm" id="confirmBtn" onclick="execAction()">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="reboot-overlay" id="rebootOverlay">
+    <div class="reboot-content" id="rebootContent">
+      <div class="reboot-icon spinning" id="rebootIcon">&#9881;&#65039;</div>
+      <div class="reboot-title" id="rebootTitle">System is rebooting</div>
+      <div class="reboot-desc" id="rebootDesc">Containers are stopping and the system is restarting. This page will reconnect automatically.</div>
+      <div class="reboot-progress"><div class="reboot-progress-bar waiting" id="rebootBar"></div></div>
+      <div class="reboot-status"><span id="rebootStatus">Waiting for shutdown</span><span class="reboot-dots"></span></div>
+      <div class="reboot-counter" id="rebootCounter"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN = new URLSearchParams(window.location.search).get('token') || '';
+let pendingAction = '';
+let rebootPollTimer = null;
+let rebootStartTime = 0;
+let healthCheckTimer = null;
+
+async function checkHealth() {
+  try {
+    const r = await fetch('/health');
+    const d = await r.json();
+    document.getElementById('statusDot').className = 'status-dot';
+    document.getElementById('statusText').innerHTML = '<strong>Online</strong> &mdash; API healthy';
+  } catch(e) {
+    document.getElementById('statusDot').className = 'status-dot error';
+    document.getElementById('statusText').innerHTML = '<strong>Offline</strong> &mdash; cannot reach API';
+  }
+}
+
+function confirmAction(action, title, desc, safe) {
+  pendingAction = action;
+  document.getElementById('confirmTitle').innerHTML = title;
+  document.getElementById('confirmDesc').textContent = desc;
+  const btn = document.getElementById('confirmBtn');
+  btn.className = safe ? 'btn-confirm safe' : 'btn-confirm';
+  btn.textContent = safe ? 'Run' : 'Confirm';
+  document.getElementById('confirmOverlay').className = 'confirm-overlay visible';
+}
+
+function hideConfirm() {
+  document.getElementById('confirmOverlay').className = 'confirm-overlay';
+  pendingAction = '';
+}
+
+function showRebootOverlay(action) {
+  const overlay = document.getElementById('rebootOverlay');
+  const icon = document.getElementById('rebootIcon');
+  const title = document.getElementById('rebootTitle');
+  const desc = document.getElementById('rebootDesc');
+  const bar = document.getElementById('rebootBar');
+  const status = document.getElementById('rebootStatus');
+  const counter = document.getElementById('rebootCounter');
+
+  if (action === 'shutdown') {
+    icon.innerHTML = '&#9211;&#65039;';
+    title.textContent = 'System is shutting down';
+    desc.textContent = 'Containers have been stopped and the system is powering off. You will need to physically power on the device to use it again.';
+    status.textContent = 'Powering off';
+  } else {
+    icon.innerHTML = '&#128260;';
+    title.textContent = 'System is rebooting';
+    desc.textContent = 'Containers are stopping and the system is restarting. This page will reconnect automatically.';
+    status.textContent = 'Waiting for shutdown';
+  }
+
+  icon.className = 'reboot-icon spinning';
+  bar.className = 'reboot-progress-bar waiting';
+  counter.textContent = '';
+  overlay.className = 'reboot-overlay visible';
+  rebootStartTime = Date.now();
+
+  // Start the elapsed counter
+  const counterTimer = setInterval(function() {
+    const el = document.getElementById('rebootCounter');
+    if (!el || !document.getElementById('rebootOverlay').classList.contains('visible')) {
+      clearInterval(counterTimer);
+      return;
+    }
+    const elapsed = Math.floor((Date.now() - rebootStartTime) / 1000);
+    el.textContent = elapsed + 's elapsed';
+  }, 1000);
+
+  if (action === 'restart') {
+    startRebootPolling();
+  }
+}
+
+function startRebootPolling() {
+  let phase = 'waiting'; // waiting → offline → recovering
+  let offlineAt = 0;
+
+  rebootPollTimer = setInterval(async function() {
+    const status = document.getElementById('rebootStatus');
+    const bar = document.getElementById('rebootBar');
+    const icon = document.getElementById('rebootIcon');
+    const title = document.getElementById('rebootTitle');
+    const desc = document.getElementById('rebootDesc');
+
+    try {
+      const r = await fetch('/health', { signal: AbortSignal.timeout(3000) });
+      const d = await r.json();
+
+      if (phase === 'offline') {
+        // System was offline and now it's back!
+        phase = 'recovering';
+        status.textContent = 'API is back, waiting for services';
+        bar.className = 'reboot-progress-bar';
+        bar.style.width = '80%';
+      }
+
+      if (phase === 'recovering' || (phase === 'waiting' && (Date.now() - rebootStartTime) > 5000)) {
+        // System is online — show success
+        clearInterval(rebootPollTimer);
+        rebootPollTimer = null;
+        showRebootSuccess();
+        return;
+      }
+    } catch(e) {
+      if (phase === 'waiting') {
+        phase = 'offline';
+        offlineAt = Date.now();
+        status.textContent = 'System is offline';
+        icon.innerHTML = '&#128308;';
+      }
+
+      if (phase === 'offline') {
+        const offlineSec = Math.floor((Date.now() - offlineAt) / 1000);
+        status.textContent = 'System is offline (' + offlineSec + 's)';
+      }
+    }
+  }, 3000);
+}
+
+function showRebootSuccess() {
+  const overlay = document.getElementById('rebootOverlay');
+  const content = document.getElementById('rebootContent');
+  const elapsed = Math.floor((Date.now() - rebootStartTime) / 1000);
+
+  content.className = 'reboot-content reboot-success';
+  content.innerHTML =
+    '<div class="reboot-icon" style="animation:none">&#9989;</div>' +
+    '<div class="reboot-title" style="color:#22c55e">System is back online!</div>' +
+    '<div class="reboot-desc">All services are running. Rebooted in ' + elapsed + ' seconds.</div>' +
+    '<div style="margin-top:20px">' +
+      '<button class="btn" onclick="dismissReboot()" style="display:inline-flex;flex-direction:row;padding:10px 24px;gap:8px;border-radius:8px;font-size:0.875rem">' +
+        '&#10003; Continue' +
+      '</button>' +
+    '</div>';
+
+  // Auto-dismiss after 8 seconds
+  setTimeout(function() {
+    if (overlay.classList.contains('visible')) {
+      dismissReboot();
+    }
+  }, 8000);
+}
+
+function dismissReboot() {
+  document.getElementById('rebootOverlay').className = 'reboot-overlay';
+  // Reset reboot content for next use
+  document.getElementById('rebootContent').className = 'reboot-content';
+  document.getElementById('rebootContent').innerHTML =
+    '<div class="reboot-icon spinning" id="rebootIcon">&#9881;&#65039;</div>' +
+    '<div class="reboot-title" id="rebootTitle">System is rebooting</div>' +
+    '<div class="reboot-desc" id="rebootDesc">Containers are stopping and the system is restarting. This page will reconnect automatically.</div>' +
+    '<div class="reboot-progress"><div class="reboot-progress-bar waiting" id="rebootBar"></div></div>' +
+    '<div class="reboot-status"><span id="rebootStatus">Waiting for shutdown</span><span class="reboot-dots"></span></div>' +
+    '<div class="reboot-counter" id="rebootCounter"></div>';
+  // Re-enable buttons and refresh status
+  document.querySelectorAll('.btn').forEach(b => b.disabled = false);
+  checkHealth();
+}
+
+async function execAction() {
+  const action = pendingAction;
+  hideConfirm();
+  const logBox = document.getElementById('logBox');
+  const logBody = document.getElementById('logBody');
+  logBox.className = 'log visible';
+  logBody.innerHTML = '<span class="info">&#9881;&#65039; Running ' + action + '...</span>\\n';
+
+  // Disable all buttons
+  document.querySelectorAll('.btn').forEach(b => b.disabled = true);
+
+  try {
+    const r = await fetch('/' + action, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + TOKEN }
+    });
+    const d = await r.json();
+
+    if (r.ok) {
+      logBody.innerHTML += '<span class="ok">&#9989; ' + JSON.stringify(d.status) + '</span>\\n';
+      if (d.results) {
+        d.results.forEach(function(res) {
+          const icon = res.rc === 0 ? '<span class="ok">&#10003;</span>' : '<span class="err">&#10007;</span>';
+          logBody.innerHTML += icon + ' ' + res.dir + '\\n';
+        });
+      }
+      if (d.output) {
+        logBody.innerHTML += '\\n' + d.output + '\\n';
+      }
+      if (action === 'shutdown' || action === 'restart') {
+        showRebootOverlay(action);
+        return; // Keep buttons disabled, overlay handles the rest
+      }
+    } else {
+      logBody.innerHTML += '<span class="err">&#10060; Error: ' + JSON.stringify(d) + '</span>\\n';
+    }
+  } catch(e) {
+    logBody.innerHTML += '<span class="err">&#10060; ' + e.message + '</span>\\n';
+  }
+
+  document.querySelectorAll('.btn').forEach(b => b.disabled = false);
+}
+
+checkHealth();
+healthCheckTimer = setInterval(checkHealth, 30000);
+</script>
+</body>
+</html>
+"""
+
+
+def run(cmd, timeout=120):
+    """Run a shell command and return (returncode, stdout, stderr)."""
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout
+        )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return 1, "", "Command timed out"
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    """Handle incoming HTTP requests for homelab control actions."""
+
+    def _send_json(self, code, data):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def _send_html(self, code, html):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html.encode())
+
+    def _check_auth(self):
+        auth = self.headers.get("Authorization", "")
+        if auth != f"Bearer {TOKEN}":
+            self._send_json(401, {"error": "unauthorized"})
+            return False
+        return True
+
+    def _check_token_param(self):
+        """Check token from query parameter for web panel access."""
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        token = params.get("token", [""])[0]
+        return token == TOKEN
+
+    def do_GET(self):  # noqa: N802
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/":
+            if self._check_token_param():
+                self._send_html(200, PANEL_HTML)
+            else:
+                self._send_json(401, {"error": "unauthorized"})
+        elif parsed.path == "/health":
+            self._send_json(200, {"status": "ok"})
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):  # noqa: N802
+        if not self._check_auth():
+            return
+
+        actions = {
+            "/shutdown": self._shutdown,
+            "/restart": self._restart,
+            "/update": self._update,
+            "/clean": self._clean,
+        }
+
+        action = actions.get(self.path)
+        if action:
+            action()
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def _shutdown(self):
+        self._send_json(200, {"status": "shutting down"})
+        os.system("sudo {{ homelab_control_dir }}/shutdown.sh &")
+
+    def _restart(self):
+        self._send_json(200, {"status": "restarting"})
+        os.system("sudo {{ homelab_control_dir }}/restart.sh &")
+
+    def _update(self):
+        results = []
+        for d in COMPOSE_DIRS:
+            if os.path.isfile(os.path.join(d, "docker-compose.yml")):
+                rc, out, err = run(f"docker compose -f {d}/docker-compose.yml pull")
+                run(f"docker compose -f {d}/docker-compose.yml up -d")
+                results.append({"dir": d, "rc": rc, "output": out.strip()})
+        self._send_json(200, {"status": "updated", "results": results})
+
+    def _clean(self):
+        rc, out, _ = run("docker system prune -af --volumes=false")
+        self._send_json(200, {"status": "cleaned", "output": out.strip()})
+
+    def log_message(self, format, *args):  # noqa: A002
+        """Log to stdout for journald capture."""
+        sys.stderr.write(f"[control-api] {args[0]} {args[1]} {args[2]}\n")
+
+
+if __name__ == "__main__":
+    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Homelab Control API listening on port {PORT}")
+    server.serve_forever()

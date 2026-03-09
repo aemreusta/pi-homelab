@@ -1,0 +1,6 @@
+---
+- name: Include FileBrowser deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+
+- name: Include FileBrowser UFW tasks
+  ansible.builtin.include_tasks: ufw.yml

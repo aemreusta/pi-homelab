@@ -1,0 +1,24 @@
+---
+adguard_compose_dir: /home/{{ docker_user }}/docker/network/adguard
+adguard_data_dir: /home/{{ docker_user }}/docker/network/adguard/data
+adguard_tz: "{{ timezone }}"
+
+# DNS upstream servers
+adguard_upstream_dns:
+  - "1.1.1.1"
+  - "9.9.9.9"
+
+# Bootstrap DNS (used to resolve upstream hostnames)
+adguard_bootstrap_dns:
+  - "1.1.1.1"
+  - "8.8.8.8"
+
+# Local DNS domain
+adguard_local_domain: homelab
+
+# Pi IP address for local DNS rewrites
+adguard_host_ip: "{{ ansible_default_ipv4.address }}"
+
+# Local DNS rewrite entries (*.homelab → Pi IP)
+adguard_dns_rewrites:
+  - domain: "*.{{ adguard_local_domain }}"

@@ -1,0 +1,17 @@
+---
+# Watchtower — automatic container image updates
+# Checks all running containers for new images every {{ watchtower_interval }}s (daily).
+# --cleanup removes old images after updating.
+
+services:
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    environment:
+      - TZ={{ watchtower_tz }}
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL={{ watchtower_interval }}
+      - DOCKER_API_VERSION=1.40
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

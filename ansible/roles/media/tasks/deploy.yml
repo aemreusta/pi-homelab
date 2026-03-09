@@ -1,0 +1,91 @@
+---
+- name: Create media compose directory
+  ansible.builtin.file:
+    path: "{{ media_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create media config directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  loop:
+    - "{{ media_config_dir }}/qbittorrent"
+    - "{{ media_config_dir }}/sonarr"
+    - "{{ media_config_dir }}/radarr"
+    - "{{ media_config_dir }}/prowlarr"
+    - "{{ media_config_dir }}/jellyfin"
+
+- name: Create download category directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0775"
+  loop:
+    - "{{ media_downloads_path }}/movies"
+    - "{{ media_downloads_path }}/series"
+
+- name: Copy media stack docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ media_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart media stack
+
+- name: Start media stack containers
+  community.docker.docker_compose_v2:
+    project_src: "{{ media_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"
+
+# qBittorrent generates default config on first boot with /downloads/ paths.
+# Since we mount /srv:/data, the correct path is /data/downloads/.
+- name: Wait for qBittorrent config to be generated
+  ansible.builtin.wait_for:
+    path: "{{ media_config_dir }}/qbittorrent/qBittorrent/qBittorrent.conf"
+    state: present
+    timeout: 30
+
+- name: Fix qBittorrent default save path
+  ansible.builtin.replace:
+    path: "{{ media_config_dir }}/qbittorrent/qBittorrent/qBittorrent.conf"
+    regexp: '=/downloads/'
+    replace: '=/data/downloads/'
+  notify: Restart qbittorrent
+
+# qBittorrent categories must use /data/downloads/ paths (not /downloads/)
+# so Sonarr/Radarr can find completed downloads via the shared mount.
+- name: Disable qBittorrent LAN authentication
+  ansible.builtin.lineinfile:
+    path: "{{ media_config_dir }}/qbittorrent/qBittorrent/qBittorrent.conf"
+    regexp: '^WebUI\\LocalHostAuth='
+    line: 'WebUI\LocalHostAuth=false'
+    insertafter: '^WebUI\\Port='
+  notify: Restart qbittorrent
+
+- name: Set qBittorrent session timeout to 7 days
+  ansible.builtin.lineinfile:
+    path: "{{ media_config_dir }}/qbittorrent/qBittorrent/qBittorrent.conf"
+    regexp: '^WebUI\\SessionTimeout='
+    line: 'WebUI\SessionTimeout=604800'
+    insertafter: '^WebUI\\Port='
+  notify: Restart qbittorrent
+
+- name: Configure qBittorrent download categories
+  ansible.builtin.template:
+    src: qbittorrent-categories.json.j2
+    dest: "{{ media_config_dir }}/qbittorrent/qBittorrent/categories.json"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart qbittorrent

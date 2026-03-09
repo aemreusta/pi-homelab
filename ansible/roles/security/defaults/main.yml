@@ -1,0 +1,8 @@
+---
+security_ssh_port: "22"
+
+security_ufw_allowed_ports: []
+
+security_fail2ban_bantime: "1h"
+security_fail2ban_findtime: "10m"
+security_fail2ban_maxretry: 5

@@ -1,0 +1,42 @@
+---
+- name: Create FileBrowser compose directory
+  ansible.builtin.file:
+    path: "{{ filebrowser_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create FileBrowser config directory
+  ansible.builtin.file:
+    path: "{{ filebrowser_config_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Seed FileBrowser settings
+  ansible.builtin.template:
+    src: settings.json.j2
+    dest: "{{ filebrowser_config_dir }}/settings.json"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+    force: false
+  notify: Restart filebrowser
+
+- name: Copy FileBrowser docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ filebrowser_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart filebrowser
+
+- name: Start FileBrowser container
+  community.docker.docker_compose_v2:
+    project_src: "{{ filebrowser_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

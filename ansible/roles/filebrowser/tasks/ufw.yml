@@ -1,0 +1,7 @@
+---
+- name: Allow FileBrowser through UFW
+  community.general.ufw:
+    rule: allow
+    port: "8082"
+    proto: tcp
+    comment: FileBrowser

@@ -1,0 +1,14 @@
+---
+- name: Allow Portainer HTTP through UFW
+  community.general.ufw:
+    rule: allow
+    port: "9000"
+    proto: tcp
+    comment: Portainer HTTP UI
+
+- name: Allow Portainer HTTPS through UFW
+  community.general.ufw:
+    rule: allow
+    port: "9443"
+    proto: tcp
+    comment: Portainer HTTPS UI

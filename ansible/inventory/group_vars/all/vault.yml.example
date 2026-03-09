@@ -1,0 +1,29 @@
+---
+# Copy to vault.yml and fill in real values:
+#   cp vault.yml.example vault.yml
+#
+# Then encrypt:
+#   ansible-vault encrypt inventory/group_vars/vault.yml
+#
+# To edit later:
+#   ansible-vault edit inventory/group_vars/vault.yml
+
+vault_qbittorrent_username: "admin"
+vault_qbittorrent_password: "CHANGE_ME"
+
+# NextDNS
+vault_nextdns_api_key: "CHANGE_ME"
+
+# Homelab Control API
+vault_homelab_control_token: "CHANGE_ME"
+
+# Media service API keys (get from each service's web UI → Settings → API Key)
+vault_jellyfin_api_key: "CHANGE_ME"
+vault_sonarr_api_key: "CHANGE_ME"
+vault_radarr_api_key: "CHANGE_ME"
+vault_prowlarr_api_key: "CHANGE_ME"
+vault_jellyseerr_api_key: "CHANGE_ME"
+
+# Tailscale
+vault_tailscale_auth_key: "CHANGE_ME"
+vault_tailscale_fqdn: "CHANGE_ME"

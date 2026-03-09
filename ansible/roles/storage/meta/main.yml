@@ -1,0 +1,15 @@
+---
+galaxy_info:
+  author: emre
+  description: Storage directory layout for homelab services
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+  galaxy_tags:
+    - storage
+    - homelab
+
+dependencies: []

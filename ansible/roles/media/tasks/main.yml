@@ -1,0 +1,6 @@
+---
+- name: Include media stack deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+
+- name: Include media stack UFW tasks
+  ansible.builtin.include_tasks: ufw.yml

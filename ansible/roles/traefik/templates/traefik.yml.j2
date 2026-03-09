@@ -1,0 +1,22 @@
+# Traefik static configuration
+# Managed by Ansible — do not edit manually
+
+entryPoints:
+  web:
+    address: ":{{ traefik_http_port }}"
+  websecure:
+    address: ":{{ traefik_https_port }}"
+  traefik:
+    address: ":{{ traefik_dashboard_port }}"
+
+api:
+  dashboard: true
+  insecure: true
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+log:
+  level: INFO
