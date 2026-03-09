@@ -161,7 +161,25 @@ graph TD
     style HP fill:#f5a623
 ```
 
+## Inter-Service Connections
+
+Services run in **isolated Docker networks** — they cannot reach each other by container name across different compose stacks. Use the Pi's IP (`192.168.1.100`) or `127.0.0.1` (for services on host network) when configuring service-to-service connections.
+
+| From | To | Host | Port |
+|------|----|------|------|
+| Sonarr/Radarr | qBittorrent | 192.168.1.100 | 8181 |
+| Sonarr/Radarr | Prowlarr | 192.168.1.100 | 9696 |
+| Maintainerr | Jellyfin | 192.168.1.100 | 8096 |
+| Maintainerr | Sonarr | 192.168.1.100 | 8989 |
+| Maintainerr | Radarr | 192.168.1.100 | 7878 |
+| Jellyseerr | Jellyfin | 192.168.1.100 | 8096 |
+| Jellyseerr | Sonarr | 192.168.1.100 | 8989 |
+| Jellyseerr | Radarr | 192.168.1.100 | 7878 |
+
+> Services within the same compose stack (e.g. Sonarr + Radarr in `media`) can use container names directly. Cross-stack communication requires the host IP.
+
 **Deploy order** (respects dependencies):
+
 1. Tailscale — VPN foundation (host-level, not Docker)
 2. AdGuard Home — DNS foundation, everything resolves through it
 3. Traefik — reverse proxy, routes `*.homelab` to backend services
