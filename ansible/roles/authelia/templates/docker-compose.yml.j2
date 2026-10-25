@@ -1,0 +1,47 @@
+---
+# Authelia — SSO / OIDC provider + forward-auth. Managed by Ansible.
+# https://www.authelia.com
+# Binds loopback only; Traefik (host network) reaches it at 127.0.0.1:9091.
+# Joins mlstack_net to reach Postgres (postgresql:5432) — deploy postgresql first.
+
+services:
+  authelia:
+    image: {{ authelia_image }}
+    container_name: authelia
+    restart: unless-stopped
+    init: true
+    user: "{{ authelia_puid }}:{{ authelia_pgid }}"
+    mem_limit: {{ authelia_mem_limit }}
+    pids_limit: {{ authelia_pids_limit }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for c in authelia_cap_drop %}
+      - {{ c }}
+{% endfor %}
+    labels:
+{% for k, v in authelia_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - TZ={{ authelia_tz }}
+      - X_AUTHELIA_CONFIG=/config/configuration.yml
+    ports:
+      - "127.0.0.1:{{ authelia_port }}:9091"
+      # Metrics — loopback only; scraped by the host-networked vmagent.
+      - "127.0.0.1:{{ authelia_metrics_port }}:{{ authelia_metrics_port }}"
+    volumes:
+      - {{ authelia_config_dir }}:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - mlstack_net
+
+networks:
+  # External bridge created by the postgresql role; Authelia reaches
+  # postgresql:5432 over it. Deploy postgresql before authelia.
+  mlstack_net:
+    external: true

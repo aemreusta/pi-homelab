@@ -1,0 +1,66 @@
+---
+- name: Probe installed runtime for indexer-health support
+  ansible.builtin.command:
+    argv:
+      - "{{ homelab_runtime_binary | default('/usr/local/bin/homelab-agent') }}"
+      - indexer-health
+      - --probe
+  register: media_indexer_health_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: media_indexer_health_enabled
+
+- name: Require indexer-health before installing its consumer
+  ansible.builtin.assert:
+    that:
+      - media_indexer_health_probe.rc == 0
+    fail_msg: Run homelab-runtime deployment first; installed binary lacks indexer-health.
+    quiet: true
+  when: media_indexer_health_enabled and not ansible_check_mode
+
+- name: Create private indexer-health state directory
+  ansible.builtin.file:
+    path: "{{ media_indexer_health_state | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: media_indexer_health_enabled
+
+- name: Create indexer-health metric publication directory
+  ansible.builtin.file:
+    path: "{{ media_indexer_health_textfile | dirname }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  when: media_indexer_health_enabled
+
+- name: Install bounded indexer-health wrapper
+  ansible.builtin.template:
+    src: indexer-health.sh.j2
+    dest: /usr/local/bin/homelab-indexer-health.sh
+    owner: root
+    group: root
+    mode: "0755"
+  when: media_indexer_health_enabled
+
+- name: Schedule read-only indexer health observation
+  ansible.builtin.cron:
+    name: Indexer functional health
+    minute: "{{ media_indexer_health_cron_minute }}"
+    user: root
+    job: /usr/local/bin/homelab-indexer-health.sh
+    state: "{{ 'present' if media_indexer_health_enabled else 'absent' }}"
+
+- name: Publish an initial indexer health observation
+  ansible.builtin.command: /usr/local/bin/homelab-indexer-health.sh
+  changed_when: false
+  when: media_indexer_health_enabled and not ansible_check_mode
+
+- name: Remove disabled collector metrics
+  ansible.builtin.file:
+    path: "{{ media_indexer_health_textfile }}"
+    state: absent
+  when: not media_indexer_health_enabled

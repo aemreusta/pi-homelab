@@ -1,0 +1,13 @@
+---
+- name: Restart tailscale-dns
+  community.docker.docker_compose_v2:
+    project_src: "{{ tailscale_dns_compose_dir }}"
+    state: restarted
+  become: true
+  become_user: "{{ docker_user }}"
+
+- name: Restart tailscale-dns-resume
+  ansible.builtin.systemd:
+    name: tailscale-dns-resume
+    state: restarted
+    daemon_reload: true

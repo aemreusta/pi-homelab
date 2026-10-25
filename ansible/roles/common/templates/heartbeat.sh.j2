@@ -1,0 +1,27 @@
+#!/bin/bash
+# Dead-man's switch — posts a heartbeat to ntfy every run.
+# If the operator stops seeing these, something is broken:
+# ntfy down, cron dead, Pi unreachable, or disk full.
+#
+# Managed by Ansible (common role) — do not edit manually.
+
+NTFY_URL="{{ ntfy_external_topic_url }}"
+
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+
+UPTIME_S=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+LOAD1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+CONTAINERS=$(docker ps -q 2>/dev/null | wc -l)
+
+# Local witness FIRST — if ntfy is the dead system, we still have a log line
+# proving the cron fired. (#6 in remediation list.)
+alert_event "heartbeat" run ok "uptime=${UPTIME_S}" "load=${LOAD1}" "containers=${CONTAINERS}"
+
+ntfy_send "heartbeat" \
+    -H "Title: Heartbeat" \
+    -H "Priority: min" \
+    -H "Tags: heartbeat" \
+    -H "Markdown: yes" \
+    -d "Up ${UPTIME_S}s | Load ${LOAD1} | ${CONTAINERS} containers" \
+    "$NTFY_URL" || true

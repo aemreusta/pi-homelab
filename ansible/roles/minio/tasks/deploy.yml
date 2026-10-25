@@ -1,0 +1,53 @@
+---
+# Fail loudly rather than booting MinIO with an insecure / empty admin password.
+- name: Assert MinIO root credentials are set in vault
+  ansible.builtin.assert:
+    that:
+      - minio_root_user | length > 0
+      - minio_root_password | length >= 8
+    fail_msg: >-
+      vault_minio_root_user / vault_minio_root_password are unset or too short.
+      Add them to ansible/inventory/group_vars/all/vault.yml (password >= 8 chars)
+      before deploying MinIO. See vault.yml.example.
+    quiet: true
+
+- name: Create MinIO compose directory
+  ansible.builtin.file:
+    path: "{{ minio_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create MinIO data directory
+  ansible.builtin.file:
+    path: "{{ minio_data_dir }}"
+    state: directory
+    owner: "{{ minio_puid }}"
+    group: "{{ minio_pgid }}"
+    mode: "0755"
+
+- name: Copy MinIO docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ minio_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart minio
+
+- name: Start MinIO container
+  community.docker.docker_compose_v2:
+    project_src: "{{ minio_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"
+
+- name: Wait for MinIO health endpoint to be live
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ minio_api_port }}/minio/health/live"
+    status_code: 200
+  register: minio_health
+  until: minio_health.status == 200
+  retries: 12
+  delay: 5

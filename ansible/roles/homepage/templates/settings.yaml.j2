@@ -1,0 +1,39 @@
+---
+title: Homelab
+# Background: keep the operator's photo but dim it hard so card text wins.
+# blur removed + cardBlur lowered to xs => far cheaper backdrop-filter on ~30
+# cards (the old blur:sm + cardBlur:md was the unreadable/sluggish render).
+background:
+  image: /images/background.jpg
+  blur: none
+  saturate: 50
+  brightness: 35
+  opacity: 55
+theme: dark
+color: slate
+headerStyle: underlined
+cardBlur: xs
+# Graceful degradation + lighter UI: one unreachable widget no longer drags the
+# whole board (hideErrors), and compact status dots instead of UP/DOWN text.
+hideErrors: true
+statusStyle: dot
+layout:
+  Media:
+    style: row
+    columns: 4
+  Network:
+    style: row
+    columns: 4
+  Infrastructure:
+    style: row
+    columns: 4
+  Data:
+    style: row
+    columns: 2
+  Observability:
+    style: row
+    columns: 4
+  Exporters:
+    style: row
+    columns: 3
+    initiallyCollapsed: true

@@ -1,0 +1,47 @@
+---
+watchtower_compose_dir: /home/{{ docker_user }}/docker/core/watchtower
+watchtower_tz: "{{ timezone }}"
+# Check for updates once per day (86400 seconds)
+watchtower_interval: "86400"
+
+# Shoutrrr ntfy URL — fires on every successful update (not on every check).
+# Centralized in group_vars/all/main.yml as ntfy_shoutrrr_url so the
+# hostname change in one place propagates everywhere.
+#
+# DNS note: watchtower runs inside Docker. Container resolution of
+# ntfy.example depends on Docker's embedded DNS (127.0.0.11) forwarding
+# to the host's resolver chain (→ AdGuard). Verified by playbooks/verify-ntfy.yml.
+watchtower_ntfy_url: "{{ ntfy_shoutrrr_url }}"
+watchtower_notifications_hostname: homelab
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+watchtower_mem_limit: 128M
+
+# --- Container security hardening ---
+
+# PID limit — Watchtower is a single Go binary; <30 OS threads typical.
+watchtower_pids_limit: 100
+
+# Read-only root filesystem; /tmp via tmpfs. Watchtower stores state in memory.
+watchtower_read_only: true
+watchtower_tmpfs_size: 32m
+
+# Linux capabilities. Drop all — Watchtower needs no caps: it doesn't bind ports
+# and accesses docker.sock via file ownership (root) without DAC_OVERRIDE.
+watchtower_cap_drop:
+  - ALL
+watchtower_cap_add: []
+
+# OCI image labels (applied to the container).
+# Note: Watchtower's own opt-in/opt-out label is `com.centurylinklabs.watchtower.enable`;
+# do NOT set that here unless you want to disable self-updates.
+watchtower_oci_labels:
+  org.opencontainers.image.title: watchtower
+  org.opencontainers.image.description: "Automatic Docker container image updater (daily, with ntfy notifications)"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/watchtower/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://containrrr.dev/watchtower/"
+
+# Ansible builds and owns these images; registry pulls cannot update them.
+watchtower_excluded_containers: [mlflow]

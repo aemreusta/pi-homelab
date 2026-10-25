@@ -1,0 +1,63 @@
+{#- Zot registry config. Managed by Ansible — do not edit manually.
+    Extensions are built as a dict + to_json so toggling any of them off can
+    never leave a trailing-comma JSON syntax error. -#}
+{%- set ext = {} -%}
+{%- if zot_search_enable -%}{%- set _ = ext.update({"search": {"enable": true}}) -%}{%- endif -%}
+{%- if zot_ui_enable -%}{%- set _ = ext.update({"ui": {"enable": true}}) -%}{%- endif -%}
+{%- if zot_scrub_enable -%}{%- set _ = ext.update({"scrub": {"enable": true, "interval": zot_scrub_interval}}) -%}{%- endif -%}
+{%- if zot_metrics_enable -%}{%- set _ = ext.update({"metrics": {"enable": true, "prometheus": {"path": "/metrics"}}}) -%}{%- endif -%}
+{
+  "storage": {
+    "rootDirectory": "/var/lib/registry",
+    "gc": {{ zot_gc | to_json }},
+    "gcDelay": "{{ zot_gc_delay }}",
+    "gcInterval": "{{ zot_gc_interval }}",
+    "dedupe": {{ zot_dedupe | to_json }},
+    "retention": {
+      "dryRun": false,
+      "delay": "{{ zot_retention_delay }}",
+      "policies": [
+        {
+          "repositories": ["**"],
+          "deleteReferrers": true,
+          "deleteUntagged": true,
+          "keepTags": [
+            {
+              "mostRecentlyPushedCount": {{ zot_retention_keep_recent }},
+              "mostRecentlyPulledCount": {{ zot_retention_keep_recent }}
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "http": {
+    "address": "0.0.0.0",
+    "port": "{{ zot_container_port }}",
+    "compat": {{ zot_compat | to_json }},
+    "auth": {
+      "htpasswd": {
+        "path": "/etc/zot/htpasswd"
+      }
+    },
+    "accessControl": {
+      "repositories": {
+        "**": {
+          "anonymousPolicy": [],
+          "defaultPolicy": ["read", "create", "update", "delete", "detectManifestCollision"]
+        }
+      },
+      "adminPolicy": {
+        "users": ["{{ zot_username }}"],
+        "actions": ["read", "create", "update", "delete"]
+      },
+      "metrics": {
+        "users": ["{{ zot_username }}"]
+      }
+    }
+  },
+  "log": {
+    "level": "info"
+  },
+  "extensions": {{ ext | to_json }}
+}

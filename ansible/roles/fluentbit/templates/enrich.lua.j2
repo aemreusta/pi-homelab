@@ -1,0 +1,91 @@
+-- Fluent Bit Lua filter — managed by Ansible.
+--
+-- Enriches each Docker log record with:
+--   container_id    — 12-char short hash, extracted from the tail input
+--                     log_path (e.g. /srv/docker/containers/<full_id>/...).
+--   container_name  — looked up once per full_id from the matching
+--                     config.v2.json sidecar that Docker writes alongside
+--                     the json log file. Mounted read-only at the same
+--                     path. Cached in a module-level table.
+--   log_level       — coarse level token (error|warn|info|debug) extracted
+--                     from the first bracketed `[LEVEL]` in the message,
+--                     after ANSI codes are stripped. Covers *arr `[Info]`,
+--                     Jellyfin `[INF]`, Jellyseerr `[info]` — the formats
+--                     queried by the container-error-rate LogsQL rules.
+--                     Lines with no recognised bracket get no log_level
+--                     field (correct: the rule's filter then skips them).
+
+-- Module-level caches survive across records but reset on container
+-- restart. We cache misses too via a sentinel because reading a 5-7 KB
+-- json file off SSD per record is wasteful, even on this Pi.
+local name_cache = {}
+local CACHE_MISS = {}
+
+local function read_container_name(full_id)
+    local cached = name_cache[full_id]
+    if cached == CACHE_MISS then return nil end
+    if cached ~= nil then return cached end
+
+    local path = "/srv/docker/containers/" .. full_id .. "/config.v2.json"
+    local f = io.open(path, "r")
+    if not f then
+        name_cache[full_id] = CACHE_MISS
+        return nil
+    end
+    local content = f:read("*a")
+    f:close()
+    -- The top-level container Name is the only `"Name":"/<...>"` with a
+    -- leading slash. Network sub-objects have `"Name":""` (empty) which
+    -- this pattern excludes.
+    local name = string.match(content or "", '"Name":"/([^"]+)"')
+    name_cache[full_id] = name or CACHE_MISS
+    return name
+end
+
+local function strip_ansi(s)
+    if not s then return s end
+    -- ESC '[' digits/semis 'm' — covers SGR colour codes that *arr,
+    -- Traefik, Jellyseerr all wrap their level token in.
+    return (string.gsub(s, "\27%[[0-9;]*m", ""))
+end
+
+local function extract_log_level(msg)
+    if not msg then return nil end
+    local clean = strip_ansi(msg)
+    -- First bracketed alpha-only token. Limits to ASCII letters so a
+    -- bracketed word like `[Jellyfin Sync]` (contains space) is skipped,
+    -- and a bracketed colour residue like `[39m` (contains digit) is
+    -- skipped.
+    local lvl = string.match(clean, "%[([A-Za-z]+)%]")
+    if not lvl then return nil end
+    local u = string.upper(lvl)
+    if u == "ERROR" or u == "ERR" or u == "FATAL" or u == "FTL" then
+        return "error"
+    elseif u == "WARN" or u == "WARNING" or u == "WRN" then
+        return "warn"
+    elseif u == "INFO" or u == "INF" then
+        return "info"
+    elseif u == "DEBUG" or u == "DBG" or u == "TRACE" then
+        return "debug"
+    end
+    return nil
+end
+
+function enrich(tag, ts, record)
+    local path = record["log_path"]
+    if path then
+        local full_id = string.match(path, "/containers/([a-f0-9]+)/")
+        if full_id then
+            record["container_id"] = string.sub(full_id, 1, 12)
+            local name = read_container_name(full_id)
+            if name then
+                record["container_name"] = name
+            end
+        end
+    end
+    local lvl = extract_log_level(record["log"])
+    if lvl then
+        record["log_level"] = lvl
+    end
+    return 1, ts, record
+end

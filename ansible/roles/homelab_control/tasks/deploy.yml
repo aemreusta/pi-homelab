@@ -1,0 +1,136 @@
+---
+- name: Create homelab control directory
+  ansible.builtin.file:
+    path: "{{ homelab_control_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Deploy control API script
+  ansible.builtin.template:
+    src: control-api.py.j2
+    dest: "{{ homelab_control_dir }}/control-api.py"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  notify: Restart homelab-control
+
+- name: Deploy shutdown script
+  ansible.builtin.template:
+    src: shutdown.sh.j2
+    dest: "{{ homelab_control_dir }}/shutdown.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: Deploy restart script
+  ansible.builtin.template:
+    src: restart.sh.j2
+    dest: "{{ homelab_control_dir }}/restart.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: Configure sudoers for control scripts
+  ansible.builtin.template:
+    src: sudoers-homelab-control.j2
+    dest: /etc/sudoers.d/homelab-control
+    owner: root
+    group: root
+    mode: "0440"
+    validate: visudo -cf %s
+  become: true
+
+- name: Create junk cleanup audit log file
+  ansible.builtin.file:
+    path: /var/log/homelab-clean.log
+    state: touch
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+  become: true
+
+- name: Create junk scan cron log file
+  ansible.builtin.file:
+    path: /var/log/homelab-junk.log
+    state: touch
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+  become: true
+
+- name: Install logrotate configuration for junk cleanup log
+  ansible.builtin.template:
+    src: logrotate-homelab.j2
+    dest: /etc/logrotate.d/homelab-clean
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+
+- name: Deploy systemd service
+  ansible.builtin.template:
+    src: homelab-control.service.j2
+    dest: /etc/systemd/system/homelab-control.service
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: Restart homelab-control
+
+- name: Enable and start homelab-control service
+  ansible.builtin.systemd:
+    name: homelab-control
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true
+
+- name: Store API token for cron jobs
+  ansible.builtin.copy:
+    content: "{{ homelab_control_token }}"
+    dest: "{{ homelab_control_dir }}/.api-token"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0600"
+  no_log: true
+
+- name: Deploy junk scan script
+  ansible.builtin.template:
+    src: junk-scan.sh.j2
+    dest: "{{ homelab_control_dir }}/junk-scan.sh"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Deploy daily report script
+  ansible.builtin.template:
+    src: daily-report.sh.j2
+    dest: "{{ homelab_control_dir }}/daily-report.sh"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Schedule weekly junk file scan report
+  ansible.builtin.cron:
+    name: "homelab junk scan"
+    user: "{{ docker_user }}"
+    weekday: "0"
+    hour: "3"
+    minute: "0"
+    job: "{{ homelab_control_dir }}/junk-scan.sh"
+
+- name: Schedule daily evening report
+  ansible.builtin.cron:
+    name: "homelab daily report"
+    user: "{{ docker_user }}"
+    hour: "21"
+    minute: "0"
+    job: "{{ homelab_control_dir }}/daily-report.sh"

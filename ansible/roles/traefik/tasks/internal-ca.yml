@@ -1,0 +1,153 @@
+---
+# Internal CA + *.example wildcard leaf, generated on the Pi via community.crypto.
+# Two-tier: a long-lived root CA (installed on devices) signs a single wildcard
+# leaf that Traefik presents on :443. One cert serves LAN and Tailscale because
+# both resolve *.example to this host. See docs/design/033-internal-ca-https.md.
+#
+# Idempotent: absolute not_after timestamps (defaults) + community.crypto's
+# default ignore_timestamps mean re-runs don't re-sign. Renewal = bump
+# traefik_internal_leaf_not_after and redeploy; the expiry-guard below fails the
+# play when the leaf has < 30 days left.
+
+- name: Ensure Traefik certs dir exists
+  ansible.builtin.file:
+    path: "{{ traefik_certs_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+# --- Root CA: reuse from vault (DR) if provided, else generate on first run ---
+- name: Materialize CA from vault (disaster-recovery path)
+  when: traefik_internal_ca_key | length > 0
+  no_log: true
+  block:
+    - name: Write vaulted CA private key
+      ansible.builtin.copy:
+        content: "{{ traefik_internal_ca_key }}"
+        dest: "{{ traefik_certs_dir }}/homelab-ca.key"
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart traefik
+
+    - name: Write vaulted CA certificate
+      ansible.builtin.copy:
+        content: "{{ traefik_internal_ca_cert }}"
+        dest: "{{ traefik_certs_dir }}/homelab-ca.crt"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart traefik
+
+- name: Generate CA on first run (no vaulted key present)
+  when: traefik_internal_ca_key | length == 0
+  block:
+    - name: Generate internal CA private key
+      community.crypto.openssl_privatekey:
+        path: "{{ traefik_certs_dir }}/homelab-ca.key"
+        type: ECC
+        curve: secp384r1
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Build self-signed CA CSR
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ traefik_certs_dir }}/homelab-ca.key"
+        common_name: "{{ traefik_internal_ca_cn }}"
+        basic_constraints:
+          - "CA:TRUE"
+        basic_constraints_critical: true
+        key_usage:
+          - keyCertSign
+          - cRLSign
+        key_usage_critical: true
+      register: traefik_ca_csr
+
+    - name: Self-sign the internal CA certificate
+      community.crypto.x509_certificate:
+        path: "{{ traefik_certs_dir }}/homelab-ca.crt"
+        csr_content: "{{ traefik_ca_csr.csr }}"
+        privatekey_path: "{{ traefik_certs_dir }}/homelab-ca.key"
+        provider: selfsigned
+        selfsigned_not_after: "{{ traefik_internal_ca_not_after }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart traefik
+
+# --- Wildcard leaf (always reconciled; signed by whatever CA is on disk) ---
+- name: Generate *.example leaf private key
+  community.crypto.openssl_privatekey:
+    path: "{{ traefik_certs_dir }}/homelab.key"
+    type: ECC
+    curve: secp256r1
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Build *.example leaf CSR
+  community.crypto.openssl_csr_pipe:
+    privatekey_path: "{{ traefik_certs_dir }}/homelab.key"
+    common_name: "{{ traefik_internal_leaf_cn }}"
+    subject_alt_name: "{{ traefik_internal_leaf_san }}"
+    key_usage:
+      - digitalSignature
+      - keyEncipherment
+    key_usage_critical: true
+    extended_key_usage:
+      - serverAuth
+  register: traefik_leaf_csr
+
+# Traefik gets the leaf ONLY (root signs it directly; devices trust the root).
+# No fullchain assembly → no leaf/CA ordering pitfall.
+- name: Sign the *.example leaf with the internal CA
+  community.crypto.x509_certificate:
+    path: "{{ traefik_certs_dir }}/homelab.crt"
+    csr_content: "{{ traefik_leaf_csr.csr }}"
+    provider: ownca
+    ownca_path: "{{ traefik_certs_dir }}/homelab-ca.crt"
+    ownca_privatekey_path: "{{ traefik_certs_dir }}/homelab-ca.key"
+    ownca_not_after: "{{ traefik_internal_leaf_not_after }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart traefik
+
+# --- Verify before Traefik picks it up (catches SAN/issuer/expiry mistakes) ---
+- name: Read leaf cert info (SAN, issuer, 30-day validity)
+  community.crypto.x509_certificate_info:
+    path: "{{ traefik_certs_dir }}/homelab.crt"
+    valid_at:
+      in_30_days: "+30d"
+  register: traefik_leaf_info
+
+- name: Assert leaf cert is correct and not near expiry
+  ansible.builtin.assert:
+    that:
+      # Explicit per-host SAN is what strict clients (curl/browsers) match — a
+      # wildcard alone is rejected by some clients. jellyfin/ntfy are sampled to
+      # catch SAN-generation bugs; if either is ever removed from
+      # traefik_services, update these lines in the same change. The apex of the
+      # primary domain is the permanent check — it never leaves the SAN.
+      # Domain-agnostic (2026-07-15 clean cut): derived from the primary domain,
+      # so a domain migration can't silently fail these asserts.
+      - "'DNS:jellyfin.' ~ homelab_internal_domains[0] in traefik_leaf_info.subject_alt_name"
+      - "'DNS:ntfy.' ~ homelab_internal_domains[0] in traefik_leaf_info.subject_alt_name"
+      - "'DNS:' ~ homelab_internal_domains[0] in traefik_leaf_info.subject_alt_name"
+      - traefik_leaf_info.issuer.commonName == traefik_internal_ca_cn
+      - traefik_leaf_info.valid_at.in_30_days
+    fail_msg: >-
+      *.{{ homelab_internal_domains[0] }} leaf cert is invalid or expires within 30 days
+      (issuer={{ traefik_leaf_info.issuer.commonName | default('?') }},
+      SAN={{ traefik_leaf_info.subject_alt_name | default([]) }}).
+      Bump traefik_internal_leaf_not_after and redeploy.
+    success_msg: "*.example leaf cert OK (issuer {{ traefik_internal_ca_cn }}, valid >30d)."
+
+# --- Publish the root to the repo so the common role + devices can install it ---
+- name: Fetch CA root cert to the common role's files dir
+  ansible.builtin.fetch:
+    src: "{{ traefik_certs_dir }}/homelab-ca.crt"
+    dest: "{{ playbook_dir }}/../roles/common/files/homelab-ca.crt"
+    flat: true

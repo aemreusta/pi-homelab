@@ -1,0 +1,129 @@
+---
+# rclone config + sync script + schedule.
+#
+# The config holds an OAuth refresh token and both crypt keys, so it is
+# root-only 0600 and rendered from vault. If the vault vars are absent the role
+# deploys everything EXCEPT the config and leaves the cron disabled, so a fresh
+# clone can run `make gdrive-backup` without failing on a secret it has not been
+# given yet.
+
+- name: Detect whether the Google Drive token is present
+  ansible.builtin.set_fact:
+    gdrive_backup_have_creds: "{{ vault_rclone_gdrive_token | default('') | length > 0 }}"
+
+- name: Warn when the Google Drive token is missing
+  ansible.builtin.debug:
+    msg: >-
+      vault_rclone_gdrive_token is not set, so rclone.conf was NOT written and
+      the sync cron stays disabled. Run `rclone authorize "drive"` on a machine
+      with a browser and add the token to vault.yml. See docs/design/043-offsite-backup-google-drive.md.
+  when: not (gdrive_backup_have_creds | bool)
+
+- name: Create rclone config directory
+  ansible.builtin.file:
+    path: "{{ gdrive_backup_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Deploy rclone configuration
+  ansible.builtin.template:
+    src: rclone.conf.j2
+    dest: "{{ gdrive_backup_config_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: gdrive_backup_have_creds | bool
+
+- name: Deploy Google Drive sync script
+  ansible.builtin.template:
+    src: gdrive-sync.sh.j2
+    dest: /usr/local/bin/homelab-gdrive-sync.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create Google Drive sync log
+  ansible.builtin.file:
+    path: "{{ gdrive_backup_log }}"
+    state: touch
+    owner: root
+    group: root
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+  changed_when: false
+
+- name: Ensure the private streamed rclone log exists
+  ansible.builtin.file:
+    path: "{{ gdrive_backup_detail_log }}"
+    state: touch
+    owner: root
+    group: root
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+
+# Own only the gdrive-backup child; leave the shared parent ownership intact.
+- name: Ensure backup success state directory exists
+  ansible.builtin.file:
+    path: "{{ gdrive_backup_last_success_file | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Deploy logrotate config for the Google Drive sync log
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/homelab-gdrive-sync
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {{ gdrive_backup_log }} {{ gdrive_backup_detail_log }} {
+          weekly
+          maxsize 20M
+          copytruncate
+          rotate 6
+          compress
+          missingok
+          notifempty
+      }
+
+# Drive folders are not created implicitly by `rclone sync` beyond the sync
+# target itself, so the rest of the tree has to be made explicitly. `rclone
+# mkdir` is idempotent, so this is safe on every run.
+# check_mode-safe: skipped under --check (the CD's deep-check phase) because it
+# talks to a live API. See CLAUDE.md check-mode skip class.
+- name: Create the homelab folder tree on Google Drive
+  ansible.builtin.command:
+    cmd: >-
+      {{ gdrive_backup_rclone_bin }} mkdir
+      gdrive:{{ gdrive_backup_root_folder }}/{{ item }}
+      --config {{ gdrive_backup_config_path }}
+  loop: "{{ gdrive_backup_folders }}"
+  loop_control:
+    label: "{{ gdrive_backup_root_folder }}/{{ item }}"
+  register: gdrive_backup_mkdir
+  changed_when: false
+  when:
+    - gdrive_backup_have_creds | bool
+    - not ansible_check_mode
+
+# Weekly, after the local backup and docker-prune. Disabled unless credentials
+# exist — a cron that fails every week is alert noise, not coverage.
+- name: Schedule the Google Drive sync
+  ansible.builtin.cron:
+    name: homelab-gdrive-sync
+    user: root
+    minute: "{{ gdrive_backup_cron_minute }}"
+    hour: "{{ gdrive_backup_cron_hour }}"
+    weekday: "{{ gdrive_backup_cron_weekday }}"
+    job: /usr/local/bin/homelab-gdrive-sync.sh
+    cron_file: homelab-gdrive-sync
+    state: >-
+      {{ 'present'
+         if (gdrive_backup_enabled | bool and gdrive_backup_have_creds | bool)
+         else 'absent' }}

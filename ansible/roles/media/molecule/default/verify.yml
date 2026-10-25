@@ -1,0 +1,87 @@
+---
+- name: Verify — assert hardening directives across all media services
+  hosts: localhost
+  gather_facts: false
+  vars:
+    sandbox: /tmp/molecule-media
+    # Apply LSIO cap set to these services
+    lscr_services:
+      - qbittorrent
+      - sonarr
+      - radarr
+      - prowlarr
+      - jellyfin
+    # byparr moved to the Mac worker 2026-07-13 (see mac-worker/) — no longer
+    # a Pi media-role service.
+    all_services:
+      - qbittorrent
+      - sonarr
+      - radarr
+      - prowlarr
+      - jellyfin
+  tasks:
+    - name: Slurp docker-compose.yml
+      ansible.builtin.slurp:
+        src: "{{ sandbox }}/docker-compose.yml"
+      register: dc
+
+    - name: Decode docker-compose
+      ansible.builtin.set_fact:
+        compose_yaml: "{{ (dc.content | b64decode) | from_yaml }}"
+
+    - name: Assert baseline hardening directives on every service
+      ansible.builtin.assert:
+        that:
+          - "'no-new-privileges:true' in compose_yaml.services[item].security_opt"
+          - compose_yaml.services[item].mem_limit is defined
+          - compose_yaml.services[item].healthcheck is defined
+          - compose_yaml.services[item].labels['org.opencontainers.image.title'] is defined
+          - compose_yaml.services[item].labels['org.opencontainers.image.source'] is defined
+          - compose_yaml.services[item].labels['org.opencontainers.image.vendor'] is defined
+        fail_msg: "{{ item }} hardening incomplete"
+      loop: "{{ all_services }}"
+
+    - name: Assert pids_limit on every service
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services[item].pids_limit | int > 0
+        fail_msg: "{{ item }} pids_limit missing"
+      loop: "{{ all_services }}"
+
+    - name: Assert cap_drop ALL on every service
+      ansible.builtin.assert:
+        that:
+          - "'ALL' in compose_yaml.services[item].cap_drop"
+          - compose_yaml.services[item].cap_add | length > 0
+        fail_msg: "{{ item }} must have cap_drop: [ALL]"
+      loop: "{{ all_services }}"
+
+    - name: Assert LSIO cap set on linuxserver.io services
+      ansible.builtin.assert:
+        that:
+          - "'CHOWN' in compose_yaml.services[item].cap_add"
+          - "'DAC_OVERRIDE' in compose_yaml.services[item].cap_add"
+          - "'FOWNER' in compose_yaml.services[item].cap_add"
+          - "'SETGID' in compose_yaml.services[item].cap_add"
+          - "'SETUID' in compose_yaml.services[item].cap_add"
+          - "'KILL' in compose_yaml.services[item].cap_add"
+        fail_msg: "{{ item }} missing one of the LSIO required caps"
+      loop: "{{ lscr_services }}"
+
+    - name: Assert PUID/PGID env preserved on LSIO services
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services[item].environment | select('match', '^PUID=') | list | length == 1
+          - compose_yaml.services[item].environment | select('match', '^PGID=') | list | length == 1
+        fail_msg: "{{ item }} missing PUID/PGID env"
+      loop: "{{ lscr_services }}"
+
+    - name: Assert /srv:/data hardlink mount preserved on services that need it
+      ansible.builtin.assert:
+        that:
+          - "'/srv:/data' in compose_yaml.services[item].volumes"
+        fail_msg: "{{ item }} missing /srv:/data hardlink mount"
+      loop:
+        - qbittorrent
+        - sonarr
+        - radarr

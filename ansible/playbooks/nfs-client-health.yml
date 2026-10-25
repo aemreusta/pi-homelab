@@ -1,0 +1,9 @@
+---
+- name: Deploy NFS client read probes and telemetry without restarting the server
+  hosts: pi
+  become: true
+  tasks:
+    - name: Deploy NFS client health
+      ansible.builtin.include_role:
+        name: nfs_server
+        tasks_from: client_health

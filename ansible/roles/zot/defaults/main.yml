@@ -1,0 +1,94 @@
+---
+# Zot — lightweight, OCI-native container registry with a web UI (Harbor-like:
+# registry + browse UI + retention/GC + optional CVE scan) for hosting
+# locally-built homelab images, e.g. forks of upstream apps (see PRD 013).
+#
+# Chosen over Harbor on purpose: Harbor is an 8+ container stack (core, portal,
+# jobservice, registry, registryctl, PostgreSQL, Redis, Trivy, nginx) with a
+# ~1.5-2 GB working set. On this 8 GB Pi — already mem_limit-overcommitted and
+# with a documented swap-death history — that is a non-starter. Zot is a single
+# Go binary (~50-150 MB) that gives the same push/pull + UI experience.
+
+zot_compose_dir: /home/{{ docker_user }}/docker/core/zot
+zot_config_dir: /home/{{ docker_user }}/docker/core/zot/config
+# Image blobs live on the SSD (same /dev/sda fs as /). App images are small;
+# retention + GC below keep this bounded (/ sits ~93 % full).
+zot_data_dir: /srv/registry
+zot_tz: "{{ timezone }}"
+
+# Full image (bundles the search + UI extensions), arm64. Latest per the
+# latest-everything directive — a registry self-update is low-risk.
+zot_image: "ghcr.io/project-zot/zot-linux-arm64:latest"
+
+# Host port → container 5000. NOTE: host 5000 is taken by MLflow, so we publish
+# 5050. The registry API and the web UI share the one port.
+zot_port: 5050
+zot_container_port: 5000
+
+# Run as the host owner (UID/GID 1000) so the bind-mounted config + storage dirs
+# (owned by {{ docker_user }}) are read/writable. zot is a plain binary with no
+# root-init step, so this just works (unlike the LSIO/s6 images).
+zot_puid: 1000
+zot_pgid: 1000
+
+# Auth — htpasswd (bcrypt). One push/pull account, admin on all repos. The Mac
+# build script and the Pi docker daemon both `docker login` with these.
+zot_username: "{{ vault_zot_username | default('homelab') }}"
+zot_password: "{{ vault_zot_password | default('') }}"
+
+# --- storage hygiene (keep the registry bounded) ---
+# Docker manifest compatibility. Zot is OCI-native and REJECTS Docker
+# schema2 manifests (application/vnd.docker.distribution.manifest.v2+json)
+# with HTTP 415 unless this is set — which is exactly what `docker push` /
+# buildx on OrbStack send, so without it EVERY push fails ("manifest invalid").
+# "docker2s2" makes Zot accept Docker schema2 alongside OCI. See runbook/Zot
+# docs: http.compat. (Diagnosed 2026-06-25 — nothing had ever pushed.)
+zot_compat:
+  - docker2s2
+
+zot_gc: true
+zot_gc_delay: "1h"          # grace before an untagged/dangling blob is GC-eligible
+zot_gc_interval: "24h"      # periodic GC sweep
+zot_dedupe: true
+# Retention: per repo keep the N most-recently pushed AND pulled tags, drop the
+# rest + untagged manifests older than the delay. Tightened 2026-07-13 (10→5,
+# 168h→72h): a fork image released fast (8 tags in 3 days), so 10+7d let 16 tags
+# accumulate. 5 recent SHA tags + :latest/:stable (always in the most-pulled set
+# — the CD controller pulls them every 5 min) is ample: the ONLY rollback target
+# that matters is the controller's last_good (= the running image), and any
+# dropped tag is rebuildable from git. GC (above) reclaims the orphaned blobs.
+# A role's floor-pin image tag is kept on a recent tag so retention
+# never orphans it. Observability: ZotGCStalled / ZotRegistryGrowing vmalert
+# rules (rules/zot.yml.j2) catch a wedged sweep — silent cleanup = silent failure.
+zot_retention_keep_recent: 5
+zot_retention_delay: "72h"
+
+# --- extensions ---
+zot_ui_enable: true
+zot_search_enable: true      # required by the UI
+zot_scrub_enable: true       # periodic blob-integrity check
+zot_scrub_interval: "24h"
+zot_metrics_enable: true     # /metrics for the vmagent scrape + ZotDown alert
+
+# Container memory limit (full image w/ UI on a small registry: ~50-150 MB live)
+zot_mem_limit: 256M
+zot_pids_limit: 200
+
+# --- hardening ---
+# The official zot image is distroless (static binary + certs, no shell/curl/wget).
+# It runs unprivileged and only reads /etc/zot + writes /var/lib/registry, so
+# cap_drop ALL with NO cap_add is safe — there is no chown/setuid init like the
+# node/LSIO images need. Consequence: no in-container CMD healthcheck is possible
+# (no shell); liveness is the /metrics scrape + the ZotDown vmalert rule instead
+# (same precedent as the scratch-based portainer/beszel images).
+zot_cap_drop:
+  - ALL
+zot_cap_add: []
+
+zot_oci_labels:
+  org.opencontainers.image.title: zot
+  org.opencontainers.image.description: "Zot — OCI registry + UI for local homelab images"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/zot/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://github.com/project-zot/zot"

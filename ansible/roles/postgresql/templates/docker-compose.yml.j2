@@ -1,0 +1,70 @@
+---
+# PostgreSQL — shared relational backend for the ML stack (MLflow, Langfuse, Prefect).
+# https://hub.docker.com/_/postgres
+# Managed by Ansible — do not edit manually.
+
+services:
+  postgresql:
+    image: {{ postgresql_image }}
+    container_name: postgresql
+    restart: unless-stopped
+    init: true
+    # Run as UID 999 (the `postgres` system user inside the image). Data dir is
+    # pre-owned 999:999 by Ansible so cap_drop ALL works without CHOWN capability.
+    user: "{{ postgresql_puid }}:{{ postgresql_pgid }}"
+    # Load pg_stat_statements (+ tuning) via server flags. shared_preload_libraries
+    # needs a restart — the template change notifies the Restart handler.
+    command:
+      - postgres
+      - "-c"
+      - "shared_preload_libraries={{ postgresql_shared_preload_libraries }}"
+{% for conf in postgresql_server_conf %}
+      - "-c"
+      - "{{ conf }}"
+{% endfor %}
+    mem_limit: {{ postgresql_mem_limit }}
+    shm_size: {{ postgresql_shm_size }}
+    pids_limit: {{ postgresql_pids_limit }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for c in postgresql_cap_drop %}
+      - {{ c }}
+{% endfor %}
+    labels:
+{% for k, v in postgresql_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - TZ={{ postgresql_tz }}
+      - POSTGRES_PASSWORD={{ postgresql_postgres_password }}
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=postgres
+      # All data in /var/lib/postgresql/data (the volume mount below).
+      - PGDATA=/var/lib/postgresql/data
+    ports:
+      # Loopback-only — admin psql from the Pi host. ML services connect via
+      # mlstack_net using service-name resolution (postgresql:5432), not this host port.
+      # No LAN exposure; no UFW rule required.
+      - "127.0.0.1:{{ postgresql_port }}:5432"
+    volumes:
+      - {{ postgresql_data_dir }}:/var/lib/postgresql/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - mlstack_net
+
+networks:
+  mlstack_net:
+    # Network is created by this role's deploy.yml and declared external here so
+    # MLflow and other ML-stack services can join it via their own compose files.
+    external: true

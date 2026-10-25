@@ -1,0 +1,438 @@
+# Observability gap-filler service alerts — Sprint 020.
+# Covers Speedtest Tracker + Uptime Kuma plus the host SMART check
+# (smart-check.sh) that is the disk-health alerting path. (Scrutiny was
+# retired 2026-06-04 — could not detect the USB-bridge SSD; smart-check.sh
+# covers it. These SMART rules are independent of Scrutiny.)
+#
+# Quoting: any annotation surfacing $value/printf uses single-quoted-outer /
+# escaped-inner per docs/conventions/vmalert-rule-quoting.md.
+#
+# Datasource: VictoriaMetrics (PromQL). node-exporter textfile collector
+# (smart_check_*), speedtest scrape job, uptime-kuma scrape job.
+
+groups:
+  - name: observability-services
+    interval: 1m
+    rules:
+      # ── Speedtest alert hierarchy (avoid one event = three pushes) ───
+      # A scrape/container outage makes speedtest_tracker_* ABSENT, so the
+      # Degraded/Floor exprs below return no-data and stay silent. Ownership:
+      #   SpeedtestScrapeDown  → scrape/container is down (up==0)
+      #   SpeedtestStale       → scrape OK but the scheduled test value is frozen
+      #   Speedtest*Degraded/*BelowFloor → up AND running, but actually slow
+      # So an outage pages once (ScrapeDown/Stale), not three times.
+
+      # ── Speedtest Tracker scrape liveness ────────────────────────────
+      - alert: SpeedtestScrapeDown
+        expr: up{job="speedtest"} == 0
+        for: {{ vmalert_speedtest_scrape_down_for | default('10m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "Speedtest Tracker scrape down"
+          description: "vmagent can't scrape speedtest:8765/prometheus. Container down, or the Prometheus integration was disabled in the speedtest UI (dataintegration.prometheus_enabled). Check the container + `make speedtest` (configure.yml re-enables it)."
+
+      # ── Speedtest freshness: SpeedtestStaleV2 only (below) ───────────
+      # `SpeedtestStale` lived here and was DELETED 2026-08-02. It inferred
+      # freshness from `changes(speedtest_tracker_download_bits[3h]) == 0`,
+      # because speedtest-tracker exposes no last-run timestamp metric. When
+      # `speedtest-result-liveness.sh` gave us a real SQLite timestamp,
+      # SpeedtestStaleV2 replaced it — and the comment written at the time
+      # already said why: "the metric-delta approach fires false positives when
+      # speedtest keeps returning the same result". Both were nonetheless kept,
+      # labelled belt-and-suspenders.
+      #
+      # The predicted false positive then happened. On 2026-08-02 V1 fired warn
+      # while V2 — which the same comment calls authoritative — was inactive,
+      # `speedtest_last_result_ok` was 1 and `speedtest_failed_last_24h` was 0.
+      # A stable link returning identical figures is the documented trigger.
+      #
+      # Redundant alerting is valuable when the copies fail INDEPENDENTLY. It is
+      # not redundancy when one copy is known-wrong: it only guarantees a false
+      # page whose defence is an operator remembering which of two
+      # similarly-named alerts to ignore. Freshness needs a timestamp, never a
+      # value delta — a constant value is not a stopped producer. Guard:
+      # tests/test_vmalert_rules.py TestNoKnownFalsePositiveRulesKeptAsBackup.
+
+{% if (vmalert_speedtest_freshness_metric | default('')) | length > 0 %}
+      # ── Speedtest throughput anomalies (up-but-slow; see hierarchy note) ──
+      # Two-pronged per docs/operations: an ABSOLUTE floor tied to the plan
+      # rate (catches slow multi-week decline + "paying for 100, getting 40"
+      # — a relative ratio can never see that), AND a RELATIVE drop vs a
+      # baseline OFFSET out of the live window (avg_over_time(...[7d] offset N))
+      # so a sustained brownout can't drag its own baseline down and self-clear.
+      # The count_over_time guard suppresses cold-start noise in the first week.
+      - alert: SpeedtestDownloadBelowFloor
+        expr: speedtest_tracker_download_bits < {{ vmalert_speedtest_download_floor_bits | default(50000000) }}
+        for: {{ vmalert_speedtest_anomaly_for | default('90m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Download {{ '{{ $value | printf "%.0f" }}' }} bps below floor ({{ vmalert_speedtest_download_floor_bits | default(50000000) }} bps)'
+          description: "Sustained download below the absolute floor (~50% of the contracted plan). Catches slow ISP decline a relative-only rule misses. Check the line/ISP; compare in the speedtest UI."
+
+      - alert: SpeedtestDownloadDegraded
+        expr: |
+          speedtest_tracker_download_bits
+            < {{ vmalert_speedtest_degraded_ratio | default(0.5) }} * avg_over_time(speedtest_tracker_download_bits[7d] offset {{ vmalert_speedtest_baseline_offset | default('6h') }})
+          and count_over_time(speedtest_tracker_download_bits[7d]) > {{ vmalert_speedtest_min_samples | default(24) }}
+        for: {{ vmalert_speedtest_anomaly_for | default('90m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Download {{ '{{ $value | printf "%.0f" }}' }} bps < {{ vmalert_speedtest_degraded_ratio | default(0.5) }}x the 7d baseline'
+          description: "Download dropped well below its 7-day baseline (offset to exclude the live dip). 'Up but slow' — distinct from a frozen/absent feed."
+
+      - alert: SpeedtestUploadBelowFloor
+        expr: speedtest_tracker_upload_bits < {{ vmalert_speedtest_upload_floor_bits | default(10000000) }}
+        for: {{ vmalert_speedtest_anomaly_for | default('90m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Upload {{ '{{ $value | printf "%.0f" }}' }} bps below floor ({{ vmalert_speedtest_upload_floor_bits | default(10000000) }} bps)'
+          description: "Sustained upload below the absolute floor. TUNE vmalert_speedtest_upload_floor_bits to your plan's upload rate."
+
+      - alert: SpeedtestUploadDegraded
+        expr: |
+          speedtest_tracker_upload_bits
+            < {{ vmalert_speedtest_degraded_ratio | default(0.5) }} * avg_over_time(speedtest_tracker_upload_bits[7d] offset {{ vmalert_speedtest_baseline_offset | default('6h') }})
+          and count_over_time(speedtest_tracker_upload_bits[7d]) > {{ vmalert_speedtest_min_samples | default(24) }}
+        for: {{ vmalert_speedtest_anomaly_for | default('90m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Upload {{ '{{ $value | printf "%.0f" }}' }} bps < {{ vmalert_speedtest_degraded_ratio | default(0.5) }}x the 7d baseline'
+          description: "Upload dropped well below its 7-day baseline (offset to exclude the live dip)."
+
+      - alert: SpeedtestPingElevated
+        expr: |
+          speedtest_tracker_ping_ms > {{ vmalert_ping_ratio | default(3) }} * avg_over_time(speedtest_tracker_ping_ms[7d] offset {{ vmalert_speedtest_baseline_offset | default('6h') }})
+          and speedtest_tracker_ping_ms > {{ vmalert_ping_floor_ms | default(50) }}
+          and count_over_time(speedtest_tracker_ping_ms[7d]) > {{ vmalert_speedtest_min_samples | default(24) }}
+        for: {{ vmalert_speedtest_anomaly_for | default('90m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Ping {{ '{{ $value | printf "%.0f" }}' }} ms — {{ vmalert_ping_ratio | default(3) }}x baseline and > {{ vmalert_ping_floor_ms | default(50) }} ms'
+          description: "Latency sustained well above the 7-day baseline and the absolute floor. Possible upstream congestion or line fault."
+{% endif %}
+
+      # ── Speedtest result liveness (textfile metric path) ──────────────
+      # Independent of the Prometheus scrape path — detects failures even
+      # when vmagent is down (the textfile metric comes from node_exporter
+      # which is a separate process). The speedtest-result-liveness.sh cron
+      # (every 5 min) queries the Speedtest Tracker SQLite DB directly.
+
+      # ── Speedtest last result is a failure ────────────────────────────
+      - alert: SpeedtestLastResultFailed
+        expr: speedtest_last_result_ok == 0
+        for: {{ vmalert_speedtest_last_result_failed_for | default('15m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "Last speedtest test failed"
+          description: "The most recent speedtest result has status 'failed'. Likely an Ookla transient error (server timeout, connection reset). It should self-recover on the next hourly run. Check the speedtest UI if this persists."
+
+      # ── Speedtest result liveness script stopped (silent-zero) ───────
+      - alert: SpeedtestResultLivenessStale
+        expr: time() - speedtest_result_liveness_last_run_unix_seconds > {{ vmalert_speedtest_liveness_stale_seconds | default(7200) }}
+        for: {{ vmalert_speedtest_liveness_stale_for | default('30m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Speedtest result liveness check stale for {{ '{{ $value | printf "%.0f" }}' }}s'
+          description: "The speedtest-result-liveness.sh cron (every 5 min) hasn't emitted its textfile metric in over 2 hours. Speedtest failure detection via the textfile path is blind. Check the root crontab and /var/lib/node_exporter/textfile/speedtest_result_liveness.prom."
+
+      # ── Speedtest staleness (the only staleness rule) ─────────────────
+      # Reads the real last-result timestamp from speedtest-result-liveness.sh
+      # (SQLite), which is why it is correct: freshness is a timestamp question.
+      # It replaced a `changes(gauge[3h]) == 0` inference that fired false
+      # positives whenever the link was stable enough to return the same figures
+      # twice. That predecessor was kept alongside it "as belt-and-suspenders"
+      # and duly fired falsely on 2026-08-02 while this rule stayed correctly
+      # inactive; it is now deleted (see the note where it used to live, ~line 37).
+      # The V2 suffix is kept only because the metric and the alert name are
+      # referenced elsewhere — there is no V1.
+      - alert: SpeedtestStaleV2
+        expr: time() - speedtest_last_result_timestamp > {{ vmalert_speedtest_stale_v2_seconds | default(21600) }}
+        for: {{ vmalert_speedtest_stale_v2_for | default('10m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'No speedtest result in {{ '{{ $value | printf "%.0f" }}' }}s'
+          description: "The speedtest-result-liveness.sh SQLite timestamp hasn't updated in over 6 hours. The hourly speedtest schedule has stopped. Check SPEEDTEST_SCHEDULE and the speedtest container."
+
+      # ── Uptime Kuma meta-monitor (watch the watcher) ─────────────────
+      # Nothing else watches Kuma; if it wedges we'd lose the alert path
+      # silently (the same F9 blind-spot class this sprint closes for byparr).
+      # Inert until the uptime-kuma scrape job is enabled (vault metrics key
+      # set) — until then up{job="uptime-kuma"} is absent and this can't fire.
+      - alert: UptimeKumaDown
+        expr: up{job="uptime-kuma"} == 0
+        for: {{ vmalert_uptime_kuma_down_for | default('5m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: "Uptime Kuma is down — outage alerts are blind"
+          description: "vmagent can't scrape uptime-kuma:3011/metrics. The endpoint-uptime monitor itself is down, so its ntfy push path is dead. Restart the container; check the API key if this started after a key rotation."
+
+      # ── Uptime Kuma config drift (committed JSON vs live) ────────────
+      # The weekly drift cron (uptime-kuma-drift.sh) emits 1 when the live
+      # monitor set diverges from the committed backup JSON — i.e. someone added/
+      # removed/renamed a monitor in the UI without re-committing. -1 = check
+      # error (UK down / key wrong), handled by absent/other rules, not here.
+      - alert: UptimeKumaConfigDrift
+        expr: uptime_kuma_config_drift == 1
+        for: 10m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "Uptime Kuma config drifted from the committed JSON"
+          description: "Live monitor set differs from roles/uptime_kuma/templates/uptime-kuma-backup.json.j2. Re-export + commit (runbook 039 §7) or revert the UI change. Run `make uptime-kuma-drift` for the diff."
+
+      # ── Uptime Kuma notification target unreachable ──────────────────
+      # UptimeKumaConfigDrift above compares config to config, so it reported 0
+      # for three weeks while every monitor was failing to notify: the committed
+      # JSON and the live DB BOTH said `http://ntfy.example:2586`, and that name
+      # died in the 2026-07-15 .example -> .example.internal cut. A comparison
+      # cannot catch a value that is wrong on both sides. This rule watches an
+      # actual probe of the target instead, so a monitoring stack that cannot
+      # reach its own notifier is loud rather than green.
+      - alert: UptimeKumaNotifyTargetDown
+        expr: uptime_kuma_notify_target_up == 0
+        for: 30m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Uptime Kuma notification target {{ '{{ $labels.notification }}' }} is unreachable'
+          description: 'Uptime Kuma notification "{{ '{{ $labels.notification }}' }}" points at {{ '{{ $labels.url }}' }}, which does not resolve or refuses connections — every monitor using it is failing silently. Check the hostname against ntfy_external_base_url; `make uptime-kuma` reconciles the live row.'
+
+      # ── ntfy liveness (watch the notification channel) ───────────────
+      # vmagent scrapes ntfy (up{job="ntfy"}), but nothing alerted on it.
+      # CAVEAT (intentional, see docs/operations): ntfy is also the delivery
+      # channel, so this alert CANNOT page via ntfy if ntfy is what's down —
+      # its value is the vmalert/Grafana UI + a recovery backlog once ntfy
+      # returns. The real fix (a second Alertmanager receiver for crit) is
+      # tracked as a follow-up (ntfy SPOF). Still worth firing.
+      - alert: NtfyDown
+        expr: up{job="ntfy"} == 0
+        for: {{ vmalert_ntfy_down_for | default('5m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: "ntfy is down — alert delivery is blind"
+          description: "vmagent can't scrape ntfy:2586/metrics. ALL ntfy-routed alerts (vmalert via ntfy-bridge, Uptime Kuma, cron scripts) are undeliverable while this holds. This very alert can't reach you over ntfy — check Grafana/vmalert UI. Restart the ntfy container."
+
+      # ── ntfy-bridge delivery failures (silent-delivery class #3) ─────
+      # 2026-08-02: the bridge lost 10 alerts in 24h and the ONLY trace was a
+      # line on container stderr. Root cause was a post-boot DNS race — the
+      # bridge starts before AdGuard serves DNS, so ntfy.example.internal is
+      # unresolvable for ~60s — made permanent by do_POST answering 204 even
+      # on a failed send, which told Alertmanager "delivered" so it never
+      # retried. Both are fixed; this rule is what makes the NEXT instance
+      # visible instead of log-only.
+      #
+      # increase() over a counter, not a level check: the counter never
+      # resets except on container restart, so a level threshold would latch
+      # on forever after one bad night.
+      - alert: NtfyBridgeSendFailures
+        expr: increase(ntfy_bridge_send_failures_total[{{ vmalert_ntfy_bridge_failures_window | default('1h') }}]) > 0
+        for: {{ vmalert_ntfy_bridge_failures_for | default('5m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'ntfy-bridge dropped {{ '{{ $value | printf "%.0f" }}' }} alert(s)'
+          description: 'The bridge exhausted all 6 retries (~62s) on at least one alert, so a notification you should have received was not delivered. Alertmanager is now told 5xx on failure and will retry, so this firing means BOTH layers gave up. Check `docker logs ntfy-bridge` for the transport error: "Name does not resolve" = DNS/AdGuard, "Connection refused" = ntfy container down (see NtfyDown), a 4xx = topic/auth change. Cross-check /var/log/alert-audit.log for status=fail lines to see exactly which alerts were lost.'
+
+      # Scrape-liveness for the bridge itself. NtfyDown watches ntfy; this
+      # watches the hop between vmalert and ntfy, which is where every
+      # vmalert-routed notification actually dies.
+      - alert: NtfyBridgeDown
+        expr: up{job="ntfy-bridge"} == 0
+        for: {{ vmalert_ntfy_bridge_down_for | default('10m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: "ntfy-bridge is down — vmalert notifications are blind"
+          description: "vmagent can't scrape the Alertmanager→ntfy bridge. Every vmalert-routed notification goes through it, so while this holds they are undeliverable — including this alert. Check the vmalert/Grafana UI and `docker ps | grep ntfy-bridge`."
+
+      # A persistent subscriber is required only for stream-based clients.
+      # iOS can receive upstream poll requests through APNS while this gauge
+      # stays zero, so subscriber absence must not claim all delivery failed.
+{% if vmalert_ntfy_live_subscribers_required | default(true) %}
+      - alert: NtfyNoSubscribers
+        expr: max_over_time(ntfy_subscribers_total{job="ntfy"}[6h]) == 0
+        for: {{ vmalert_ntfy_no_subscribers_for | default('30m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "ntfy has had no live stream subscriber for 6h"
+          description: "This deployment requires a persistent stream client, but none was observed for 6 h. Reconnect that client to {{ ntfy_hostname }}. This gauge does not prove iOS/APNS delivery failed; verify phone receipt separately."
+{% endif %}
+
+      - alert: DeadmanHeartbeatUnconfigured
+        expr: deadman_heartbeat_configured == 0
+        for: 30m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "External dead-man's-switch is not armed"
+          description: "The heartbeat cron runs without a configured ping URL. A Pi, network or evaluator outage therefore has no independent notification path. Complete docs/runbooks/040-2026-05-31-deadman-switch-activation.md; this on-Pi warning does not replace the external check."
+
+      # ── Dead-man's-switch invariants failing (on-box view) ───────────
+      # The EXTERNAL page (healthchecks.io) is the real signal — it survives the
+      # Pi dying, which this on-box rule cannot. This only adds visibility for the
+      # case where invariants fail but VM still answers (e.g. disk not writable):
+      # the heartbeat is pinging /fail. Configured-gated so it's silent until the
+      # healthchecks URL is set.
+      - alert: DeadmanHeartbeatInvariantsFailing
+        expr: (deadman_heartbeat_invariants_ok == 0) and (deadman_heartbeat_configured == 1)
+        for: 15m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "Dead-man's-switch invariants failing"
+          description: "The external heartbeat is pinging /fail (disk-writable or VM-query check failed) — healthchecks.io will page. If VM itself is down, trust the external page, not this rule."
+
+      # ── vmagent self-monitoring (watch the scraper) ─────────────────
+      # When vmagent dies, ALL scrape-based alerting goes blind — every
+      # up{job="…"} metric stops being updated. This rule fires because
+      # vmalert queries VictoriaMetrics DIRECTLY (not through vmagent):
+      # when vmagent stops scraping itself, VM staleness handling makes
+      # up{job="vmagent-self"} absent/0, and vmalert detects it.
+      # The textfile collector rejected at least one .prom file. This is the
+      # meta-guard for EVERY cron-emitted gauge on the box, and it was missing
+      # until 2026-08-03 — when it turned out to have been sitting at 1 with
+      # nobody watching.
+      #
+      # What it caught the day it was written:
+      #   - one cleanup cron's .prom  "second HELP line for metric name ..." —
+      #     the reaper emitted a full
+      #     HELP/TYPE block per namespace, so ALL 14 of its gauges were being
+      #     written correctly and never ingested, including the two that its
+      #     own vmalert rules read. A silent cron whose file looked healthy.
+      #   - homepage_probe.prom   "contains unsupported client-side timestamps"
+      #
+      # A rejected file is invisible in the worst possible way: the emitter
+      # succeeds, the file is fresh on disk, `cat` shows correct values, and
+      # every rule reading it silently never fires. CLAUDE.md hard rule #1 says
+      # every cron must emit a metric — this is what checks the metric ARRIVES.
+      #
+      # The gauge carries no file label, so the description points at the one
+      # place that names the file.
+      - alert: NodeTextfileScrapeError
+        expr: node_textfile_scrape_error > 0
+        for: {{ vmalert_node_textfile_scrape_error_for | default('15m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "node_exporter is rejecting a textfile .prom — those gauges are silently absent"
+          description: "At least one file in /var/lib/node_exporter/textfile failed to parse, so node_exporter skips it ENTIRELY and every gauge in it is missing from Prometheus while the file still looks fresh and correct on disk. Any alert rule reading those gauges can never fire. The gauge has no file label: run `docker logs --tail 50 node-exporter 2>&1 | grep textfile` to see which file and which line. Common causes: a second HELP/TYPE line for the same metric name (an emitter appending per-item blocks instead of writing headers once), client-side timestamps, or a truncated write from a non-atomic emit."
+
+      - alert: VMAgentScrapeDown
+        expr: up{job="vmagent-self"} == 0
+        for: {{ vmalert_vmagent_scrape_down_for | default('5m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: "vmagent is down — all scrape-based alerts are blind"
+          description: "vmagent can't scrape itself on :8429/metrics. ALL scrape-based alerting (speedtest, uptime-kuma, node-exporter, cadvisor, ntfy, minio, etc.) is inactive while vmagent is down. Restart the vmagent container; check docker logs."
+
+      # vmagent running but unable to forward metrics to VictoriaMetrics —
+      # scraping works but nothing lands in VM, so all Prometheus queries
+      # return stale data.
+      - alert: VMAgentRemoteWriteFailing
+        expr: vmagent_remote_write_errors_total{job="vmagent-self"} > 0
+        for: {{ vmalert_vmagent_remote_write_fail_for | default('10m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "vmagent remote-write to VictoriaMetrics is failing"
+          description: "vmagent is running and scraping targets but cannot forward to VictoriaMetrics on :8428. All scraped metrics are being queued/dropped. Check VictoriaMetrics health and available disk."
+
+      # ── VictoriaLogs liveness (watch the log store) ──────────────────
+      # VL's in-container healthcheck was removed 2026-07-16: the upstream
+      # image went distroless (no shell/wget — nothing an exec check can run),
+      # so docker health status can never be green. This rule is the
+      # replacement liveness signal: vmagent scrapes :9428/metrics directly.
+      # When VL is down, every log-based alert (container-error-rate group,
+      # vmalert-logs datasource) is blind, and fluent-bit buffers/drops —
+      # hence crit.
+      - alert: VictoriaLogsDown
+        expr: up{job="victorialogs"} == 0
+        for: {{ vmalert_victorialogs_down_for | default('5m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: "VictoriaLogs is down — log-based alerting is blind"
+          description: "vmagent can't scrape victorialogs on :9428/metrics. All LogsQL-based alerts (container error rates) are inactive and fluent-bit is buffering/dropping logs while this holds. Restart the container; check docker logs victorialogs and /srv disk space. NOTE: the container reports no docker health status by design (distroless image) — this rule is the liveness signal."
+
+      # ── SMART overall-health failure (authoritative vmalert path) ────
+      # Belt-and-suspenders with smart-check.sh's own urgent ntfy. health_ok
+      # is only meaningful when data_available=1 (the USB→SATA bridge can
+      # transiently return no SMART data; that must NOT page as a failure).
+      - alert: SmartHealthNotOK
+        expr: (smart_check_health_ok == 0) and (smart_check_data_available == 1)
+        for: 5m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: "SMART health NOT OK on /dev/sda"
+          description: "smart-check.sh reports overall SMART health != PASSED/OK. Disk failure likely imminent — run `smartctl -d scsi -a /dev/sda`, confirm a current backup, plan replacement. (no-data-removal rule still applies — do not auto-prune.)"
+
+      # ── smart-check cron silently died (silent-zero) ─────────────────
+      # The one failure the in-script ntfy CANNOT cover: a dead cron sends
+      # nothing. Daily cron (05:00) → stale if no run in >2 days.
+      - alert: SmartDataUnavailable
+        expr: (smart_check_data_available == 0) or absent(smart_check_data_available)
+        for: 15m
+        labels:
+          severity: warn
+          service: disk
+        annotations:
+          summary: 'SMART health monitoring has no usable data'
+          description: 'A running daily cron does not prove disk health was read. Check /usr/local/bin/smart-check.sh under PATH=/usr/bin:/bin and the configured smartctl transport. Missing telemetry is not a healthy disk.'
+
+      - alert: SmartCheckStale
+        expr: time() - smart_check_last_run_unix_seconds > {{ vmalert_smart_check_stale_seconds | default(172800) }}
+        for: 30m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'smart-check cron has not run in {{ '{{ $value | printf "%.0f" }}' }}s'
+          description: "The daily smart-check.sh (05:00) hasn't emitted its textfile metric in over 2 days. Disk-health monitoring is silently blind. Check the root crontab and /var/lib/node_exporter/textfile/smart_check.prom."
+
+      # ── Reallocated-sector growth (slow-degradation early warning) ───
+      - alert: SmartReallocatedSectorsGrowing
+        expr: increase(smart_check_reallocated_sectors[7d]) > 0
+        for: 5m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Reallocated sectors grew by {{ '{{ $value | printf "%.0f" }}' }} in 7d'
+          description: "SMART reallocated-sector count on /dev/sda is climbing — an early SSD-wear signal. Monitor; plan replacement if growth continues."

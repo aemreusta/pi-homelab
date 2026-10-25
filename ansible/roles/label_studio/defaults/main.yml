@@ -1,0 +1,106 @@
+---
+# Label Studio — open-source data-labeling UI for the ML stack (PRD-004).
+# Use case: audio / speech-to-text dataset QA — correct machine transcripts,
+# label segments, check existing labels. Source audio + annotation export live
+# in MinIO (S3); STT pre-annotations are produced off-box (see design 035).
+#
+# Community Edition (Apache-2.0). Single-operator, SQLite all-in-one — NOT the
+# Postgres+nginx+Redis production stack, which the Pi has no RAM for. Audio is
+# served from MinIO (presigned URLs), never uploaded into the app, so the
+# server footprint stays small.
+
+label_studio_compose_dir: /home/{{ docker_user }}/docker/data/label-studio
+# App-private data (SQLite DB, config, exports) on the SSD in the ML-stack
+# namespace — decoupled from the compose dir so a compose-dir wipe never drops
+# the project DB. Owned by the image's runtime UID (1001), NOT 1000: this dir
+# is app-private, not shared /srv media, so it doesn't follow the host-1000
+# convention. (Audio itself lives in MinIO, so this dir stays small.)
+label_studio_data_dir: /srv/data/label-studio
+label_studio_tz: "{{ timezone }}"
+
+# Pinned, not :latest — reproducible deploys (CLAUDE.md: pin image versions).
+# 1.23.0 is the current CE release; confirmed multi-arch (arm64 pulls on the Pi).
+label_studio_image: "heartexlabs/label-studio:1.23.0"
+
+# Host port. Container listens on 8080; 8080 host is taken by AdGuard, so remap.
+label_studio_port: 8085
+
+# The image is built to run as UID 1001 (non-root, baked in). We do NOT override
+# `user:` — HOME (/label-studio) is owned by 1001 inside the image and the
+# entrypoint writes there; the host data dir is pre-owned 1001:1001 to match.
+label_studio_puid: 1001
+label_studio_pgid: 1001
+
+# External URL behind Traefik internal-CA HTTPS. Drives absolute-URL building
+# and the login redirect; CSRF_TRUSTED_ORIGINS must match or Django rejects the
+# login POST behind the proxy.
+label_studio_host_url: "https://label-studio.{{ homelab_internal_domains[0] }}"
+
+# Django CSRF trusted origins — MUST list every origin the login POST can come
+# from, or it 403s. Multi-valued (comma-joined into the env var) so the UI works
+# over LAN HTTPS, the bare LAN host port, and Tailscale HTTPS alike. The
+# Tailscale origin is only added when vault_tailscale_fqdn is set (a global vault
+# var, NOT the traefik-role var) so an unset fqdn never renders an invalid
+# "https://".
+label_studio_csrf_trusted_origins: >-
+  {{ (homelab_internal_domains | default(['homelab'])
+        | map('regex_replace', '^', 'https://label-studio.') | list)
+     + ['http://' ~ ansible_facts['default_ipv4']['address'] ~ ':' ~ label_studio_port]
+     + (['https://' ~ vault_tailscale_fqdn]
+        if (vault_tailscale_fqdn | default('')) | length > 0 else []) }}
+
+# Bootstrap admin (created on first boot from these env vars — no manual signup).
+# Username must be an email. Vault-only; the role asserts they're set.
+label_studio_username: "{{ vault_label_studio_username | default('') }}"
+label_studio_password: "{{ vault_label_studio_password | default('') }}"
+# Fixed legacy API token — lets the off-box STT pre-annotation script push
+# predictions without scraping a session cookie. Vault-only.
+label_studio_user_token: "{{ vault_label_studio_user_token | default('') }}"
+
+# Lock down open registration — only the bootstrap admin (and users it invites
+# via link) can sign in. Without this, anyone on the LAN could self-register.
+label_studio_disable_signup: "true"
+
+# Re-enable legacy ("Authorization: Token <token>") API auth. LS 1.20+ disabled
+# it org-wide by default in favour of expiring JWT personal-access tokens — but
+# a long-lived legacy token is what an unattended batch job (the Faz-2 STT
+# prediction-import script using label_studio_user_token) needs. Without this,
+# the provisioned token 401s ("legacy token authentication has been disabled").
+# Authoritative: LABEL_STUDIO_ENABLE_LEGACY_API_TOKEN (settings/base.py).
+label_studio_enable_legacy_token: "true"
+# Disable HumanSignal telemetry (privacy + works offline).
+label_studio_collect_analytics: "false"
+
+# Container memory limit (requires kernel cgroup_enable=memory). A single-
+# operator SQLite instance idles ~0.6-0.9 GB; 1536M is a runaway-containment
+# CEILING, not a reservation (the Pi is tight — watch working set, tune down if
+# stable). See docs/conventions/container-mem-limits.md.
+label_studio_mem_limit: 1536M
+
+# --- Container security hardening ---
+label_studio_pids_limit: 512
+# Python/Django app binding only high port 8080, running non-root on a pre-owned
+# data dir → no Linux capabilities required. Drop everything; if the entrypoint
+# turns out to need CHOWN on the data dir, that surfaces on first deploy.
+label_studio_cap_drop:
+  - ALL
+
+label_studio_oci_labels:
+  org.opencontainers.image.title: label-studio
+  org.opencontainers.image.description: "Label Studio CE — audio/ASR dataset labeling & QA"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/label_studio/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://github.com/HumanSignal/label-studio"
+
+# --- Postgres backend (migrated off SQLite 2026-07-07) ---
+# When true, LS stores projects/tasks/annotations in the shared Postgres
+# (postgresql:5432/label_studio via mlstack_net) instead of the local SQLite.
+# The SQLite file under label_studio_data_dir is retained untouched as the
+# rollback path — flip this to false + redeploy to return to it.
+label_studio_use_postgres: true
+label_studio_pg_host: postgresql
+label_studio_pg_port: 5432
+label_studio_pg_name: label_studio
+label_studio_pg_user: label_studio
+label_studio_pg_password: "{{ vault_label_studio_db_password }}"

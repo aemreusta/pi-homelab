@@ -1,0 +1,28 @@
+---
+- name: Reload ethernet connection # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: nmcli connection up "{{ common_ethernet_connection }}"
+  changed_when: false
+  failed_when: false
+
+- name: Reboot required for cgroup
+  ansible.builtin.debug:
+    msg: "REBOOT REQUIRED: cgroup_enable=memory was added. Run 'sudo reboot' on the Pi to activate Docker memory limits."
+
+- name: Restart journald
+  ansible.builtin.systemd:
+    name: systemd-journald
+    state: restarted
+
+# Masking a unit doesn't clear its failed state from systemd's runtime view —
+# without this, `systemctl --failed` keeps reporting smartmontools.service
+# until the next reboot. failed_when: false keeps the handler safe if the
+# unit was never in a failed state to begin with.
+- name: Reset failed state for smartmontools.service  # noqa: command-instead-of-module
+  ansible.builtin.command: systemctl reset-failed smartmontools.service
+  changed_when: false
+  failed_when: false
+
+- name: Update CA certificates  # noqa: command-instead-of-module
+  ansible.builtin.command: update-ca-certificates
+  changed_when: true

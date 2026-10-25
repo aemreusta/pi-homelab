@@ -1,0 +1,77 @@
+#!/usr/bin/env node
+/*
+ * Uptime Kuma idempotent seeder — managed by Ansible, do not edit.
+ *
+ * Rebuilds notifications + monitors from the committed backup JSON over UK's
+ * socket.io API (UK 1.x has no monitor-CRUD REST API). Makes "restore UK from
+ * repo" a real runnable path, not just a file + a runbook. Idempotent: existing
+ * notifications/monitors (matched by name) are skipped, so re-running is safe
+ * and a clean way to drill the restore (expect "created 0").
+ *
+ * Runs INSIDE the uptime-kuma container (which bundles socket.io-client):
+ *   docker exec -e UK_USER -e UK_PASS uptime-kuma \
+ *     node --eval "$(cat seed.js)"   (or via the seed.yml Ansible task)
+ *
+ * Env: UK_USER, UK_PASS (admin creds), BACKUP_JSON (path inside container).
+ * Maintenance window + status-page grouping are NOT seeded here (configured
+ * live, rarely change) — see runbook 039 §4/§5 to re-apply them post-restore.
+ */
+const io = require("socket.io-client");
+const fs = require("fs");
+
+const URL = process.env.UK_URL || "http://localhost:3001";
+const backup = JSON.parse(fs.readFileSync(process.env.BACKUP_JSON, "utf8"));
+const socket = io(URL, { transports: ["websocket"] });
+const emit = (ev, ...a) => new Promise((res) => { socket.emit(ev, ...a, (r) => res(r)); setTimeout(() => res({ timeout: true, ev }), 9000); });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+let monitorList = {}, notificationList = [];
+socket.on("monitorList", (m) => { monitorList = m || monitorList; });
+socket.on("notificationList", (n) => { notificationList = n || notificationList; });
+
+function fail(msg) { console.error("SEED FAIL:", msg); process.exit(1); }
+
+(async () => {
+  await new Promise((r) => { socket.on("connect", r); setTimeout(r, 5000); });
+  if (!socket.connected) fail("could not connect to " + URL);
+  const login = await emit("login", { username: process.env.UK_USER, password: process.env.UK_PASS, token: "" });
+  if (!login || !login.ok) fail("login failed: " + JSON.stringify(login));
+  await sleep(1500); // let monitorList / notificationList push arrive
+
+  // 1) notifications — map committed id -> live id (create if missing by name)
+  const notifIdMap = {};
+  for (const n of backup.notificationList || []) {
+    const existing = notificationList.find((x) => x.name === n.name);
+    if (existing) { notifIdMap[n.id] = existing.id; continue; }
+    const cfg = Object.assign({}, n); delete cfg.id;
+    const r = await emit("addNotification", cfg, null);
+    if (!r || !r.ok) fail("addNotification " + n.name + ": " + JSON.stringify(r));
+    notifIdMap[n.id] = r.id;
+  }
+
+  // 2) monitors — idempotent by name; remap notificationIDList via notifIdMap
+  const have = new Set(Object.values(monitorList).map((m) => m.name));
+  let created = 0, skipped = 0;
+  for (const m of backup.monitorList || []) {
+    if (have.has(m.name)) { skipped++; continue; }
+    const nidl = {};
+    for (const k of Object.keys(m.notificationIDList || {})) {
+      const live = notifIdMap[k]; if (live) nidl[live] = true;
+    }
+    const mon = {
+      type: m.type, name: m.name, url: m.url || null, hostname: m.hostname || null,
+      port: m.port || null, dns_resolve_server: m.dns_resolve_server || null,
+      dns_resolve_type: m.dns_resolve_type || "A",
+      method: "GET", interval: m.interval || 60, retryInterval: m.retryInterval || 60,
+      resendInterval: 0, maxretries: m.maxretries != null ? m.maxretries : 2,
+      accepted_statuscodes: m.accepted_statuscodes || ["200-299"],
+      notificationIDList: nidl, upsideDown: false, ignoreTls: false,
+      maxredirects: 10, expiryNotification: false,
+    };
+    const r = await emit("add", mon);
+    if (!r || !r.ok) fail("add " + m.name + ": " + JSON.stringify(r));
+    created++;
+  }
+  console.log(`seed ok: notifications=${(backup.notificationList || []).length} monitors created=${created} skipped(existing)=${skipped}`);
+  process.exit(0);
+})().catch((e) => fail(String(e)));

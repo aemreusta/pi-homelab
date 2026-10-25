@@ -1,0 +1,31 @@
+# vmagent Prometheus-style scrape config — managed by Ansible
+# Each job below scrapes one /metrics endpoint and forwards via remote_write.
+
+global:
+  scrape_interval: {{ vmagent_scrape_interval }}
+  scrape_timeout: {{ vmagent_scrape_timeout }}
+  external_labels:
+    host: homelab
+
+scrape_configs:
+{% for job in vmagent_scrape_jobs if job.enabled | default(true) | bool %}
+  - job_name: {{ job.name }}
+    metrics_path: {{ job.metrics_path | default('/metrics') }}
+{% if job.basic_auth_username is defined and job.basic_auth_password is defined and job.basic_auth_password | length > 0 %}
+    basic_auth:
+      username: "{{ job.basic_auth_username }}"
+      password: "{{ job.basic_auth_password }}"
+{% endif %}
+    static_configs:
+      - targets: ["{{ job.target }}"]
+        labels:
+          host: homelab
+          app_name: {{ job.name }}
+{% if job.drop_labels is defined %}
+    metric_relabel_configs:
+{% for label in job.drop_labels %}
+      - action: labeldrop
+        regex: "{{ label }}"
+{% endfor %}
+{% endif %}
+{% endfor %}

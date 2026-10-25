@@ -1,0 +1,52 @@
+---
+# Uptime Kuma — multi-protocol uptime monitor with status page.
+# https://github.com/louislam/uptime-kuma
+# Managed by Ansible — do not edit manually.
+
+services:
+  uptime-kuma:
+    image: {{ uptime_kuma_image }}
+    container_name: uptime-kuma
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ uptime_kuma_mem_limit }}
+    pids_limit: {{ uptime_kuma_pids_limit }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for c in uptime_kuma_cap_drop %}
+      - {{ c }}
+{% endfor %}
+{% if uptime_kuma_cap_add | length > 0 %}
+    cap_add:
+{% for c in uptime_kuma_cap_add %}
+      - {{ c }}
+{% endfor %}
+{% endif %}
+    labels:
+{% for k, v in uptime_kuma_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - TZ={{ uptime_kuma_tz }}
+    ports:
+      - "{{ uptime_kuma_port }}:3001"
+    volumes:
+      - {{ uptime_kuma_data_dir }}:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "-sf", "http://127.0.0.1:3001"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - uptime_kuma_net
+
+networks:
+  uptime_kuma_net:
+    driver: bridge

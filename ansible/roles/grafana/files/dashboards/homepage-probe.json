@@ -1,0 +1,143 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Service response time (server-side)",
+      "description": "HTTP response time of each dashboard target, probed every ~2m by the homepage role's host cron. Server-side latency, not in-browser render.",
+      "gridPos": {"h": 10, "w": 16, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never"},
+          "color": {"mode": "palette-classic"}
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+          "expr": "homepage_probe_duration_seconds",
+          "legendFormat": "{{target}}"
+        }
+      ],
+      "options": {
+        "legend": {"showLegend": true, "displayMode": "table", "placement": "right", "calcs": ["mean", "max", "lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Target availability",
+      "description": "1 = answered on its LAN port, 0 = no response (homepage_probe_up).",
+      "gridPos": {"h": 10, "w": 8, "x": 16, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "UP", "color": "green"}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]},
+          "color": {"mode": "thresholds"}
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+          "expr": "homepage_probe_up",
+          "legendFormat": "{{target}}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "auto",
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Homepage dashboard response time",
+      "description": "The homepage dashboard's own HTTP response time (the 'pageload' proxy — server-side TTFB, not browser render).",
+      "gridPos": {"h": 8, "w": 16, "x": 0, "y": 10},
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "showPoints": "never"},
+          "color": {"mode": "fixed", "fixedColor": "blue"}
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+          "expr": "homepage_probe_duration_seconds{target=\"homepage\"}",
+          "legendFormat": "homepage"
+        }
+      ],
+      "options": {
+        "legend": {"showLegend": false},
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Probe freshness",
+      "description": "Seconds since the probe cron last ran. Should stay under ~120s (cron is every 2m). Climbing = the cron died (HomepageProbeStale).",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 10},
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 180}, {"color": "red", "value": 900}]},
+          "color": {"mode": "thresholds"}
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+          "expr": "time() - homepage_probe_last_run_timestamp_seconds",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "auto",
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": ["homepage", "probe", "homelab"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Homepage / Service Probe",
+  "uid": "homepage-probe",
+  "version": 1,
+  "weekStart": ""
+}

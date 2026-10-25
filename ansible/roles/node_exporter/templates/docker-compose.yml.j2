@@ -1,0 +1,60 @@
+---
+# Prometheus node_exporter — host hardware metrics on :{{ node_exporter_port }}
+# Uses host network + bind-mount of `/` for accurate filesystem/PID/sysfs access.
+
+services:
+  node-exporter:
+    image: {{ node_exporter_image }}
+    container_name: node-exporter
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ node_exporter_mem_limit }}
+    pids_limit: {{ node_exporter_pids_limit }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in node_exporter_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+{% if node_exporter_cap_add | length > 0 %}
+    cap_add:
+{% for cap in node_exporter_cap_add %}
+      - {{ cap }}
+{% endfor %}
+{% endif %}
+    network_mode: host
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+      # Textfile collector: scans this dir (via the /host bind above) for
+      # *.prom files emitted by host scripts. Path is from container's PoV.
+      - --collector.textfile.directory=/host{{ node_exporter_textfile_dir }}
+      - --web.listen-address=0.0.0.0:{{ node_exporter_port }}
+    environment:
+      - TZ={{ node_exporter_tz }}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # Probe '/' (tiny landing page) and CONSUME the body — never '/metrics'
+      # with --spider. 2026-07-31: --spider on /metrics made wget hang up
+      # after the headers while node_exporter was still streaming, so the
+      # server logged one "error encoding and sending metric family: broken
+      # pipe" per metric family — 408 errors every 30s (~1.2M/day) drowning
+      # the log. It also forced a full 4300-line collector run every 30s on a
+      # load-4 Pi purely to throw the output away. The scrape itself was never
+      # slow (scrape_duration_seconds ≈ 0.157s); two earlier scrape_timeout
+      # bumps (10s→20s→30s) chased the wrong cause and changed nothing.
+      # Keep '-O /dev/null' (reads the body to EOF) rather than '--spider'.
+      test: ["CMD", "wget", "--quiet", "--tries=1", "-O", "/dev/null", "http://localhost:{{ node_exporter_port }}/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

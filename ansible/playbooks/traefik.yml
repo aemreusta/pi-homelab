@@ -1,0 +1,6 @@
+---
+- name: Deploy Traefik reverse proxy
+  hosts: pi
+  become: true
+  roles:
+    - traefik

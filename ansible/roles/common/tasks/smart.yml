@@ -1,0 +1,16 @@
+---
+- name: Deploy SMART check script
+  ansible.builtin.template:
+    src: smart-check.sh.j2
+    dest: /usr/local/bin/smart-check.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule daily SMART check
+  ansible.builtin.cron:
+    name: "smart disk health check"
+    user: root
+    hour: "5"
+    minute: "0"
+    job: "/usr/local/bin/smart-check.sh"

@@ -1,0 +1,62 @@
+---
+# Google cAdvisor — per-container metrics on host port {{ cadvisor_port }}
+# Needs broad host visibility for cgroups, /proc, /sys, /var/lib/docker.
+# Hardened: replaces upstream `privileged: true` with cap_drop ALL + targeted cap_add
+# (DAC_READ_SEARCH, SYS_PTRACE, SYS_ADMIN) which is the standard non-privileged
+# securityContext used in Kubernetes deployments of cAdvisor.
+
+services:
+  cadvisor:
+    image: {{ cadvisor_image }}
+    container_name: cadvisor
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ cadvisor_mem_limit }}
+    pids_limit: {{ cadvisor_pids_limit }}
+    read_only: {{ cadvisor_read_only | lower }}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size={{ cadvisor_tmpfs_size }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in cadvisor_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+    cap_add:
+{% for cap in cadvisor_cap_add %}
+      - {{ cap }}
+{% endfor %}
+    devices:
+      - /dev/kmsg
+    labels:
+{% for k, v in cadvisor_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    ports:
+      - "{{ cadvisor_port }}:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      # The Docker/containerd handler uses spec.Root.Path as an absolute path.
+      # /rootfs alone does not expose it there; rslave follows new task mounts.
+      - {{ cadvisor_docker_data_root }}:{{ cadvisor_docker_data_root }}:ro,rslave
+      - /etc/machine-id:/etc/machine-id:ro
+    command:
+      - --housekeeping_interval=30s
+      - --docker_only=true
+      - --store_container_labels=false
+      - --disable_metrics={{ cadvisor_disabled_metrics | join(',') }}
+    environment:
+      - TZ={{ cadvisor_tz }}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

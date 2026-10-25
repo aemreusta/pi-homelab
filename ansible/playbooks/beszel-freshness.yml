@@ -1,0 +1,9 @@
+---
+- name: Deploy Beszel data freshness monitoring without reconfiguring the hub
+  hosts: pi
+  become: true
+  tasks:
+    - name: Deploy Beszel freshness collector
+      ansible.builtin.include_role:
+        name: beszel
+        tasks_from: freshness

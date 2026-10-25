@@ -1,0 +1,10 @@
+# /etc/exports — managed by Ansible (nfs_server role)
+# Manual changes will be overwritten on next deploy.
+#
+# Each path is exported to every subnet in its `subnets` list. We dual-export
+# to LAN + Tailscale so Mac clients can mount via either path without server
+# reconfig when they roam.
+{% for export in nfs_server_exports %}
+{{ export.path }}    {% for subnet in export.subnets %}{{ subnet }}({{ export.options }}){% if not loop.last %} {% endif %}{% endfor %}
+
+{% endfor %}

@@ -1,0 +1,9 @@
+---
+- name: Deploy service probes without restarting application containers
+  hosts: pi
+  become: true
+  tasks:
+    - name: Deploy Homepage probes
+      ansible.builtin.include_role:
+        name: homepage
+        tasks_from: probe

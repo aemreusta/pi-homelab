@@ -1,0 +1,58 @@
+---
+# Jellyseerr — Netflix-style media request system
+# https://github.com/Fallenbagel/jellyseerr
+
+services:
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    restart: unless-stopped
+    # tini as PID 1 reaps `next-server`'s un-`wait()`ed wget children
+    # (TMDB/IMDB image prefetches). Without this, 4 <defunct> entries
+    # accumulate per cold start and drift up over weeks. Same pattern as
+    # byparr (commit 218e0f2). Sprint 016 Story 2b.
+    init: true
+    mem_limit: {{ jellyseerr_mem_limit }}
+    pids_limit: {{ jellyseerr_pids_limit }}
+    read_only: {{ jellyseerr_read_only | lower }}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size={{ jellyseerr_tmpfs_size }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in jellyseerr_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+{% if jellyseerr_cap_add | length > 0 %}
+    cap_add:
+{% for cap in jellyseerr_cap_add %}
+      - {{ cap }}
+{% endfor %}
+{% endif %}
+    labels:
+{% for k, v in jellyseerr_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - TZ={{ jellyseerr_tz }}
+    ports:
+      - "{{ jellyseerr_port }}:5055"
+    volumes:
+      - {{ jellyseerr_config_dir }}:/app/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5055/api/v1/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - jellyseerr_net
+
+networks:
+  jellyseerr_net:
+    driver: bridge

@@ -1,0 +1,6 @@
+---
+- name: Deploy Fluent Bit (log collector for VictoriaLogs)
+  hosts: pi
+  become: true
+  roles:
+    - fluentbit

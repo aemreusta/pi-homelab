@@ -1,0 +1,13 @@
+[Unit]
+Description=Start tailscale-dns container after tailscale0 is ready
+After=tailscaled.service docker.service
+Wants=tailscaled.service docker.service
+
+[Service]
+Type=oneshot
+ExecStart={{ tailscale_dns_resume_script }}
+RemainAfterExit=yes
+TimeoutStartSec=150
+
+[Install]
+WantedBy=multi-user.target

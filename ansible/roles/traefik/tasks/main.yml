@@ -1,0 +1,23 @@
+---
+# Internal CA + *.example leaf first, so the cert exists before the container
+# starts (deploy.yml templates dynamic.yml referencing /certs/homelab.crt).
+- name: Include internal-CA cert tasks
+  ansible.builtin.include_tasks:
+    file: internal-ca.yml
+    apply:
+      tags: [traefik, configure, tls]
+  tags: [traefik, configure, tls]
+  when: traefik_internal_ca_enabled | bool
+
+- name: Include Traefik deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [traefik]
+
+- name: Include Traefik TLS cert tasks
+  ansible.builtin.include_tasks: certs.yml
+  tags: [traefik, configure]
+  when: traefik_tailscale_fqdn | length > 0
+
+- name: Include Traefik UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [traefik, firewall]

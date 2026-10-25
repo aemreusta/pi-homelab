@@ -1,0 +1,63 @@
+---
+# vmagent — scrape /metrics, remote_write to VictoriaMetrics
+# Host network mode so it can reach every other observability component
+# (VL/VM bridge-published ports, node_exporter/cAdvisor/Traefik/ntfy on host)
+# via 127.0.0.1, bypassing the DOCKER-USER chain that blocks bridge→host.
+
+services:
+  vmagent:
+    image: {{ vmagent_image }}
+    container_name: vmagent
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ vmagent_mem_limit }}
+    pids_limit: {{ vmagent_pids_limit }}
+    read_only: {{ vmagent_read_only | lower }}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size={{ vmagent_tmpfs_size }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in vmagent_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+{% if vmagent_cap_add | length > 0 %}
+    cap_add:
+{% for cap in vmagent_cap_add %}
+      - {{ cap }}
+{% endfor %}
+{% endif %}
+    labels:
+{% for k, v in vmagent_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    network_mode: host
+    volumes:
+      - {{ vmagent_data_dir }}:/data
+      - {{ vmagent_config_dir }}/scrape.yml:/etc/vmagent/scrape.yml:ro
+    command:
+      - --promscrape.config=/etc/vmagent/scrape.yml
+      - --remoteWrite.url={{ vmagent_remote_write_url }}
+      - --remoteWrite.tmpDataPath=/data
+      - --httpListenAddr=:{{ vmagent_port }}
+      # Disable gzip on scrape requests. vmagent's gzip-aware response
+      # reader was racing with node-exporter's trailing writes, producing
+      # benign-but-noisy "broken pipe" ERROR logs at every scrape. With
+      # plain identity encoding the read drains cleanly. Verified via
+      # `curl /metrics` (no keep-alive, no gzip) → 0 ERRORs in 10 scrapes.
+      - --promscrape.disableCompression=true
+    environment:
+      - TZ={{ vmagent_tz }}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Use 127.0.0.1: glibc resolves "localhost" to ::1 first in some images,
+    # service listens IPv4 only → Connection refused. 127.0.0.1 is deterministic.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:{{ vmagent_port }}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

@@ -1,0 +1,15 @@
+---
+# Disable WiFi since the Pi is now connected via ethernet.
+# This prevents unnecessary power usage and potential network conflicts.
+
+- name: Check if WiFi is enabled # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: nmcli radio wifi
+  register: common_wifi_status
+  changed_when: false
+
+- name: Disable WiFi radio # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: nmcli radio wifi off
+  changed_when: true
+  when: common_wifi_status.stdout == 'enabled'

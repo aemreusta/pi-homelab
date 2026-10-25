@@ -1,0 +1,121 @@
+---
+beszel_compose_dir: /home/{{ docker_user }}/docker/core/beszel
+beszel_data_dir: /home/{{ docker_user }}/docker/core/beszel/data
+beszel_agent_data_dir: /home/{{ docker_user }}/docker/core/beszel/agent-data
+beszel_tz: "{{ timezone }}"
+
+beszel_port: 8090
+beszel_agent_port: 45876
+
+# --- Disk monitoring ---
+# Root disk. Beszel accepts a device, partition, or mount point — but a
+# CONTAINERISED agent has no bind of the host root, so `/` would stat the
+# container's own filesystem. Hence a device name here.
+#
+# KNOWN FRAGILITY: this Pi re-enumerates its USB disks (sda->sdb->sdc) on every
+# power incident — four on 2026-08-01/02, see
+# docs/conventions/pi4-usb-power-budget.md. After a dropout this may point at
+# the wrong disk, or none. If Beszel's root-disk chart goes flat or looks wrong
+# after an incident, check `lsblk` and update this var. Tracked in TODO.
+beszel_root_filesystem: /dev/sda
+
+# Additional disks. Per Beszel's docs the DOCKER agent discovers these through
+# bind mounts into /extra-filesystems (the EXTRA_FILESYSTEMS env var is for the
+# binary/systemd agent), so each entry mounts a marker directory that lives ON
+# the target filesystem — which is what makes it survive device renaming.
+#
+# `name` uses Beszel's `device__Label` convention: the device prefix is what
+# lets it join /proc/diskstats for I/O stats; without it you get usage only.
+# EMPTIED 2026-08-02 with the ssd2 rollback. Docker auto-creates a missing bind
+# source, so leaving this entry in place while the drive is gone makes Beszel
+# bind a directory on the ROOT disk and chart it under the Kingston's name —
+# the root disk reported twice, one of them mislabelled. Restore this list in
+# the same change that sets storage_ssd2_enabled back to true.
+beszel_extra_filesystems: []
+
+# Legacy env-var form, kept for the SD card. Preserved rather than deleted
+# because it predates this change and may still be feeding a chart; the docs
+# say the env var is for the binary agent, so if the SD-card entry is dead in
+# the UI it can simply be emptied.
+beszel_extra_filesystems_env: /dev/mmcblk0p2
+
+beszel_admin_email: "{{ vault_beszel_email }}"
+beszel_admin_password: "{{ vault_beszel_password }}"
+
+# System to monitor
+beszel_system_name: homelab
+beszel_system_host: "127.0.0.1"
+beszel_system_port: "{{ beszel_agent_port }}"
+
+# Notification — ntfy shoutrrr URL (scheme=http for local ntfy).
+# Centralized in group_vars/all/main.yml as ntfy_shoutrrr_url.
+beszel_ntfy_url: "{{ ntfy_shoutrrr_url }}"
+
+# Alert thresholds (min = duration in minutes, value = threshold).
+# Single-source-of-truth rule (see docs/design/024-alert-discipline.md):
+#   - Memory/swap → common/memory-alert.sh.j2 (hysteresis + cooldown)
+#   - Disk → common/disk-alert.sh.j2 (cooldown + jump escape hatch + actions)
+#   - CPU/Load → vmalert CPULoadHigh/Critical (for + keep_firing_for hysteresis)
+#   - Temperature/Status → here (Beszel's sustained-window check)
+#
+# Valid name enum (per Beszel alerts schema):
+#   Status, CPU, Memory, Disk, Temperature, Bandwidth, GPU,
+#   LoadAvg1, LoadAvg5, LoadAvg15, Battery
+# Using non-enum names (e.g. "CPU Usage", "Load") silently fails with API
+# status 400 — the role swallowed those errors before Sprint 014.
+#
+# CPU and LoadAvg5 were removed 2026-10-15: Beszel re-evaluates a plain
+# threshold with no hysteresis, so a host sitting at 85% sent an above/below
+# pair every few minutes (31 pushes in a day). LoadAvg5=12 duplicated vmalert's
+# CPULoadCritical (3x cores). vmalert holds one episode open instead.
+beszel_alert_rules:
+  - { name: "Temperature", min: 0, value: 70 }
+  - { name: "Status", min: 0, value: 0 }
+
+# Alert names to delete from Beszel if they exist (used to clean up
+# previously-created rules that are now handled elsewhere). Memory was
+# double-pinging with the script-side hysteresis rule — keep only one source.
+# "CPU Usage" was the old (invalid) name; "CPU"/"LoadAvg5" moved to vmalert.
+beszel_alert_rules_to_remove:
+  - "Disk"
+  - "Memory"
+  - "CPU Usage"
+  - "CPU"
+  - "LoadAvg5"
+  - "Load"
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+beszel_mem_limit: 256M
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+beszel_agent_mem_limit: 128M
+
+# --- Container security hardening ---
+
+beszel_pids_limit: 200
+beszel_agent_pids_limit: 100
+
+# Both henrygd/beszel and henrygd/beszel-agent are scratch images. Just cap_drop ALL.
+# Hub listens on port 8090 (>1024), agent on beszel_agent_port (>1024).
+beszel_cap_drop:
+  - ALL
+beszel_cap_add: []
+
+# read_only NOT applied — both binaries write to their bind-mounted data dirs.
+# The /tmp tmpfs isn't strictly needed but harmless on scratch images.
+
+beszel_oci_labels:
+  org.opencontainers.image.title: beszel
+  org.opencontainers.image.description: "Beszel — lightweight server monitoring hub"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/beszel/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://beszel.dev"
+
+beszel_agent_oci_labels:
+  org.opencontainers.image.title: beszel-agent
+  org.opencontainers.image.description: "Beszel agent — host metrics collector reporting to hub"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/beszel/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://beszel.dev"

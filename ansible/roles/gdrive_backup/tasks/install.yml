@@ -1,0 +1,54 @@
+---
+# Upstream rclone binary, pinned. Debian Trixie's 1.60.1 predates several years
+# of Google Drive OAuth and uploader fixes.
+
+- name: Check installed rclone version
+  ansible.builtin.command:
+    cmd: "{{ gdrive_backup_rclone_bin }} version"
+  register: gdrive_backup_rclone_current
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Download and install rclone
+  when: >-
+    gdrive_backup_rclone_version.lstrip('v')
+    not in (gdrive_backup_rclone_current.stdout | default(''))
+  block:
+    - name: Create rclone staging directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: rclone
+      register: gdrive_backup_tmp
+
+    - name: Download rclone archive
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/rclone/rclone/releases/download/{{ gdrive_backup_rclone_version }}/{{ gdrive_backup_rclone_stem }}.zip
+        dest: "{{ gdrive_backup_tmp.path }}/rclone.zip"
+        mode: "0644"
+      register: gdrive_backup_dl
+      retries: 3
+      delay: 5
+      until: gdrive_backup_dl is succeeded
+
+    - name: Unpack rclone archive
+      ansible.builtin.unarchive:
+        src: "{{ gdrive_backup_tmp.path }}/rclone.zip"
+        dest: "{{ gdrive_backup_tmp.path }}"
+        remote_src: true
+
+    - name: Install rclone binary
+      ansible.builtin.copy:
+        src: "{{ gdrive_backup_tmp.path }}/{{ gdrive_backup_rclone_stem }}/rclone"
+        dest: "{{ gdrive_backup_rclone_bin }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+  always:
+    - name: Remove rclone staging directory
+      ansible.builtin.file:
+        path: "{{ gdrive_backup_tmp.path | default('') }}"
+        state: absent
+      when: gdrive_backup_tmp.path is defined

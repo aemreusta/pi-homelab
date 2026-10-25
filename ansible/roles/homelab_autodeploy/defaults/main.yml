@@ -1,0 +1,141 @@
+---
+# homelab_autodeploy — Pi-side GitOps CD for the raspi-homelab repo itself.
+# TAG-GATED (2026-07-13): a plain push to master runs CI only; the CD deploys
+# ONLY the commit a `deploy-v*` tag points at (mirrors the image-repo
+# build split — CI on push, deploy on tag). On a new (CI-green) deploy
+# tag it deploys the roles whose files changed since the last deployed tag
+# (diff-based, base first); rolls back the checkout + redeploys on failure.
+# Runs ON THE PI (root cron) against itself — design 039: the vault may live on
+# the Pi (it already holds every decrypted secret) but NEVER on the Mac CI box.
+#
+# Ship a change:  after CI is green on master,
+#   git tag -a deploy-vX.Y.Z -m "what shipped" <sha> && git push origin deploy-vX.Y.Z
+#
+# ENABLED — FULL ROLLOUT (2026-07-14). The pilot proved out, so manual `make` is
+# retired: the tag deploys EVERY changed role EXCEPT the never_auto deny-list
+# (base — see homelab_autodeploy_target_allowlist and
+# homelab_autodeploy_never_auto_targets below). WHEN is gated by the `deploy-v*`
+# tag; WHAT is every changed role except base (host provisioning stays manual). The
+# per-deploy safety net (CI-green → syntax-check → deep --check --diff → apply →
+# rollback-on-ansible-failure) is the blast-radius control now, not the allowlist.
+# Prerequisites (verified present on the Pi 2026-07-03): repo checkout at
+# {{ homelab_autodeploy_repo_dir }}; root-resolvable ansible-playbook (uv, never
+# pip); vault password at <repo>/ansible/.vault-password (root-only, 0600). Set
+# homelab_autodeploy_enabled to false to fully disable (removes the cron).
+homelab_autodeploy_enabled: true
+
+homelab_autodeploy_repo_dir: "/opt/homelab/raspi-homelab"
+homelab_autodeploy_branch: "master"
+# Deploy-tag glob. The CD deploys the commit the NEWEST matching tag points at.
+# Distinct from the `v*` release tags (v1.0.0, v2.0.0…) on purpose — those mark
+# milestones, `deploy-v*` authorises an actual CD apply. Cut one per shippable
+# change; the tag name is free-form after the prefix (semver or dated).
+homelab_autodeploy_deploy_tag_glob: "deploy-v*"
+homelab_autodeploy_state_file: "/opt/homelab/.homelab-autodeploy-state.json"
+# Baseline for the deny-list drift alarm (below): {"homelab-autodeploy": "<sha>"}
+# — the control-node repo commit as of the last MANUAL `make homelab-autodeploy`.
+# Written by this role's own tasks (main.yml), read every cron cycle by
+# homelab-autodeploy.sh to detect repo changes under the role that were never
+# actually pushed to the live controller. See homelab_autodeploy_never_auto_targets.
+homelab_autodeploy_denylist_state_file: "/opt/homelab/.homelab-autodeploy-denylist-state.json"
+homelab_autodeploy_bin_dir: /usr/local/bin
+
+# role-dir → make/playbook target. The convention underscores→hyphens already
+# maps most roles to their playbook (homelab_control → homelab-control.yml etc.). Add an
+# entry ONLY for a role whose playbook name breaks that convention — otherwise
+# the derived target has no playbook and `deploy_target()` SILENTLY skips it
+# (false success), so the role never auto-deploys. Guarded by
+# tests/test_homelab_autodeploy.py::TestRoleTargetMappingIntegrity.
+homelab_autodeploy_role_target_map:
+  # role dir `speedtest_tracker` → playbook `speedtest.yml` (not the derived
+  # `speedtest-tracker.yml`). Missing this dropped the 2026-07-14 Phase 0 UFW
+  # change from the CD plan without failing the deploy.
+  speedtest_tracker: speedtest
+
+# Roles that collapse to the single `base` playbook (run first, once).
+homelab_autodeploy_base_roles:
+  - common
+  - security
+  - storage
+  - docker
+
+# ── Deploy gate: FULL ROLLOUT (manual `make` retired) ────────────────────────
+# 2026-07-14 (operator directive): manual `make <service>` is retired — the
+# `deploy-v*` tag is now the ONLY deploy trigger, and it deploys EVERY role whose
+# files changed since the last deployed tag (base first, dependency-ordered). An
+# EMPTY allowlist means "no gate": plan_targets() returns every changed target
+# and plan_skipped() returns nothing (nothing is HELD for manual anymore). This
+# is the documented full-rollout end state the phased design (039) was walking
+# toward; the pilot cohorts (homepage/grafana/vmagent/node-exporter/cadvisor/
+# fluentbit/homelab-control/beszel/watchtower) proved the loop out, so the gate
+# is dropped wholesale.
+#
+# Safety net still in force on EVERY deploy: CI-green gate (won't deploy a red
+# commit) → `--syntax-check` → semantic `--check --diff` deep-check (catches
+# undefined vars / missing roles / bad vault keys before apply) → apply → on
+# ansible failure, `git reset` to last-good + redeploy the attempted targets.
+#
+# To re-gate any tier, list the allowed targets here again (non-empty = gated).
+homelab_autodeploy_target_allowlist: []
+
+# ── Deny-list: NEVER auto-deploy these, even with an empty allowlist ──────────
+# `base` (common/security/storage/docker = host provisioning) is held OUT of the
+# CD deliberately (2026-07-14 operator directive). Unlike a service, a base
+# change that SUCCEEDS but bricks the host (a ufw rule cutting SSH, a
+# docker-daemon config killing the socket) is marked ok and is NOT
+# auto-rolled-back — the rollback only fires on an ansible non-zero exit, and the
+# CD runs ON the Pi it would brick. So base stays a deliberate manual `make base`
+# (surfaced via ntfy as held when a base file changes — never silently dropped).
+# Deny wins over the allowlist. Add other genuinely-dangerous targets here if a
+# class of them ever earns it; this is the escape hatch that keeps 'full rollout'
+# from meaning 'auto-deploy the one thing that can brick the box unrecoverably'.
+#
+# `homelab-autodeploy` is on the list too (2026-07-14 incident): the controller
+# must NEVER auto-deploy ITSELF. When it did, a mid-deploy rollback redeployed the
+# controller at the last-good commit — reverting its own live logic in the middle
+# of the cycle (the self-sabotaging-rollback class CLAUDE.md flags). Controller
+# changes ship via a deliberate manual `make homelab-autodeploy` (the bootstrap),
+# never via the tag, so a bad controller change can't auto-ship and a rollback
+# can't self-revert. Held + surfaced via ntfy like base.
+#
+# The per-cycle "held" ntfy is one-shot and easy to miss — 2026-08-03: a fix to
+# THIS controller (CHANGELOG.md -> homepage routing) shipped in the repo but sat
+# undeployed for a day because nobody re-ran `make homelab-autodeploy` after the
+# ntfy scrolled by. `homelab_autodeploy_denylist_drift{target=...}` (emitted by
+# homelab-autodeploy.sh, alerted by vmalert/homelab-autodeploy.yml.j2) is the
+# persistent version: it stays lit until the target is actually redeployed,
+# instead of clearing itself the moment the commit is silently adopted.
+homelab_autodeploy_never_auto_targets:
+  - base
+  - homelab-autodeploy
+
+# CI-green gate. With a fine-grained PAT (Actions: read on the repo) the
+# controller refuses to deploy a commit whose CI isn't green — the clean-room
+# backstop before the CD touches the Pi. Sourced from the vault
+# (`vault_homelab_autodeploy_ci_token`, the `homelab-ci-runner` PAT); `default('')`
+# keeps it empty when the vault key is absent (e.g. the CI lint stub), which
+# degrades gracefully to "no gate" (deep-check + local pre-push pytest still run).
+homelab_autodeploy_ci_token: "{{ vault_homelab_autodeploy_ci_token | default('') }}"
+homelab_autodeploy_ci_repo: "aemreusta/raspi-homelab"
+
+homelab_autodeploy_textfile_dir: /var/lib/node_exporter/textfile
+homelab_autodeploy_log_file: /var/log/homelab-autodeploy.log
+
+# ntfy — start, final result, holds, failures and rollback detail. Reference
+# the canonical var (never build).
+homelab_autodeploy_ntfy_url: "{{ ntfy_external_topic_url | default('') }}"
+# Per-step progress pushes (evaluating, CI green, checkout, per-target start/
+# done). Off since 2026-09-29: a green deploy pushed 14 messages. Steps are
+# always in homelab_autodeploy_log_file.
+homelab_autodeploy_notify_progress: false
+
+# Cron cadence — every 5 min.
+# Stagger slot 3 (was "*/5") — see homelab_cron_stagger_* in group_vars/all.
+homelab_autodeploy_cron_minute: "3-58/5"
+
+# PATH the orchestrator pins for itself (cron's bare PATH can't see uv's
+# /usr/local/bin ansible-playbook). Intentionally UNSET here so the template's
+# baked-in default (the authoritative production value) is used. Overridden only
+# by the CD drill (tests/test_autodeploy_drill.py) to prepend a mock bin dir —
+# never set it in real inventory.
+# homelab_autodeploy_path: "/usr/local/bin:/root/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"

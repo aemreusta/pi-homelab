@@ -1,0 +1,93 @@
+---
+- name: Get Tailscale IPv4 address  # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: tailscale ip -4
+  register: tailscale_dns_ip_result
+  changed_when: false
+  # READ-ONLY PROBE — must run in check mode too. `command` is SKIPPED under
+  # --check by default, so without this the register is {skipped: true} with
+  # no .stdout, the set_fact below renders '', and the assert fails with
+  # "Tailscale IP not found or invalid: ''" — on a host where Tailscale is
+  # running perfectly fine. That is the check-mode-skip class (ops-discipline
+  # §6 / design 040), and it bit the CD on 2026-09-03: a bare `make
+  # tailscale-dns` is apply-only and passed, while the CD's
+  # --check --diff phase failed 3/3 attempts and rolled the whole tag back.
+  # `tailscale ip -4` mutates nothing, so running it under --check is safe.
+  check_mode: false
+
+- name: Set Tailscale IP fact
+  ansible.builtin.set_fact:
+    tailscale_dns_ip: "{{ tailscale_dns_ip_result.stdout | trim }}"
+
+- name: Verify Tailscale IP was obtained
+  ansible.builtin.assert:
+    that:
+      - tailscale_dns_ip | length > 0
+      - tailscale_dns_ip is match('^100\.')
+    fail_msg: >-
+      Tailscale IP not found or invalid: '{{ tailscale_dns_ip }}'.
+      Ensure Tailscale is running (make tailscale).
+
+- name: Create tailscale-dns compose directory
+  ansible.builtin.file:
+    path: "{{ tailscale_dns_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create tailscale-dns config directory
+  ansible.builtin.file:
+    path: "{{ tailscale_dns_config_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Template dnsmasq configuration
+  ansible.builtin.template:
+    src: dnsmasq.conf.j2
+    dest: "{{ tailscale_dns_config_dir }}/dnsmasq.conf"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart tailscale-dns
+
+- name: Template tailscale-dns docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ tailscale_dns_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart tailscale-dns
+
+- name: Start tailscale-dns container
+  community.docker.docker_compose_v2:
+    project_src: "{{ tailscale_dns_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"
+
+- name: Install tailscale-dns-resume script
+  ansible.builtin.template:
+    src: tailscale-dns-resume.sh.j2
+    dest: "{{ tailscale_dns_resume_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install tailscale-dns-resume systemd unit
+  ansible.builtin.template:
+    src: tailscale-dns-resume.service.j2
+    dest: /etc/systemd/system/tailscale-dns-resume.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart tailscale-dns-resume
+
+- name: Enable tailscale-dns-resume service
+  ansible.builtin.systemd:
+    name: tailscale-dns-resume
+    enabled: true
+    daemon_reload: true

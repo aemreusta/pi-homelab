@@ -1,0 +1,33 @@
+---
+# Enable legacy ("Authorization: Token <token>") API auth for existing orgs.
+#
+# LABEL_STUDIO_ENABLE_LEGACY_API_TOKEN (set in the compose env) only feeds the
+# DEFAULT at org-creation time (organizations/functions.py ORs it in), so a
+# *fresh* install gets legacy auth on automatically. But an org bootstrapped by
+# an earlier env-less deploy keeps its JWTSettings row at
+# legacy_api_tokens_enabled=False (migration 0002 changed the default to False),
+# and the auth check is `org.jwt.legacy_api_tokens_enabled` — so the provisioned
+# label_studio_user_token 401s until the row is flipped. This task enforces the
+# desired state idempotently for every org.
+#
+# Mechanism: `label-studio shell` reads Python from stdin (the CLI wrapper does
+# NOT forward Django's `shell -c`). `docker exec -i` is REQUIRED — without `-i`
+# the piped stdin is silently discarded and the snippet never runs.
+#
+# UPGRADE NOTE: the import path `jwt_auth.models.JWTSettings` is stable across LS
+# 1.2x minors but verify it on a major bump (e.g. 1.23 -> 2.x). If the module is
+# renamed, the snippet prints a Traceback to stderr WITHOUT "LSCONFIG updated=0",
+# so changed_when reports "changed" while nothing was flipped — re-check that
+# whoami still returns 200 after a major upgrade. (Faz-1 review O2, 2026-06-07.)
+- name: Ensure legacy API tokens are enabled for existing organizations
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      printf '%s\n' \
+        'from jwt_auth.models import JWTSettings' \
+        'n = JWTSettings.objects.filter(legacy_api_tokens_enabled=False).update(legacy_api_tokens_enabled=True)' \
+        "print('LSCONFIG updated=%d' % n)" \
+        | docker exec -i label-studio label-studio shell
+    executable: /bin/bash
+  register: label_studio_legacy
+  changed_when: "'LSCONFIG updated=0' not in label_studio_legacy.stdout"

@@ -1,0 +1,32 @@
+---
+- name: Install NFS server packages
+  ansible.builtin.apt:
+    name:
+      - nfs-kernel-server
+    state: present
+    update_cache: true
+
+- name: Configure NFS exports
+  ansible.builtin.template:
+    src: exports.j2
+    dest: /etc/exports
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload NFS exports
+
+# Fix mountd to a static port so UFW can allow it.
+# Debian Trixie uses /etc/nfs.conf (not /etc/default/nfs-kernel-server).
+- name: Fix NFS mountd to static port 32767
+  ansible.builtin.lineinfile:
+    path: /etc/nfs.conf
+    insertafter: '^\[mountd\]'
+    regexp: '^port='
+    line: "port=32767"
+  notify: Restart NFS server
+
+- name: Enable and start NFS server
+  ansible.builtin.systemd:
+    name: nfs-kernel-server
+    enabled: true
+    state: started

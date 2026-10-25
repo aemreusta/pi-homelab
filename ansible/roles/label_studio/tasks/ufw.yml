@@ -1,0 +1,13 @@
+---
+# LAN-only access to the Label Studio host port. The browser UI is normally
+# reached via Traefik (https://label-studio.example), which terminates on the
+# host and needs no rule here; this rule keeps the direct host port reachable on
+# the LAN (e.g. the off-box STT script POSTing predictions to the API) while
+# blocking it from everywhere else.
+- name: Allow Label Studio through UFW (LAN only)
+  community.general.ufw:
+    rule: allow
+    port: "{{ label_studio_port }}"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: Label Studio

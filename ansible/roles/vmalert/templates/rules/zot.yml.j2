@@ -1,0 +1,62 @@
+# Zot OCI registry alerts.
+#
+# Scope: liveness + cleanup health. Zot hosts locally-built homelab images
+# (PRD 012/013). If it's down, the next deploy of any
+# role pulling a localhost:5050/* image fails its pull — so a down registry is a
+# deploy-blocker, not just a cosmetic outage. Cleanup: Zot's native retention +
+# GC (zot role config) prune old tags and reclaim blobs on a 24h sweep. That
+# sweep runs SILENTLY inside Zot — if it wedges, the registry grows unbounded
+# until the disk fills with nothing to show for it (the silent-cleanup class,
+# CLAUDE.md). ZotGCStalled + ZotRegistryGrowing below make that sweep observable.
+#
+# Datasource: VictoriaMetrics (PromQL). Source: the `zot` vmagent scrape job
+# (up{job="zot"}) against 127.0.0.1:5050/metrics. /metrics is gated behind
+# accessControl.metrics.users, so the job authenticates with the registry creds.
+# The zot image is distroless (no in-container healthcheck), so this up-scrape is
+# the liveness signal — same precedent as the scratch-based portainer/beszel.
+#
+# Quoting: any annotation surfacing $value/printf uses single-quoted-outer /
+# escaped-inner per docs/conventions/vmalert-rule-quoting.md.
+
+groups:
+  - name: zot
+    interval: 1m
+    rules:
+
+      # ── Zot liveness (container down OR scrape failing) ───────────────
+      - alert: ZotDown
+        expr: up{job="zot"} == 0
+        for: {{ vmalert_zot_down_for | default('10m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "Zot registry is down — local image push/pull unavailable"
+          description: "vmagent can't scrape zot at 127.0.0.1:5050/metrics. The local OCI registry is down or unreachable, so building/deploying homelab-built images will fail the pull. Restart with `make zot`; check `docker logs zot`. severity=warn (not crit): upstream images still pull fine, only local-built ones are blocked."
+
+      # ── GC sweep stalled (registry cleanup silently stopped) ─────────
+      # zot_gc_runs_total increments once per GC sweep (interval 24h). A window
+      # of {{ vmalert_zot_gc_stalled_window | default('50h') }} spans >2 sweeps,
+      # so zero runs = the scheduler wedged. Guarded on up==1 so this is silent
+      # while Zot is simply down (ZotDown owns that). Catches the exact failure
+      # that would otherwise only surface as a slow disk-fill with no cause.
+      - alert: ZotGCStalled
+        expr: (increase(zot_gc_runs_total[{{ vmalert_zot_gc_stalled_window | default('50h') }}]) == 0) and (up{job="zot"} == 1)
+        for: {{ vmalert_zot_gc_stalled_for | default('2h') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "Zot GC has not run in {{ vmalert_zot_gc_stalled_window | default('50h') }} — registry cleanup stalled"
+          description: "zot_gc_runs_total has not advanced across the window while Zot is up: the periodic garbage-collection sweep (retention + orphaned-blob reclaim, 24h interval) is not firing. Old tags/blobs will accumulate and the registry will grow unbounded (silent-cleanup class). Check `docker logs zot` for scheduler errors and `docker exec`-free `sum(zot_repo_storage_bytes)` trend; restart with `make zot` if wedged."
+
+      # ── Registry size over budget (retention not keeping up) ─────────
+      - alert: ZotRegistryGrowing
+        expr: sum(zot_repo_storage_bytes) > {{ vmalert_zot_registry_max_bytes | default(8000000000) }}
+        for: {{ vmalert_zot_registry_for | default('6h') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Zot registry is {{ "{{ $value | humanize1024 }}" }}B — over the cleanup budget'
+          description: 'Total on-disk registry size (sum of zot_repo_storage_bytes) has stayed above the budget for {{ vmalert_zot_registry_for | default('6h') }}. Retention (keep 5 recent tags/repo) + GC should hold this bounded (~a few GB); sustained growth means cleanup is losing to push volume or a repo is not covered by the ["**"] policy. Inspect per-repo: `topk(5, zot_repo_storage_bytes)`. Not crit: the SSD is large, but this is the early signal before a disk-fill.'

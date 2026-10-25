@@ -1,0 +1,6 @@
+---
+- name: Deploy the shared static Go runtime
+  hosts: pi
+  become: true
+  roles:
+    - homelab_runtime

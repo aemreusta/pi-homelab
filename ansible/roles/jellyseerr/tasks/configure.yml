@@ -1,0 +1,42 @@
+---
+- name: Wait for Jellyseerr API to be ready
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ jellyseerr_port }}/api/v1/settings/public"
+    status_code: 200
+  register: jellyseerr_public
+  retries: 15
+  delay: 5
+  until: jellyseerr_public.status == 200
+
+- name: Check if Jellyseerr needs initialization
+  ansible.builtin.set_fact:
+    jellyseerr_needs_init: "{{ not jellyseerr_public.json.initialized }}"
+
+- name: Initialize Jellyseerr via Jellyfin sign-in and finalize setup
+  ansible.builtin.shell: |
+    set -e
+    COOKIE_JAR=$(mktemp)
+    JF_BODY=$(printf '{"serverType":2,"username":"%s","password":"%s","hostname":"%s","port":8096,"useSsl":false,"urlBase":""}' \
+      "{{ vault_jellyfin_username }}" \
+      "{{ vault_jellyfin_password }}" \
+      "{{ ansible_facts['default_ipv4']['address'] }}")
+    STATUS=$(curl -s -o /tmp/jelly_auth_resp.json -w "%{http_code}" \
+      -X POST "http://127.0.0.1:{{ jellyseerr_port }}/api/v1/auth/jellyfin" \
+      -H "Content-Type: application/json" \
+      -c "$COOKIE_JAR" -d "$JF_BODY")
+    if [ "$STATUS" != "200" ] && [ "$STATUS" != "201" ]; then
+      cat /tmp/jelly_auth_resp.json >&2
+      rm -f "$COOKIE_JAR" /tmp/jelly_auth_resp.json
+      exit 1
+    fi
+    curl -s -o /dev/null \
+      -X POST "http://127.0.0.1:{{ jellyseerr_port }}/api/v1/settings/initialize" \
+      -b "$COOKIE_JAR"
+    rm -f "$COOKIE_JAR" /tmp/jelly_auth_resp.json
+  args:
+    executable: /bin/bash
+  register: jellyseerr_init_result
+  changed_when: true
+  when: jellyseerr_needs_init
+  failed_when: jellyseerr_needs_init and jellyseerr_init_result.rc != 0
+  no_log: true

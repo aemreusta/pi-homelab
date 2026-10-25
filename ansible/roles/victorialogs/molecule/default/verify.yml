@@ -1,0 +1,30 @@
+---
+- name: Verify — assert hardening directives are present in rendered files
+  hosts: localhost
+  gather_facts: false
+  vars:
+    sandbox: /tmp/molecule-vl
+  tasks:
+    - name: Slurp docker-compose.yml
+      ansible.builtin.slurp:
+        src: "{{ sandbox }}/docker-compose.yml"
+      register: dc
+
+    - name: Decode docker-compose
+      ansible.builtin.set_fact:
+        compose_yaml: "{{ (dc.content | b64decode) | from_yaml }}"
+
+    - name: Assert hardening directives
+      ansible.builtin.assert:
+        that:
+          - "'no-new-privileges:true' in compose_yaml.services.victorialogs.security_opt"
+          - "'ALL' in compose_yaml.services.victorialogs.cap_drop"
+          - compose_yaml.services.victorialogs.read_only | bool
+          - compose_yaml.services.victorialogs.tmpfs[0] is search('/tmp:.*noexec.*nosuid.*nodev.*size=')
+          - compose_yaml.services.victorialogs.pids_limit | int > 0
+          - compose_yaml.services.victorialogs.mem_limit is defined
+          - compose_yaml.services.victorialogs.healthcheck is defined
+          - compose_yaml.services.victorialogs.labels['org.opencontainers.image.title'] is defined
+          - compose_yaml.services.victorialogs.labels['org.opencontainers.image.source'] is defined
+          - compose_yaml.services.victorialogs.labels['org.opencontainers.image.vendor'] is defined
+        fail_msg: "victorialogs hardening incomplete"

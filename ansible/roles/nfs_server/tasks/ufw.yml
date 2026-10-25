@@ -1,0 +1,37 @@
+---
+# NFS requires multiple ports:
+# - 111 (rpcbind/portmapper) — TCP+UDP
+# - 2049 (nfsd) — TCP+UDP
+# - 32767 (mountd, fixed in /etc/nfs.conf) — TCP+UDP
+- name: Allow NFS (port 2049) through UFW (LAN only)
+  community.general.ufw:
+    rule: allow
+    port: "{{ nfs_server_port }}"
+    proto: "{{ item }}"
+    from_ip: "{{ nfs_server_allow_from }}"
+    comment: "NFS server"
+  loop:
+    - tcp
+    - udp
+
+- name: Allow rpcbind (port 111) through UFW (LAN only)
+  community.general.ufw:
+    rule: allow
+    port: "111"
+    proto: "{{ item }}"
+    from_ip: "{{ nfs_server_allow_from }}"
+    comment: "NFS rpcbind/portmapper"
+  loop:
+    - tcp
+    - udp
+
+- name: Allow NFS mountd (port 32767) through UFW (LAN only)
+  community.general.ufw:
+    rule: allow
+    port: "32767"
+    proto: "{{ item }}"
+    from_ip: "{{ nfs_server_allow_from }}"
+    comment: "NFS mountd (fixed port)"
+  loop:
+    - tcp
+    - udp

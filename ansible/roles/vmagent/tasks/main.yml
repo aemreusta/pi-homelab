@@ -1,0 +1,8 @@
+---
+- name: Include vmagent deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [vmagent]
+
+- name: Include vmagent UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [vmagent, firewall]

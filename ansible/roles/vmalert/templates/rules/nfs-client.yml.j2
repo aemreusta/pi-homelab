@@ -1,0 +1,40 @@
+groups:
+  - name: nfs-client
+    interval: 60s
+    rules:
+      - alert: MacNfsReadFailing
+        expr: >-
+          (mac_nfs_read_ok == 0)
+          and on(instance) (mac_nfs_status_valid == 1)
+          and on(instance) (time() - mac_nfs_check_timestamp_seconds < 600)
+        for: 5m
+        labels:
+          severity: crit
+          mac_dependent: "true"
+          service: nfs
+        annotations:
+          summary: 'Mac NFS {{ "{{ $labels.export }}" }} read checks are failing'
+          description: 'Native mount presence is insufficient. Check /var/run/homelab-nfs.json on the Mac and archive exports on the Pi. Docker NFS is independent; verify it separately before resuming retries.'
+      - alert: MacNfsStatusMissing
+        expr: >-
+          (mac_nfs_status_valid == 0)
+          or (time() - mac_nfs_check_timestamp_seconds > 600)
+        for: 10m
+        labels:
+          severity: warn
+          mac_dependent: "true"
+          service: nfs
+        annotations:
+          summary: 'Mac NFS read report is missing, invalid or stale'
+          description: 'The supervisor may be stopped, the Mac asleep/offline, or the generated-assets export unwritable. Inspect launchd io.tdarr.nfsmount and /var/log/tdarr-nfs-mount.log.'
+      - alert: MacNfsCollectorStale
+        expr: >-
+          (time() - mac_nfs_collector_timestamp_seconds > 600)
+          or absent(mac_nfs_collector_timestamp_seconds)
+        for: 10m
+        labels:
+          severity: warn
+          service: nfs
+        annotations:
+          summary: 'Pi NFS health collector has stopped publishing'
+          description: 'Check the Native Mac NFS health cron and /usr/local/bin/nfs-client-metrics.sh. This signal is independent of the Mac report timestamp.'

@@ -1,0 +1,18 @@
+---
+- name: Include Jellyseerr deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [jellyseerr]
+
+- name: Include Jellyseerr UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [jellyseerr, firewall]
+
+# `not ansible_check_mode`: configure.yml reads `jellyseerr_public.json` (a live
+# `uri` GET) in a set_fact. In `--check` mode the GET is SKIPPED (no `.json`), so
+# the set_fact crashes at arg finalization — the autodeploy deep-check would
+# brick the next jellyseerr deploy (2026-07-02 class). Check mode can validate
+# nothing in this live-API phase. See docs/operations/ops-discipline.md (class fix).
+- name: Include Jellyseerr configure tasks
+  ansible.builtin.include_tasks: configure.yml
+  tags: [jellyseerr, configure]
+  when: vault_jellyseerr_email is defined and not ansible_check_mode

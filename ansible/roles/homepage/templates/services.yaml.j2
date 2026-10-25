@@ -1,0 +1,256 @@
+---
+- Media:
+    - Jellyfin:
+        icon: jellyfin.png
+        href: https://jellyfin.{{ homelab_internal_domains[0] }}
+        description: Media Server
+        server: my-docker
+        container: jellyfin
+        widget:
+            type: jellyfin
+            url: http://{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:8096
+            key: "{{ homepage_jellyfin_api_key }}"
+            enableBlocks: true
+            enableNowPlaying: true
+    - Sonarr:
+        icon: sonarr.png
+        href: https://sonarr.{{ homelab_internal_domains[0] }}
+        description: TV Series
+        server: my-docker
+        container: sonarr
+        widget:
+            type: sonarr
+            url: http://{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:8989
+            key: "{{ homepage_sonarr_api_key }}"
+    - Radarr:
+        icon: radarr.png
+        href: https://radarr.{{ homelab_internal_domains[0] }}
+        description: Movies
+        server: my-docker
+        container: radarr
+        widget:
+            type: radarr
+            url: http://{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:7878
+            key: "{{ homepage_radarr_api_key }}"
+    - Prowlarr:
+        icon: prowlarr.png
+        href: https://prowlarr.{{ homelab_internal_domains[0] }}
+        description: Indexers
+        server: my-docker
+        container: prowlarr
+        widget:
+            type: prowlarr
+            url: http://{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:9696
+            key: "{{ homepage_prowlarr_api_key }}"
+    - qBittorrent:
+        icon: qbittorrent.png
+        href: https://qbittorrent.{{ homelab_internal_domains[0] }}
+        description: Torrents
+        server: my-docker
+        container: qbittorrent
+        widget:
+            type: qbittorrent
+            url: http://{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:8181
+            username: "{{ homepage_qbittorrent_username }}"
+            password: "{{ homepage_qbittorrent_password }}"
+    - Tdarr:
+        icon: tdarr.png
+        href: https://tdarr.{{ homelab_internal_domains[0] }}
+        description: Transcoding
+        server: my-docker
+        container: tdarr
+        widget:
+            type: tdarr
+            url: http://{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:{{ tdarr_ui_port | default(8265) }}
+    - Jellyseerr:
+        icon: jellyseerr.png
+        href: https://jellyseerr.{{ homelab_internal_domains[0] }}
+        description: Media Requests
+        server: my-docker
+        container: jellyseerr
+- Network:
+    - AdGuard Home:
+        icon: adguard-home.png
+        href: https://adguard.{{ homelab_internal_domains[0] }}
+        description: Local DNS
+        server: my-docker
+        container: adguard
+        widget:
+            type: adguard
+            url: http://{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:8080
+    - NextDNS:
+        icon: sh-nextdns
+        href: https://my.nextdns.io/{{ homepage_nextdns_profile }}/analytics
+        description: DNS Security
+        widget:
+            type: nextdns
+            profile: "{{ homepage_nextdns_profile }}"
+            key: "{{ homepage_nextdns_api_key }}"
+    - Traefik:
+        icon: traefik.png
+        href: https://traefik.{{ homelab_internal_domains[0] }}
+        description: Reverse Proxy
+        server: my-docker
+        container: traefik
+        widget:
+            type: traefik
+            url: http://{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:8180
+    - Tailscale:
+        icon: tailscale.png
+        href: https://login.tailscale.com/admin/machines
+        description: VPN Mesh
+    - ntfy:
+        icon: ntfy.png
+        href: https://{{ ntfy_hostname | default('ntfy.' ~ homelab_internal_domains[0]) }}
+        description: Notifications
+        server: my-docker
+        container: ntfy
+
+- Infrastructure:
+    - Portainer:
+        icon: portainer.png
+        href: https://portainer.{{ homelab_internal_domains[0] }}
+        description: Containers
+        server: my-docker
+        container: portainer
+    - FileBrowser:
+        icon: filebrowser.png
+        href: https://filebrowser.{{ homelab_internal_domains[0] }}
+        description: File Manager
+        server: my-docker
+        container: filebrowser
+    - Watchtower:
+        icon: watchtower.png
+        description: Auto Updates
+        server: my-docker
+        container: watchtower
+    - Control API:
+        icon: mdi-remote
+        # Link card only. The customapi widget was removed: the API binds
+        # 127.0.0.1 by design (defense-in-depth), so the LAN-IP widget always
+        # ETIMEDOUT (red card + stalled proxy). Routing it via Traefik would
+        # fail the self-signed homelab CA inside the container — not worth it.
+        # DEFERRED (conscious): the token is rendered into the href as a query
+        # param (browser history/referrer/log exposure). Out of scope for this
+        # dashboard pass; track separately if it matters.
+        href: "https://control.{{ homelab_internal_domains[0] }}/?token={{ homepage_control_token }}"
+        description: Shutdown · Restart · Update
+    - byparr:
+        icon: mdi-cloud-lock-outline
+        # byparr moved to the Mac worker 2026-07-13 (192.0.2.102) — it can't
+        # solve Cloudflare on the Pi 4B. No docker status widget: the Mac's
+        # Docker socket isn't exposed to the Pi's Homepage. See mac-worker/.
+        href: http://192.0.2.102:8191/docs
+        description: Cloudflare bypass (Mac worker)
+    - Zot Registry:
+        # Local OCI registry for homelab-built images.
+        # Link card → browser UI over Traefik TLS. Push is raspberrypi.local:5050
+        # (plain HTTP + insecure-registries), NOT this route. No native Homepage
+        # widget for zot; container stats come from the my-docker socket. A
+        # customapi /v2/_catalog widget is deliberately skipped — it needs
+        # basic-auth + the repo-count mapping is the same brittleness the
+        # Control API note above warns about.
+        icon: mdi-package-variant-closed
+        href: https://registry.{{ homelab_internal_domains[0] }}
+        description: OCI registry (homelab images)
+        server: my-docker
+        container: zot
+
+- Data:
+    - MinIO:
+        icon: minio.png
+        href: https://minio.{{ homelab_internal_domains[0] }}
+        description: Object storage (S3)
+        server: my-docker
+        container: minio
+    - Label Studio:
+        icon: mdi-tag-multiple
+        href: https://label-studio.{{ homelab_internal_domains[0] }}
+        description: Dataset labeling
+        server: my-docker
+        container: label-studio
+
+# Problems & events live here as link cards. A customapi alert-count widget was
+# deliberately deferred (the Alertmanager /api/v2/alerts array-count mapping is
+# brittle) — add one only after confirming the mapping returns a number live.
+- Observability:
+    - Grafana:
+        icon: grafana.png
+        href: https://grafana.{{ homelab_internal_domains[0] }}
+        description: Dashboards
+        server: my-docker
+        container: grafana
+    - Alertmanager:
+        icon: mdi-bell-ring
+        href: https://alertmanager.{{ homelab_internal_domains[0] }}
+        description: Problems · alert routing & silences
+        server: my-docker
+        container: alertmanager
+    - VictoriaLogs:
+        icon: mdi-text-search
+        href: https://logs.{{ homelab_internal_domains[0] }}
+        description: Events · LogsQL search
+        server: my-docker
+        container: victorialogs
+    - VictoriaMetrics:
+        icon: prometheus.png
+        href: https://metrics.{{ homelab_internal_domains[0] }}
+        description: TSDB (Prom-compatible)
+        server: my-docker
+        container: victoriametrics
+    - vmagent:
+        icon: mdi-radar
+        href: https://vmagent.{{ homelab_internal_domains[0] }}
+        description: Metric scraper
+        server: my-docker
+        container: vmagent
+    - vmalert:
+        icon: mdi-bell-alert
+        href: https://vmalert.{{ homelab_internal_domains[0] }}
+        description: PromQL alert rules
+        server: my-docker
+        container: vmalert
+    - vmalert-logs:
+        icon: mdi-bell-alert-outline
+        href: https://vmalert-logs.{{ homelab_internal_domains[0] }}
+        description: LogsQL alert rules
+        server: my-docker
+        container: vmalert-logs
+    - Beszel:
+        icon: sh-beszel
+        href: https://beszel.{{ homelab_internal_domains[0] }}
+        description: Monitoring
+        server: my-docker
+        container: beszel
+    - Uptime Kuma:
+        icon: uptime-kuma.png
+        href: https://uptime.{{ homelab_internal_domains[0] }}
+        description: Endpoint uptime + status page
+        server: my-docker
+        container: uptime-kuma
+    - Speedtest Tracker:
+        icon: speedtest-tracker.png
+        href: https://speedtest.{{ homelab_internal_domains[0] }}
+        description: ISP bandwidth log
+        server: my-docker
+        container: speedtest-tracker
+
+- Exporters:
+    - cAdvisor:
+        icon: mdi-chart-areaspline
+        href: http://{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:{{ cadvisor_port | default(8081) }}/
+        description: Container metrics
+        server: my-docker
+        container: cadvisor
+    - node-exporter:
+        icon: mdi-server
+        href: http://{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:{{ node_exporter_port | default(9100) }}/metrics
+        description: Host hardware metrics
+        server: my-docker
+        container: node-exporter
+    - fluentbit:
+        icon: mdi-tray-arrow-up
+        href: http://{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:2020/
+        description: Log shipper
+        server: my-docker
+        container: fluentbit

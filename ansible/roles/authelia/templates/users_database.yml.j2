@@ -1,0 +1,12 @@
+---
+# Authelia user database — managed by Ansible (do not edit on the host).
+# The single SSO identity. Password is an argon2id hash from vault
+# (vault_authelia_admin_password_hash). 1FA only — no TOTP secret here.
+users:
+  {{ authelia_admin_user }}:
+    disabled: false
+    displayname: '{{ authelia_admin_display_name }}'
+    password: '{{ authelia_admin_password_hash }}'
+    email: '{{ authelia_admin_email }}'
+    groups:
+      - admins

@@ -1,0 +1,6 @@
+---
+- name: Deploy homelab automated backups (Sprint 10)
+  hosts: pi
+  become: true
+  roles:
+    - backup

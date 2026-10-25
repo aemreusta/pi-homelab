@@ -1,0 +1,92 @@
+# Alertmanager configuration — Sprint 18.
+# Single receiver (ntfy-bridge); future: split by severity if needed.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: {{ alertmanager_route_default_receiver }}
+  group_by: ['alertname', 'severity']
+  group_wait: {{ alertmanager_group_wait }}
+  group_interval: {{ alertmanager_group_interval }}
+  repeat_interval: {{ alertmanager_repeat_interval }}
+  routes:
+    # Inhibition-source alerts (notify="none", e.g. MacWorkerAway) exist only
+    # to suppress their dependents. They must be routed SOMEWHERE — the
+    # blackhole receiver has no configs, so they are never delivered. Kept
+    # first so no later route can deliver them.
+    - matchers:
+        - notify="none"
+      receiver: blackhole
+      continue: false
+    # Chronic-saturation warns are sustained STATE, not recurring incidents —
+    # page once/day instead of every {{ alertmanager_repeat_interval }} (design 024:
+    # "sustained-state = 24h minimum; re-firing every few hours is nagging").
+{# Docs: docs/design/024-alert-discipline.md #}
+    # SrvDiskCritical (95%) is intentionally NOT matched so a true emergency
+    # keeps nagging at the default cadence.
+    #
+    # Interplay with the inhibit_rules below: repeat_interval governs
+    # re-notification CADENCE during the chronic-high (75–95%) phase; the
+    # SrvDiskCritical→SrvDiskHigh inhibition governs alert COUNT once disk
+    # crosses 95% (it suppresses the warn entirely while crit fires). The two
+    # cover different phases and compose — don't assume one replaces the other.
+    - matchers:
+        - alertname=~"{{ alertmanager_sustained_alert_pattern }}"
+      repeat_interval: {{ alertmanager_sustained_repeat_interval }}
+
+receivers:
+  - name: blackhole
+  - name: ntfy-bridge
+    webhook_configs:
+      - url: http://ntfy-bridge:{{ alertmanager_bridge_port }}/
+        send_resolved: true
+        max_alerts: 0
+
+# Inhibition rules: when a CRIT alert fires, suppress its sibling WARN so the
+# operator gets one ntfy per incident, not two.
+#
+# CPU + disk inhibits are host-scoped — alertname matchers already establish
+# the 1:1 mapping, so `equal: []` is the cleanest expression (Alertmanager
+# treats empty `equal` as "no further label-equality constraint").
+# PID-budget needs `equal: [name]` because the alerts are per-container —
+# crit on byparr must NOT suppress warn on sonarr.
+inhibit_rules:
+  - source_matchers: [severity="crit", alertname="CPULoadCritical"]
+    target_matchers: [severity="warn", alertname="CPULoadHigh"]
+    equal: []
+
+  - source_matchers: [severity="crit", alertname="SrvDiskCritical"]
+    target_matchers: [severity="warn", alertname="SrvDiskHigh"]
+    equal: []
+
+  - source_matchers: [severity="crit", alertname="ContainerPIDBudgetCritical"]
+    target_matchers: [severity="warn", alertname="ContainerPIDBudgetHigh"]
+    equal: [name]
+
+  # When vmagent is down, ALL scrape-based alerts fire simultaneously.
+  # VMAgentScrapeDown (crit) is the root cause; suppress the downstream
+  # scrape-down warns so the operator gets one ntfy, not four.
+  # NOTE: each matcher is its OWN YAML list item. Folding two matchers under a
+  # single `- ` (a `severity=...` line followed by an un-dashed `alertname=...`
+  # line) makes YAML concatenate them into one scalar, which Alertmanager then
+  # rejects as `matcher value contains unescaped double quote` → config load
+  # fails → crash-loop → notification blackout. Shipped once (3a72e43), now
+  # gated by the amtool check-config deploy step + tests/test_alertmanager_config.py.
+  - source_matchers: [severity="crit", alertname="VMAgentScrapeDown"]
+    target_matchers:
+      - severity="warn"
+      - alertname=~"SpeedtestScrapeDown|UptimeKumaDown|NtfyDown"
+    equal: []
+
+  # The Mac worker is a laptop: while it is asleep/off-LAN, or settling in the
+  # 15 minutes after wake, MacWorkerAway (a notify="none" inhibition source,
+  # vmalert rule file mac-worker.yml) suppresses every alert whose truth
+  # depends on the Mac being awake. One physical cause → zero pages; a day
+  # away → one MacWorkerAwayLong page. Dependents opt in by label so a new Mac
+  # alert must declare itself (guarded by tests/test_alertmanager_config.py).
+  - source_matchers:
+      - alertname="MacWorkerAway"
+    target_matchers:
+      - mac_dependent="true"
+    equal: []

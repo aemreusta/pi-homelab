@@ -1,0 +1,119 @@
+---
+# MLflow — experiment tracking + model registry (PRD-004, Faz-2).
+# Backend store: PostgreSQL (`mlflow` DB) over mlstack_net (service-name resolution).
+# Artifact store: MinIO (s3://mlflow-artifacts), served in --serve-artifacts proxy
+# mode so clients log/fetch through MLflow and never hold MinIO credentials.
+
+mlflow_compose_dir: /home/{{ docker_user }}/docker/data/mlflow
+mlflow_tz: "{{ timezone }}"
+
+# Locally-built thin uv image (files/Dockerfile + requirements.txt). Operator
+# directive: no version pinning — requirements.txt tracks latest MLflow and
+# `build: always` reinstalls it on every deploy.
+mlflow_image: "homelab/mlflow:latest"
+
+mlflow_port: 5000
+
+# Shared ML-stack bridge (created by the postgresql role). MLflow joins it to
+# resolve postgresql:5432 by service name — no LAN-IP hairpin for the DB, which
+# is loopback-only and unreachable any other way from a bridge container.
+mlflow_network: mlstack_net
+
+# Run as pi (1000:1000). MLflow keeps no local state (state = Postgres + S3),
+# so non-root + cap_drop ALL is clean.
+mlflow_puid: 1000
+mlflow_pgid: 1000
+
+# --- Backend store (PostgreSQL `mlflow` DB) ---
+# Service-name resolution over mlstack_net; password is the per-service user's
+# own secret (NOT the Postgres superuser) — see the postgresql role.
+mlflow_db_user: mlflow
+mlflow_db_password: "{{ vault_mlflow_db_password | default('') }}"
+mlflow_db_host: postgresql
+mlflow_db_port: 5432
+mlflow_db_name: mlflow
+
+# --- Artifact store (MinIO) ---
+# MinIO joins mlstack_net (see minio's compose), so MLflow reaches the S3 API by
+# service name over the shared bridge — no LAN-IP hairpin, survives IP changes.
+# DVC / Mac clients still use the published host port :9010 (minio/tasks/ufw.yml).
+mlflow_artifact_bucket: mlflow-artifacts
+mlflow_s3_endpoint: "http://minio:9000"
+
+# Scoped MinIO service credentials — limited to the mlflow-artifacts bucket by a
+# MinIO policy provisioned in configure.yml. Sensitive data lives in `datasets`;
+# MLflow must NEVER hold creds (e.g. root) that can reach it (review finding B4).
+mlflow_minio_access_key: "{{ vault_minio_mlflow_access_key | default('') }}"
+mlflow_minio_secret_key: "{{ vault_minio_mlflow_secret_key | default('') }}"
+mlflow_minio_policy_name: mlflow-rw
+
+# MinIO root creds — used ONLY by configure.yml (admin API via mc) to mint the
+# scoped key above. Never injected into the MLflow container.
+mlflow_minio_root_user: "{{ vault_minio_root_user | default('') }}"
+mlflow_minio_root_password: "{{ vault_minio_root_password | default('') }}"
+
+# Memory ceiling — runaway containment, not a reservation. MLflow 3.x runs a
+# FastAPI/uvicorn server (not the old gunicorn) and needs well over the PRD's
+# 100-200 MB estimate; 512M OOM-loops before a single worker can spawn.
+mlflow_mem_limit: 1024M
+
+# Single uvicorn worker. MLflow 3.x otherwise fans out one worker per core; on an
+# 8 GB Pi the per-worker MLflow footprint blows the mem_limit → OOM respawn loop.
+mlflow_workers: 1
+
+# Server-side job execution (MLflow 3.x `mlflow.server.jobs`) — DISABLED.
+#
+# Measured on the live Pi 2026-08-02: mlflow sat at 514 MiB of its 1024 M cap
+# while completely idle, and 87% of that was NOT the API server:
+#
+#   84,700 KB  huey_consumer  mlflow.server.jobs._periodic_tasks_consume
+#   80,232 KB  huey_consumer  mlflow.server.jobs._huey_consumer
+#   79,968 KB  huey_consumer  (…4 more, ~71–80 MB each)
+#   ──────────
+#   73,052 KB  uvicorn        ← the actual web server, one worker
+#
+# Six huey consumers ≈ 467 MB, each a full Python interpreter with MLflow +
+# SQLAlchemy imported. Upstream (`mlflow.environment_variables`) documents that
+# the feature "requires the 'huey' package and an MLflow server configured with
+# a database URI" — both are true here (huey ships in the image, the backend
+# store is Postgres), so it **auto-enabled itself** and nothing in this repo
+# asked for it.
+#
+# It powers async judge invocation, online scoring and periodic tasks. This
+# homelab runs none of them, so the pool is pure overhead on a 7.6 GiB box.
+# It was also the single largest contributor to mlflow pegging its own
+# mem_limit for the entire 20-day window that ContainerMemoryHeadroomCritical
+# was written against.
+#
+# Set to true if server-side jobs are ever actually needed; expect the ~420 MB
+# back on the bill. Note `| lower` in the compose template — MLflow parses this
+# as a Python bool and Ansible would otherwise render "False".
+mlflow_enable_job_execution: false
+
+# MLflow 3.x ships DNS-rebinding protection (Starlette middleware, localhost-only
+# by default) and matches the Host header *including the port* (e.g. 127.0.0.1:5000,
+# 192.0.2.100:5000, mlflow.example) — so a bare-host allowlist 403s every API
+# call. This service is LAN-only behind UFW and has no auth boundary anyway
+# (every service is LAN-open by host port — see reverse-proxy-not-an-auth-boundary),
+# so rebinding protection adds nothing here; accept all hosts rather than chase
+# per-port matching. Tighten to explicit "host:port" patterns if ever exposed.
+mlflow_allowed_hosts: "*"
+
+# Expose a real Prometheus /metrics endpoint (MLflow --expose-prometheus) so
+# vmagent can scrape it and up{job="mlflow"} becomes meaningful. /health returns
+# plain "OK" (unparseable as Prometheus → up=0 forever), so it cannot drive `up`.
+# MLflow creates this dir at boot; it holds the prometheus multiprocess files.
+mlflow_prometheus_dir: /tmp/mlflow-metrics
+
+# --- Container security hardening ---
+mlflow_pids_limit: 200
+mlflow_cap_drop:
+  - ALL
+
+mlflow_oci_labels:
+  org.opencontainers.image.title: mlflow
+  org.opencontainers.image.description: "MLflow — experiment tracking + model registry (ML stack)"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/mlflow/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://github.com/mlflow/mlflow"

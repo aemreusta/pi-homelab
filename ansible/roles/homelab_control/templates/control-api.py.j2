@@ -1,0 +1,1718 @@
+#!/usr/bin/env python3
+"""Homelab Control API — lightweight HTTP service for safe system management.
+
+Endpoints:
+    GET  /                → Web control panel (token required via query param)
+    GET  /health          → 200 OK (no auth required)
+    GET  /updates         → Watchtower update history (parsed sessions)
+    GET  /offload/status  → Mac compute offload last run status
+    GET  /offload/history → Mac compute offload run history
+    POST /shutdown        → stop containers, power off
+    POST /restart         → stop containers, reboot
+    POST /update          → pull & restart containers
+    POST /clean           → prune unused Docker resources
+
+All POST endpoints require: Authorization: Bearer <token>
+Web panel requires: /?token=<token>
+"""
+
+import concurrent.futures
+import fnmatch
+import http.server
+import json
+import logging
+import logging.handlers
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlparse
+
+TOKEN = "{{ homelab_control_token }}"
+PORT = {{ homelab_control_port }}
+NTFY_URL = "{{ homelab_control_ntfy_url }}"
+EXTERNAL_URL = "{{ homelab_control_external_url }}"
+
+# Compose project directories managed by Ansible
+COMPOSE_DIRS = [
+    "/home/{{ docker_user }}/docker/network/adguard",
+    "/home/{{ docker_user }}/docker/core/portainer",
+    "/home/{{ docker_user }}/docker/core/homepage",
+    "/home/{{ docker_user }}/docker/core/filebrowser",
+    "/home/{{ docker_user }}/docker/core/watchtower",
+    "/home/{{ docker_user }}/docker/core/beszel",
+    "/home/{{ docker_user }}/docker/media",
+]
+
+DOCKER_CONTAINER_WHITELIST = [
+    "jellyfin", "sonarr", "radarr", "prowlarr", "qbittorrent",
+    "jellyseerr", "adguard", "traefik", "portainer",
+    "filebrowser", "homepage", "beszel", "beszel-agent",
+    "watchtower", "ntfy",
+]
+MAX_LOG_LINES = 500
+MAX_LOG_OUTPUT_CHARS = 10_000
+
+# Sprint 10 — Automated Backups integration
+BACKUP_STATE_FILE = "{{ homelab_control_backup_state_file }}"
+BACKUP_LOG_FILE = "{{ homelab_control_backup_log_file }}"
+BACKUP_SCRIPT = "{{ homelab_control_backup_script }}"
+BACKUP_LOG_TAIL_LINES = {{ homelab_control_backup_log_tail_lines }}
+
+# macOS/Windows junk file patterns to scan and remove
+JUNK_PATTERNS = ["._*", ".DS_Store", ".Spotlight-V100", ".fseventsd", ".Trashes", "Thumbs.db", "desktop.ini"]
+JUNK_SCAN_DIRS = {{ homelab_control_junk_scan_dirs | to_json }}
+
+# Audit logger for junk cleanup operations
+JUNK_LOG = "/var/log/homelab-clean.log"
+junk_logger = logging.getLogger("homelab_clean")
+junk_logger.setLevel(logging.INFO)
+if not junk_logger.handlers:
+    try:
+        _handler = logging.handlers.RotatingFileHandler(
+            JUNK_LOG, maxBytes=10 * 1024 * 1024, backupCount=4,
+        )
+        _handler.setFormatter(logging.Formatter(
+            "%(asctime)s [JUNK] %(message)s", datefmt="%Y-%m-%dT%H:%M:%S",
+        ))
+        junk_logger.addHandler(_handler)
+    except OSError:
+        # Log file not writable (e.g. in test environment) — fall back to stderr
+        junk_logger.addHandler(logging.StreamHandler())
+
+
+def _is_inside_srv(path, srv_real=None):
+    """True iff realpath(path) is strictly inside /srv (resolved).
+
+    Uses commonpath equality rather than prefix matching so crafted paths
+    like '/srv_evil/...' or '/srv' itself cannot slip past.
+    """
+    base = srv_real or os.path.realpath("/srv")
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    try:
+        return os.path.commonpath([real, base]) == base and real != base
+    except ValueError:
+        return False
+
+
+def _is_safe_compose_dir(path):
+    """True iff a COMPOSE_DIRS entry is a real directory under the docker
+    root and contains no symlink hops on the way in.
+
+    This blocks an attacker who can drop a symlink at one of the compose
+    paths pointing at their own docker-compose.yml to achieve RCE via
+    the /update endpoint.
+    """
+    docker_root = os.path.realpath("/home/{{ docker_user }}/docker")
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    if not os.path.isdir(real) or os.path.islink(path):
+        return False
+    try:
+        return os.path.commonpath([real, docker_root]) == docker_root
+    except ValueError:
+        return False
+
+
+def ntfy(title, message, priority="default", tags="", actions=""):
+    """Send a notification to ntfy. Fire-and-forget, never raises.
+
+    Always sends Markdown: yes so multi-line bodies render with real
+    line breaks (and **bold** etc.) on the mobile app.
+    """
+    try:
+        import urllib.request  # noqa: PLC0415
+
+        headers = {
+            "Title": title,
+            "Priority": priority,
+            "Markdown": "yes",
+        }
+        if tags:
+            headers["Tags"] = tags
+        if actions:
+            headers["Actions"] = actions
+        req = urllib.request.Request(  # noqa: S310
+            NTFY_URL, data=message.encode(), headers=headers, method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)  # noqa: S310
+    except Exception:
+        pass  # best-effort — never break the action
+
+
+STORAGE_CACHE_TTL = 60  # seconds
+_STORAGE_CACHE = {"data": None, "ts": 0.0, "refreshing": False, "last_error": None}
+_STORAGE_CACHE_LOCK = threading.Lock()
+
+# Backing filesystems to report separately. /srv spans more than one spindle
+# since design 042 (parts of it are bind mounts from the second SSD), so a
+# single total is misleading. Entries whose path is not actually a mountpoint
+# are skipped, which is what makes this degrade quietly when ssd2 has dropped
+# off the USB bus rather than reporting the root disk's numbers under its name.
+STORAGE_FILESYSTEMS = [
+    ("root SSD", "/"),
+    ("ssd2 (Kingston)", "{{ storage_ssd2_mount | default('/mnt/ssd2') }}"),
+]
+
+# Directories that live OUTSIDE /srv but whose bytes are on the root disk and
+# which the operator needs to see: `_dir_size` correctly refuses to descend
+# into a filesystem mounted under /srv, so a tree whose bytes live elsewhere
+# on this disk is listed explicitly — a panel that shows neither number is
+# worse than one that shows a wrong one.
+EXTRA_SIZE_DIRS = {{ homelab_control_extra_size_dirs | default([]) | to_json }}
+
+
+def get_backup_status():
+    """Read the backup state file + tail the structured log.
+
+    Returns whatever is on disk; if the state file is missing the response
+    is shaped like a "never run" marker so the panel doesn't crash. The
+    log tail is a *separate* signal from the state — it shows in-flight
+    runs the state file hasn't been overwritten with yet.
+    """
+    state = {"last_run_ts": None, "status": "never_run", "per_service": {}}
+    try:
+        with open(BACKUP_STATE_FILE) as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    recent_log = []
+    try:
+        # Tail the last N lines; the log is JSONL so each line is one event.
+        with open(BACKUP_LOG_FILE) as f:
+            lines = f.readlines()[-BACKUP_LOG_TAIL_LINES:]
+        for line in lines:
+            try:
+                recent_log.append(json.loads(line))
+            except json.JSONDecodeError:
+                recent_log.append({"raw": line.strip()})
+    except OSError:
+        pass
+
+    return {"state": state, "recent_log": recent_log}
+
+
+def _dir_size(path):
+    """Bytes under `path`, NOT crossing filesystem boundaries (`du -x`).
+
+    The device check is load-bearing, not tidiness. A FUSE/remote
+    filesystem mounted under /srv (e.g. a cloud mount) would otherwise:
+
+      * count REMOTE bytes as local disk usage, contradicting the
+        df-derived figures alongside it; and
+      * traverse FUSE, issuing remote API calls on every dir-cache miss.
+
+    `du -xsh` is already the documented way to measure this box;
+    this makes the API agree with the CLI.
+    """
+    total = 0
+    try:
+        root_dev = os.stat(path).st_dev
+    except OSError:
+        return 0
+    try:
+        for dirpath, dirs, files in os.walk(path):
+            # Prune other filesystems before descending into them.
+            dirs[:] = [
+                d for d in dirs
+                if _same_device(os.path.join(dirpath, d), root_dev)
+            ]
+            for fname in files:
+                try:
+                    st = os.lstat(os.path.join(dirpath, fname))
+                    if st.st_dev != root_dev:
+                        continue
+                    total += st.st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def _same_device(path, root_dev):
+    try:
+        return os.stat(path).st_dev == root_dev
+    except OSError:
+        return False
+
+
+def _refresh_storage_stats():
+    """Exactly one background scan; preserve the previous snapshot on failure."""
+    try:
+        result = _measure_storage_stats()
+    except Exception as exc:
+        result = {"error": str(exc)}
+    with _STORAGE_CACHE_LOCK:
+        if "error" not in result:
+            _STORAGE_CACHE["data"] = result
+        _STORAGE_CACHE["last_error"] = result.get("error")
+        # TTL starts when the scan FINISHES, including failed attempts.
+        _STORAGE_CACHE["ts"] = time.monotonic()
+        _STORAGE_CACHE["refreshing"] = False
+
+
+def get_storage_stats():
+    """Return the last snapshot immediately while one worker refreshes it."""
+    with _STORAGE_CACHE_LOCK:
+        cached = _STORAGE_CACHE["data"]
+        fresh = (cached is not None or _STORAGE_CACHE["last_error"] is not None) and (
+            time.monotonic() - _STORAGE_CACHE["ts"] < STORAGE_CACHE_TTL
+        )
+        if not fresh and not _STORAGE_CACHE["refreshing"]:
+            _STORAGE_CACHE["refreshing"] = True
+            try:
+                threading.Thread(target=_refresh_storage_stats, daemon=True).start()
+            except Exception:
+                _STORAGE_CACHE["refreshing"] = False
+                raise
+        extra = {
+            "cached": cached is not None,
+            "refreshing": _STORAGE_CACHE["refreshing"],
+            "scan_error": _STORAGE_CACHE["last_error"],
+        }
+        if cached is not None:
+            return {**cached, **extra}
+    # Cold start exposes capacity immediately, without walking a directory.
+    try:
+        usage = shutil.disk_usage("/srv")
+        return {
+            "total_bytes": usage.total, "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "use_percent": round(usage.used / usage.total * 100, 1) if usage.total else 0,
+            "filesystems": [], "dirs": [], "scan_time": None, **extra,
+        }
+    except OSError as exc:
+        return {"error": str(exc), **extra}
+
+
+def _measure_storage_stats():
+    """Measure in a background worker; keep archive filesystem boundaries."""
+    try:
+        usage = shutil.disk_usage("/srv")
+        total, used, free = usage.total, usage.used, usage.free
+
+        subdirs = [
+            entry for entry in os.scandir("/srv")
+            if entry.is_dir(follow_symlinks=False)
+        ]
+        dir_sizes = []
+        if subdirs:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(2, len(subdirs)),
+            ) as pool:
+                sizes = list(pool.map(lambda e: _dir_size(e.path), subdirs))
+            for entry, size in zip(subdirs, sizes):
+                dir_sizes.append({
+                    "name": entry.name,
+                    "path": entry.path,
+                    "bytes": size,
+                })
+        for extra in EXTRA_SIZE_DIRS:
+            epath = extra.get("path", "")
+            if not epath or not os.path.isdir(epath):
+                continue
+            dir_sizes.append({
+                "name": extra.get("name") or epath,
+                "path": epath,
+                "bytes": _dir_size(epath),
+            })
+
+        dir_sizes.sort(key=lambda x: x["bytes"], reverse=True)
+
+        # /srv is no longer one spindle. Since 2026-08-02 some of it is bind
+        # mounted from the second SSD (design 042), so the totals above — which
+        # describe whichever filesystem backs /srv itself — silently understate
+        # capacity and misattribute free space. Report each backing filesystem
+        # separately so the panel can't imply a subdirectory's bytes came out
+        # of the root disk's budget.
+        filesystems = []
+        for label, path in STORAGE_FILESYSTEMS:
+            try:
+                if not os.path.ismount(path) and path != "/srv":
+                    continue
+                fs = shutil.disk_usage(path)
+            except OSError:
+                continue
+            filesystems.append({
+                "label": label,
+                "path": path,
+                "total_bytes": fs.total,
+                "used_bytes": fs.used,
+                "free_bytes": fs.free,
+                "use_percent": round(fs.used / fs.total * 100, 1) if fs.total else 0,
+            })
+
+        result = {
+            "total_bytes": total,
+            "used_bytes": used,
+            "free_bytes": free,
+            "use_percent": round(used / total * 100, 1) if total else 0,
+            "filesystems": filesystems,
+            "dirs": dir_sizes,
+            "scan_time": datetime.now(UTC).isoformat(),
+            "cached": False,
+        }
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def scan_junk():
+    """Walk JUNK_SCAN_DIRS and return list of junk files/dirs with metadata."""
+    found = []
+    for base in JUNK_SCAN_DIRS:
+        if not os.path.isdir(base):
+            continue
+        for root, dirs, files in os.walk(base):
+            for name in files:
+                if any(fnmatch.fnmatch(name, p) for p in JUNK_PATTERNS):
+                    path = os.path.join(root, name)
+                    try:
+                        size = os.path.getsize(path)
+                    except OSError:
+                        size = 0
+                    found.append({"path": path, "name": name, "size": size})
+            prune = [d for d in dirs if any(fnmatch.fnmatch(d, p) for p in JUNK_PATTERNS)]
+            for name in prune:
+                path = os.path.join(root, name)
+                found.append({"path": path, "name": name, "size": 0, "is_dir": True})
+                dirs.remove(name)
+    return found
+
+
+PANEL_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Homelab Control</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .container {
+    width: 100%;
+    max-width: 480px;
+    padding: 24px;
+  }
+  .header {
+    text-align: center;
+    margin-bottom: 32px;
+  }
+  .header h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: #f8fafc;
+    margin-bottom: 4px;
+  }
+  .header p {
+    font-size: 0.875rem;
+    color: #64748b;
+  }
+  .status-bar {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #22c55e;
+    flex-shrink: 0;
+    animation: pulse 2s infinite;
+  }
+  .status-dot.error { background: #ef4444; animation: none; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+  .status-text {
+    font-size: 0.875rem;
+    color: #94a3b8;
+  }
+  .status-text strong {
+    color: #e2e8f0;
+  }
+  .actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 20px 16px;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    background: #1e293b;
+    color: #e2e8f0;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: inherit;
+    font-size: 0.875rem;
+    font-weight: 500;
+  }
+  .btn:hover { background: #334155; border-color: #475569; transform: translateY(-1px); }
+  .btn:active { transform: translateY(0); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+  .btn .icon { font-size: 1.5rem; }
+  .btn.danger { border-color: #7f1d1d; }
+  .btn.danger:hover { background: #7f1d1d; border-color: #991b1b; }
+  .btn.warn { border-color: #78350f; }
+  .btn.warn:hover { background: #78350f; border-color: #92400e; }
+
+  .log {
+    margin-top: 24px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 16px;
+    display: none;
+  }
+  .log.visible { display: block; }
+  .log-title {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #64748b;
+    margin-bottom: 8px;
+  }
+  .log-body {
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+    font-size: 0.8rem;
+    color: #94a3b8;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 200px;
+    overflow-y: auto;
+    line-height: 1.6;
+  }
+  .log-body .ok { color: #22c55e; }
+  .log-body .err { color: #ef4444; }
+  .log-body .info { color: #38bdf8; }
+
+  .confirm-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    backdrop-filter: blur(4px);
+  }
+  .confirm-overlay.visible { display: flex; }
+  .confirm-box {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 16px;
+    padding: 24px;
+    width: 90%;
+    max-width: 360px;
+    text-align: center;
+  }
+  .confirm-box h3 {
+    font-size: 1.1rem;
+    margin-bottom: 8px;
+    color: #f8fafc;
+  }
+  .confirm-box p {
+    font-size: 0.875rem;
+    color: #94a3b8;
+    margin-bottom: 20px;
+  }
+  .confirm-actions {
+    display: flex;
+    gap: 12px;
+  }
+  .confirm-actions button {
+    flex: 1;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid #334155;
+    font-family: inherit;
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-cancel {
+    background: #1e293b;
+    color: #e2e8f0;
+  }
+  .btn-cancel:hover { background: #334155; }
+  .btn-confirm {
+    background: #dc2626;
+    color: #fff;
+    border-color: #dc2626;
+  }
+  .btn-confirm:hover { background: #b91c1c; }
+  .btn-confirm.safe {
+    background: #2563eb;
+    border-color: #2563eb;
+  }
+  .btn-confirm.safe:hover { background: #1d4ed8; }
+
+  /* Reboot overlay */
+  .reboot-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.95);
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+    backdrop-filter: blur(8px);
+  }
+  .reboot-overlay.visible { display: flex; }
+  .reboot-content {
+    text-align: center;
+    max-width: 360px;
+    padding: 32px;
+  }
+  .reboot-icon {
+    font-size: 3rem;
+    margin-bottom: 20px;
+    display: inline-block;
+  }
+  .reboot-icon.spinning {
+    animation: spin 2s linear infinite;
+  }
+  @keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
+  .reboot-title {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: #f8fafc;
+    margin-bottom: 8px;
+  }
+  .reboot-desc {
+    font-size: 0.875rem;
+    color: #94a3b8;
+    margin-bottom: 24px;
+    line-height: 1.5;
+  }
+  .reboot-progress {
+    width: 100%;
+    height: 4px;
+    background: #334155;
+    border-radius: 2px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .reboot-progress-bar {
+    height: 100%;
+    background: #3b82f6;
+    border-radius: 2px;
+    width: 0%;
+    transition: width 0.5s ease;
+  }
+  .reboot-progress-bar.waiting {
+    width: 100%;
+    animation: shimmer 1.5s ease-in-out infinite;
+    background: linear-gradient(90deg, #3b82f6 0%, #60a5fa 50%, #3b82f6 100%);
+    background-size: 200% 100%;
+  }
+  @keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+  .reboot-status {
+    font-size: 0.8rem;
+    color: #64748b;
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+  }
+  .reboot-dots::after {
+    content: '';
+    animation: dots 1.5s steps(4, end) infinite;
+  }
+  @keyframes dots {
+    0% { content: ''; }
+    25% { content: '.'; }
+    50% { content: '..'; }
+    75% { content: '...'; }
+  }
+  .reboot-success {
+    animation: fadeInUp 0.5s ease;
+  }
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .reboot-counter {
+    font-size: 0.75rem;
+    color: #475569;
+    margin-top: 12px;
+  }
+
+  .storage-panel {
+    margin-top: 24px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 16px;
+  }
+  .storage-bar {
+    width: 100%;
+    height: 8px;
+    background: #334155;
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 8px 0;
+  }
+  .storage-bar-fill {
+    height: 100%;
+    background: #3b82f6;
+    border-radius: 4px;
+    transition: width 0.5s ease;
+  }
+  .storage-bar-fill.warn { background: #f59e0b; }
+  .storage-bar-fill.danger { background: #ef4444; }
+  .storage-summary {
+    font-size: 0.8rem;
+    color: #94a3b8;
+    margin-bottom: 8px;
+  }
+  .storage-dirs {
+    font-size: 0.75rem;
+    color: #94a3b8;
+    margin-top: 8px;
+  }
+  .storage-dirs table { width: 100%; border-collapse: collapse; }
+  .storage-dirs td { padding: 3px 8px; }
+  .storage-dirs td:last-child { text-align: right; color: #64748b; }
+
+  .btn.span2 { grid-column: span 2; flex-direction: row; justify-content: center; }
+  .junk-results {
+    margin-top: 12px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 16px;
+    display: none;
+  }
+  .junk-results.visible { display: block; }
+  .junk-results .log-body { margin-top: 8px; }
+
+  .logs-panel {
+    margin-top: 24px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 16px;
+  }
+  .logs-controls {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .logs-select, .logs-input {
+    background: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    color: #e2e8f0;
+    font-family: inherit;
+    font-size: 0.8rem;
+    padding: 4px 8px;
+  }
+  .logs-select { flex: 1; min-width: 120px; }
+  .logs-input { width: 64px; }
+  .logs-output {
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+    font-size: 0.75rem;
+    color: #94a3b8;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 280px;
+    overflow-y: auto;
+    line-height: 1.5;
+    margin-top: 4px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>&#127968; Homelab Control</h1>
+    <p>Raspberry Pi 4B &middot; {{ ansible_facts['default_ipv4']['address'] | default('192.0.2.100') }}</p>
+  </div>
+
+  <div class="status-bar" id="statusBar">
+    <div class="status-dot" id="statusDot"></div>
+    <div class="status-text" id="statusText">Checking...</div>
+  </div>
+
+  <div class="actions">
+    <button class="btn warn" onclick="confirmAction('restart', '&#128260; Restart', 'All containers will stop and the system will reboot.')">
+      <span class="icon">&#128260;</span> Restart
+    </button>
+    <button class="btn danger" onclick="confirmAction('shutdown', '&#9211;&#65039; Shutdown', 'All containers will stop and the system will power off.')">
+      <span class="icon">&#9211;&#65039;</span> Shutdown
+    </button>
+    <button class="btn" onclick="confirmAction('update', '&#128230; Update', 'Docker images will be pulled and containers restarted.', true)">
+      <span class="icon">&#128230;</span> Update
+    </button>
+    <button class="btn" onclick="confirmAction('clean', '&#129529; Clean', 'Unused Docker images and networks will be pruned.', true)">
+      <span class="icon">&#129529;</span> Clean
+    </button>
+    <button class="btn span2" id="junkScanBtn" onclick="junkScan()">
+      <span class="icon" id="junkScanIcon">&#128269;</span> Scan for Junk
+    </button>
+  </div>
+
+  <div class="storage-panel" id="storagePanel">
+    <div class="log-title" style="margin-bottom:8px">Storage</div>
+    <div id="storageContent" style="font-size:0.8rem;color:#64748b">Loading...</div>
+  </div>
+
+  <div class="junk-results" id="junkResults">
+    <div class="log-title" id="junkResultsTitle">Junk Files</div>
+    <div class="log-body" id="junkResultsBody" style="max-height:300px;overflow-y:auto"></div>
+    <div id="junkResultsActions" style="margin-top:12px"></div>
+  </div>
+
+  <div class="log" id="logBox">
+    <div class="log-title">Output</div>
+    <div class="log-body" id="logBody"></div>
+  </div>
+
+  <div class="logs-panel">
+    <div class="log-title" style="margin-bottom:8px">Logs</div>
+    <div class="logs-controls">
+      <select class="logs-select" id="logsSource">
+        <option value="system">system (journald)</option>
+        <option value="jellyfin">jellyfin</option>
+        <option value="sonarr">sonarr</option>
+        <option value="radarr">radarr</option>
+        <option value="prowlarr">prowlarr</option>
+        <option value="qbittorrent">qbittorrent</option>
+        <option value="jellyseerr">jellyseerr</option>
+        <option value="adguard">adguard</option>
+        <option value="traefik">traefik</option>
+        <option value="portainer">portainer</option>
+        <option value="filebrowser">filebrowser</option>
+        <option value="homepage">homepage</option>
+        <option value="beszel">beszel</option>
+        <option value="beszel-agent">beszel-agent</option>
+
+        <option value="watchtower">watchtower</option>
+        <option value="ntfy">ntfy</option>
+      </select>
+      <input class="logs-input" id="logsLines" type="number" value="50" min="1" max="500" title="Lines (max 500)">
+      <button class="btn" id="logsFetchBtn" onclick="fetchLogs()" style="padding:4px 12px;flex-direction:row;gap:4px;font-size:0.8rem">&#128196; Fetch</button>
+    </div>
+    <div class="logs-output" id="logsOutput"></div>
+  </div>
+
+  <div class="logs-panel" id="updatesPanel">
+    <div class="log-title" style="margin-bottom:8px">&#128260; Watchtower Updates</div>
+    <table style="width:100%;border-collapse:collapse;font-size:0.8rem">
+      <thead>
+        <tr style="border-bottom:1px solid #334155;text-align:left">
+          <th style="padding:6px 8px;color:#94a3b8">Date</th>
+          <th style="padding:6px 8px;color:#94a3b8">Updated</th>
+          <th style="padding:6px 8px;color:#94a3b8;text-align:center">Scanned</th>
+          <th style="padding:6px 8px;color:#94a3b8;text-align:center">Failed</th>
+        </tr>
+      </thead>
+      <tbody id="updatesBody"><tr><td colspan="4" style="padding:12px;color:#64748b;text-align:center">Loading...</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="logs-panel" id="offloadPanel">
+    <div class="log-title" style="margin-bottom:8px">&#128187; Mac Worker</div>
+    <div id="offloadStatus" style="font-size:0.85rem;margin-bottom:12px">
+      <span id="offloadDot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#64748b;margin-right:6px"></span>
+      <span id="offloadStatusText" style="color:#64748b">Loading...</span>
+    </div>
+    <div id="offloadSummary" style="font-size:0.8rem;color:#94a3b8;margin-bottom:12px"></div>
+    <table style="width:100%;border-collapse:collapse;font-size:0.75rem">
+      <thead>
+        <tr style="border-bottom:1px solid #334155;text-align:left">
+          <th style="padding:4px 6px;color:#94a3b8">Date</th>
+          <th style="padding:4px 6px;color:#94a3b8">Status</th>
+          <th style="padding:4px 6px;color:#94a3b8;text-align:center">Markers</th>
+          <th style="padding:4px 6px;color:#94a3b8;text-align:center">Duration</th>
+        </tr>
+      </thead>
+      <tbody id="offloadHistory"><tr><td colspan="4" style="padding:8px;color:#475569;text-align:center">Loading...</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="confirm-overlay" id="confirmOverlay">
+    <div class="confirm-box">
+      <h3 id="confirmTitle"></h3>
+      <p id="confirmDesc"></p>
+      <div class="confirm-actions">
+        <button class="btn-cancel" onclick="hideConfirm()">Cancel</button>
+        <button class="btn-confirm" id="confirmBtn" onclick="execConfirm()">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="reboot-overlay" id="rebootOverlay">
+    <div class="reboot-content" id="rebootContent">
+      <div class="reboot-icon spinning" id="rebootIcon">&#9881;&#65039;</div>
+      <div class="reboot-title" id="rebootTitle">System is rebooting</div>
+      <div class="reboot-desc" id="rebootDesc">Containers are stopping and the system is restarting. This page will reconnect automatically.</div>
+      <div class="reboot-progress"><div class="reboot-progress-bar waiting" id="rebootBar"></div></div>
+      <div class="reboot-status"><span id="rebootStatus">Waiting for shutdown</span><span class="reboot-dots"></span></div>
+      <div class="reboot-counter" id="rebootCounter"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN = new URLSearchParams(window.location.search).get('token') || '';
+let pendingAction = '';
+let rebootPollTimer = null;
+let rebootStartTime = 0;
+let healthCheckTimer = null;
+
+async function checkHealth() {
+  try {
+    const r = await fetch('/health');
+    const d = await r.json();
+    document.getElementById('statusDot').className = 'status-dot';
+    document.getElementById('statusText').innerHTML = '<strong>Online</strong> &mdash; API healthy';
+  } catch(e) {
+    document.getElementById('statusDot').className = 'status-dot error';
+    document.getElementById('statusText').innerHTML = '<strong>Offline</strong> &mdash; cannot reach API';
+  }
+}
+
+function confirmAction(action, title, desc, safe) {
+  pendingAction = action;
+  document.getElementById('confirmTitle').innerHTML = title;
+  document.getElementById('confirmDesc').textContent = desc;
+  const btn = document.getElementById('confirmBtn');
+  btn.className = safe ? 'btn-confirm safe' : 'btn-confirm';
+  btn.textContent = safe ? 'Run' : 'Confirm';
+  document.getElementById('confirmOverlay').className = 'confirm-overlay visible';
+}
+
+function hideConfirm() {
+  document.getElementById('confirmOverlay').className = 'confirm-overlay';
+  pendingAction = '';
+}
+
+function showRebootOverlay(action) {
+  const overlay = document.getElementById('rebootOverlay');
+  const icon = document.getElementById('rebootIcon');
+  const title = document.getElementById('rebootTitle');
+  const desc = document.getElementById('rebootDesc');
+  const bar = document.getElementById('rebootBar');
+  const status = document.getElementById('rebootStatus');
+  const counter = document.getElementById('rebootCounter');
+
+  if (action === 'shutdown') {
+    icon.innerHTML = '&#9211;&#65039;';
+    title.textContent = 'System is shutting down';
+    desc.textContent = 'Containers have been stopped and the system is powering off. You will need to physically power on the device to use it again.';
+    status.textContent = 'Powering off';
+  } else {
+    icon.innerHTML = '&#128260;';
+    title.textContent = 'System is rebooting';
+    desc.textContent = 'Containers are stopping and the system is restarting. This page will reconnect automatically.';
+    status.textContent = 'Waiting for shutdown';
+  }
+
+  icon.className = 'reboot-icon spinning';
+  bar.className = 'reboot-progress-bar waiting';
+  counter.textContent = '';
+  overlay.className = 'reboot-overlay visible';
+  rebootStartTime = Date.now();
+
+  // Start the elapsed counter
+  const counterTimer = setInterval(function() {
+    const el = document.getElementById('rebootCounter');
+    if (!el || !document.getElementById('rebootOverlay').classList.contains('visible')) {
+      clearInterval(counterTimer);
+      return;
+    }
+    const elapsed = Math.floor((Date.now() - rebootStartTime) / 1000);
+    el.textContent = elapsed + 's elapsed';
+  }, 1000);
+
+  if (action === 'restart') {
+    startRebootPolling();
+  }
+}
+
+function startRebootPolling() {
+  let phase = 'waiting'; // waiting → offline → recovering
+  let offlineAt = 0;
+
+  rebootPollTimer = setInterval(async function() {
+    const status = document.getElementById('rebootStatus');
+    const bar = document.getElementById('rebootBar');
+    const icon = document.getElementById('rebootIcon');
+    const title = document.getElementById('rebootTitle');
+    const desc = document.getElementById('rebootDesc');
+
+    try {
+      const r = await fetch('/health', { signal: AbortSignal.timeout(3000) });
+      const d = await r.json();
+
+      if (phase === 'offline') {
+        // System was offline and now it's back!
+        phase = 'recovering';
+        status.textContent = 'API is back, waiting for services';
+        bar.className = 'reboot-progress-bar';
+        bar.style.width = '80%';
+      }
+
+      if (phase === 'recovering' || (phase === 'waiting' && (Date.now() - rebootStartTime) > 5000)) {
+        // System is online — show success
+        clearInterval(rebootPollTimer);
+        rebootPollTimer = null;
+        showRebootSuccess();
+        return;
+      }
+    } catch(e) {
+      if (phase === 'waiting') {
+        phase = 'offline';
+        offlineAt = Date.now();
+        status.textContent = 'System is offline';
+        icon.innerHTML = '&#128308;';
+      }
+
+      if (phase === 'offline') {
+        const offlineSec = Math.floor((Date.now() - offlineAt) / 1000);
+        status.textContent = 'System is offline (' + offlineSec + 's)';
+      }
+    }
+  }, 3000);
+}
+
+function showRebootSuccess() {
+  const overlay = document.getElementById('rebootOverlay');
+  const content = document.getElementById('rebootContent');
+  const elapsed = Math.floor((Date.now() - rebootStartTime) / 1000);
+
+  content.className = 'reboot-content reboot-success';
+  content.innerHTML =
+    '<div class="reboot-icon" style="animation:none">&#9989;</div>' +
+    '<div class="reboot-title" style="color:#22c55e">System is back online!</div>' +
+    '<div class="reboot-desc">All services are running. Rebooted in ' + elapsed + ' seconds.</div>' +
+    '<div style="margin-top:20px">' +
+      '<button class="btn" onclick="dismissReboot()" style="display:inline-flex;flex-direction:row;padding:10px 24px;gap:8px;border-radius:8px;font-size:0.875rem">' +
+        '&#10003; Continue' +
+      '</button>' +
+    '</div>';
+
+  // Auto-dismiss after 8 seconds
+  setTimeout(function() {
+    if (overlay.classList.contains('visible')) {
+      dismissReboot();
+    }
+  }, 8000);
+}
+
+function dismissReboot() {
+  document.getElementById('rebootOverlay').className = 'reboot-overlay';
+  // Reset reboot content for next use
+  document.getElementById('rebootContent').className = 'reboot-content';
+  document.getElementById('rebootContent').innerHTML =
+    '<div class="reboot-icon spinning" id="rebootIcon">&#9881;&#65039;</div>' +
+    '<div class="reboot-title" id="rebootTitle">System is rebooting</div>' +
+    '<div class="reboot-desc" id="rebootDesc">Containers are stopping and the system is restarting. This page will reconnect automatically.</div>' +
+    '<div class="reboot-progress"><div class="reboot-progress-bar waiting" id="rebootBar"></div></div>' +
+    '<div class="reboot-status"><span id="rebootStatus">Waiting for shutdown</span><span class="reboot-dots"></span></div>' +
+    '<div class="reboot-counter" id="rebootCounter"></div>';
+  // Re-enable buttons and refresh status
+  document.querySelectorAll('.btn').forEach(b => b.disabled = false);
+  checkHealth();
+}
+
+async function execAction() {
+  const action = pendingAction;
+  hideConfirm();
+  const logBox = document.getElementById('logBox');
+  const logBody = document.getElementById('logBody');
+  logBox.className = 'log visible';
+  logBody.innerHTML = '<span class="info">&#9881;&#65039; Running ' + action + '...</span>\\n';
+
+  // Disable all buttons
+  document.querySelectorAll('.btn').forEach(b => b.disabled = true);
+
+  try {
+    const r = await fetch('/' + action, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + TOKEN }
+    });
+    const d = await r.json();
+
+    if (r.ok) {
+      logBody.innerHTML += '<span class="ok">&#9989; ' + JSON.stringify(d.status) + '</span>\\n';
+      if (d.results) {
+        d.results.forEach(function(res) {
+          const icon = res.rc === 0 ? '<span class="ok">&#10003;</span>' : '<span class="err">&#10007;</span>';
+          logBody.innerHTML += icon + ' ' + res.dir + '\\n';
+        });
+      }
+      if (d.output) {
+        logBody.innerHTML += '\\n' + d.output + '\\n';
+      }
+      if (action === 'shutdown' || action === 'restart') {
+        showRebootOverlay(action);
+        return; // Keep buttons disabled, overlay handles the rest
+      }
+    } else {
+      logBody.innerHTML += '<span class="err">&#10060; Error: ' + JSON.stringify(d) + '</span>\\n';
+    }
+  } catch(e) {
+    logBody.innerHTML += '<span class="err">&#10060; ' + e.message + '</span>\\n';
+  }
+
+  document.querySelectorAll('.btn').forEach(b => b.disabled = false);
+}
+
+// ----------- Junk file scanner -----------
+let lastJunkFiles = [];
+
+function formatBytes(b) {
+  if (b === 0) return '0 B';
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+  return (b / 1048576).toFixed(1) + ' MB';
+}
+
+async function junkScan() {
+  const btn = document.getElementById('junkScanBtn');
+  const icon = document.getElementById('junkScanIcon');
+  const results = document.getElementById('junkResults');
+  const title = document.getElementById('junkResultsTitle');
+  const body = document.getElementById('junkResultsBody');
+  const actions = document.getElementById('junkResultsActions');
+
+  btn.disabled = true;
+  icon.innerHTML = '&#9203;';
+  results.className = 'junk-results visible';
+  title.textContent = 'Scanning...';
+  body.innerHTML = '<span class="info">Scanning /srv for junk files...</span>';
+  actions.innerHTML = '';
+
+  try {
+    const r = await fetch('/junk', { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+    const d = await r.json();
+    lastJunkFiles = d.files || [];
+    const count = d.total_count || 0;
+    const size = d.total_size || 0;
+
+    title.textContent = count > 0
+      ? 'Found ' + count + ' junk files (' + formatBytes(size) + ')'
+      : 'No junk files found';
+
+    if (count === 0) {
+      body.innerHTML = '<span class="ok">&#10003; Clean! No junk files found.</span>';
+    } else {
+      body.innerHTML = lastJunkFiles.map(function(f) {
+        return '<span class="err">&#10007;</span> ' + f.path + ' <span style="color:#64748b">(' + formatBytes(f.size) + ')</span>';
+      }).join('\\n');
+      actions.innerHTML =
+        '<button class="btn danger" style="width:100%;flex-direction:row;justify-content:center;gap:8px" onclick="junkConfirmDelete()">' +
+        '&#128465;&#65039; Delete ' + count + ' files &nbsp;<span style="color:#94a3b8;font-weight:400">(' + formatBytes(size) + ')</span>' +
+        '</button>';
+    }
+  } catch(e) {
+    title.textContent = 'Scan failed';
+    body.innerHTML = '<span class="err">&#10060; ' + e.message + '</span>';
+  }
+
+  btn.disabled = false;
+  icon.innerHTML = '&#128269;';
+}
+
+function junkConfirmDelete() {
+  confirmAction(
+    'junk-delete',
+    '&#128465;&#65039; Delete Junk',
+    'Permanently delete ' + lastJunkFiles.length + ' junk files? This cannot be undone.',
+    false
+  );
+}
+
+async function execJunkDelete() {
+  hideConfirm();
+  const body = document.getElementById('junkResultsBody');
+  const actions = document.getElementById('junkResultsActions');
+  body.innerHTML += '\\n<span class="info">Deleting...</span>';
+  actions.innerHTML = '';
+
+  try {
+    const r = await fetch('/junk', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + TOKEN }
+    });
+    const d = await r.json();
+    body.innerHTML += '\\n<span class="ok">&#9989; Deleted ' + d.deleted + ' files, freed ' + formatBytes(d.freed_bytes) + '</span>';
+    if (d.errors && d.errors.length) {
+      d.errors.forEach(function(err) {
+        body.innerHTML += '\\n<span class="err">&#10007; ' + err.path + ': ' + err.error + '</span>';
+      });
+    }
+    document.getElementById('junkResultsTitle').textContent = 'Done \u2014 ' + d.deleted + ' files deleted';
+  } catch(e) {
+    body.innerHTML += '\\n<span class="err">&#10060; ' + e.message + '</span>';
+  }
+}
+
+function execConfirm() {
+  if (pendingAction === 'junk-delete') {
+    execJunkDelete();
+  } else {
+    execAction();
+  }
+}
+
+// ----------- Log viewer -----------
+async function fetchLogs() {
+  const source = document.getElementById('logsSource').value;
+  const lines = parseInt(document.getElementById('logsLines').value, 10) || 50;
+  const output = document.getElementById('logsOutput');
+  const btn = document.getElementById('logsFetchBtn');
+
+  btn.disabled = true;
+  output.textContent = 'Fetching logs\u2026';
+
+  try {
+    const r = await fetch('/logs?source=' + encodeURIComponent(source) + '&lines=' + lines, {
+      headers: { 'Authorization': 'Bearer ' + TOKEN }
+    });
+    const d = await r.json();
+    if (r.ok) {
+      output.textContent = d.lines.join('\\n');
+      if (d.truncated) {
+        output.textContent += '\\n[output truncated]';
+      }
+      output.scrollTop = output.scrollHeight;
+    } else {
+      output.textContent = 'Error: ' + (d.error || r.status);
+    }
+  } catch (e) {
+    output.textContent = e.message;
+  }
+
+  btn.disabled = false;
+}
+
+async function fetchUpdates() {
+  const tbody = document.getElementById('updatesBody');
+  try {
+    const r = await fetch('/updates', { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+    const d = await r.json();
+    if (!r.ok || !d.sessions || d.sessions.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="4" style="padding:12px;color:#64748b;text-align:center">No update sessions found</td></tr>';
+      return;
+    }
+    tbody.innerHTML = d.sessions.reverse().map(s => {
+      const ts = s.timestamp ? new Date(s.timestamp).toLocaleDateString('tr-TR', {day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
+      const containers = (s.updates || []).filter(u => u.action === 'recreated').map(u => u.container).join(', ') || '—';
+      const scanned = s.summary ? s.summary.scanned : '—';
+      const failed = s.summary ? s.summary.failed : '—';
+      const updated = s.summary ? s.summary.updated : 0;
+      const rowColor = updated > 0 ? '#e2e8f0' : '#475569';
+      return '<tr style="border-bottom:1px solid #1e293b;color:' + rowColor + '">' +
+        '<td style="padding:6px 8px">' + ts + '</td>' +
+        '<td style="padding:6px 8px">' + (containers || 'none') + '</td>' +
+        '<td style="padding:6px 8px;text-align:center">' + scanned + '</td>' +
+        '<td style="padding:6px 8px;text-align:center">' + (failed > 0 ? '<span style="color:#ef4444">' + failed + '</span>' : failed) + '</td></tr>';
+    }).join('');
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="4" style="padding:12px;color:#ef4444">' + e.message + '</td></tr>';
+  }
+}
+
+async function loadStorage() {
+  const el = document.getElementById('storageContent');
+  try {
+    const r = await fetch('/storage', { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+    const d = await r.json();
+    if (d.error) { el.textContent = 'Error: ' + d.error; return; }
+
+    const usedGB = (d.used_bytes / 1e9).toFixed(1);
+    const totalGB = (d.total_bytes / 1e9).toFixed(1);
+    const pct = d.use_percent;
+    const barClass = pct > 90 ? 'danger' : pct > 75 ? 'warn' : '';
+
+    el.innerHTML =
+      '<div class="storage-summary">' + usedGB + ' GB / ' + totalGB + ' GB (' + pct + '%)</div>' +
+      '<div class="storage-bar"><div class="storage-bar-fill ' + barClass + '" style="width:' + pct + '%"></div></div>' +
+      '<div class="storage-dirs"><table>' +
+      d.dirs.map(function(dir) {
+        const gb = (dir.bytes / 1e9).toFixed(2);
+        return '<tr><td>' + dir.name + '</td><td>' + gb + ' GB</td></tr>';
+      }).join('') +
+      '</table></div>';
+    if (d.refreshing || d.scan_error) {
+      const note = document.createElement('p');
+      note.textContent = d.refreshing ? 'Updating directory sizes…' : 'Directory sizes could not be refreshed.';
+      el.appendChild(note);
+    }
+    if (d.refreshing) setTimeout(loadStorage, 2000);
+  } catch(e) {
+    el.textContent = e.message;
+  }
+}
+
+async function fetchOffload() {
+  try {
+    const r = await fetch('/offload/status', { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+    const d = await r.json();
+    const dot = document.getElementById('offloadDot');
+    const txt = document.getElementById('offloadStatusText');
+    const sum = document.getElementById('offloadSummary');
+    if (d.status === 'no_runs') {
+      txt.textContent = 'No offload runs yet';
+    } else if (d.status === 'skipped') {
+      dot.style.background = '#64748b';
+      txt.textContent = 'Last: skipped (Mac offline)';
+      txt.style.color = '#64748b';
+    } else if (d.status === 'success') {
+      dot.style.background = '#22c55e';
+      txt.textContent = 'Last: ' + (d.last_run || '').slice(0, 16).replace('T', ' ');
+      txt.style.color = '#e2e8f0';
+      const m = d.markers || {};
+      sum.innerHTML = 'Markers: <b>' + (m.generated||0) + '</b> ok, ' + (m.failed||0) + ' failed'
+        + ' &middot; Duration: <b>' + (d.duration_minutes||0) + 'm</b>'
+        + (d.ai && d.ai.ran ? ' &middot; AI: ran' : '');
+    } else if (d.status === 'failed') {
+      dot.style.background = '#ef4444';
+      txt.textContent = 'Last: failed';
+      txt.style.color = '#ef4444';
+    }
+  } catch(e) { /* ignore */ }
+  try {
+    const r2 = await fetch('/offload/history', { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+    const d2 = await r2.json();
+    const tbody = document.getElementById('offloadHistory');
+    if (!d2.runs || d2.runs.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="4" style="padding:8px;color:#475569;text-align:center">No history</td></tr>';
+      return;
+    }
+    tbody.innerHTML = d2.runs.reverse().slice(0, 5).map(r => {
+      const st = r.status === 'success' ? '&#9989;' : r.status === 'skipped' ? '&#9898;' : '&#10060;';
+      const ml = (r.markers_line || '').match(/(ok=\\d+ fail=\\d+)/) || ['', '-'];
+      return '<tr style="border-bottom:1px solid #1e293b">'
+        + '<td style="padding:4px 6px;color:#cbd5e1">' + (r.start || '-') + '</td>'
+        + '<td style="padding:4px 6px">' + st + '</td>'
+        + '<td style="padding:4px 6px;text-align:center;color:#94a3b8">' + ml[1] + '</td>'
+        + '<td style="padding:4px 6px;text-align:center;color:#94a3b8">' + ((r.end||'').slice(11,16) || '-') + '</td>'
+        + '</tr>';
+    }).join('');
+  } catch(e) { /* ignore */ }
+}
+
+checkHealth();
+healthCheckTimer = setInterval(checkHealth, 30000);
+loadStorage();
+fetchUpdates();
+fetchOffload();
+</script>
+</body>
+</html>
+"""
+
+
+def run(cmd, timeout=120):
+    """Run a command and return (returncode, stdout, stderr)."""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return 1, "", "Command timed out"
+
+
+def parse_watchtower_updates():
+    """Parse watchtower logs into structured update sessions."""
+    try:
+        result = subprocess.run(  # noqa: S603, S607
+            ["docker", "logs", "watchtower", "--tail", "500"],
+            capture_output=True, text=True, timeout=15,
+        )
+        lines = (result.stdout + result.stderr).strip().split("\n")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+
+    sessions = []
+    current = {}
+    for line in lines:
+        if "Found new" in line:
+            ts = ""
+            if 'time="' in line:
+                ts = line.split('time="')[1].split('"')[0]
+            image = ""
+            if "Found new " in line:
+                image = line.split("Found new ")[1].split(" image")[0]
+            if "updates" not in current:
+                current = {"timestamp": ts, "updates": []}
+            current["updates"].append({"image": image, "action": "found"})
+        elif "Creating /" in line:
+            container = line.split("Creating /")[1].split('"')[0].split(" ")[0].strip("()")
+            if current.get("updates") is not None:
+                current["updates"].append({"container": container, "action": "recreated"})
+        elif "Session done" in line:
+            ts = ""
+            if 'time="' in line:
+                ts = line.split('time="')[1].split('"')[0]
+            summary = {}
+            for key in ["Failed", "Scanned", "Updated"]:
+                if key + "=" in line:
+                    try:
+                        summary[key.lower()] = int(line.split(key + "=")[1].split(" ")[0])
+                    except (ValueError, IndexError):
+                        pass
+            if not current.get("timestamp"):
+                current["timestamp"] = ts
+            current["summary"] = summary
+            sessions.append(current)
+            current = {}
+    return sessions[-10:]
+
+
+# ── Mac Offload Status ───────────────────────────────────────
+OFFLOAD_STATUS_FILE = "{{ homelab_control_offload_status_file }}"
+OFFLOAD_LOG_FILE = "{{ homelab_control_offload_log_file }}"
+
+
+def get_offload_status():
+    """Read the last offload run status from JSON file written by orchestrator."""
+    if not os.path.exists(OFFLOAD_STATUS_FILE):
+        return {"status": "no_runs", "mac_available": False}
+    try:
+        with open(OFFLOAD_STATUS_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"status": "error", "error": "could not read status file"}
+
+
+def get_offload_history(limit=10):
+    """Parse the offload log file into run summaries."""
+    if not os.path.exists(OFFLOAD_LOG_FILE):
+        return []
+    runs = []
+    current = {}
+    try:
+        with open(OFFLOAD_LOG_FILE) as f:
+            for line in f:
+                # NOTE: the 2026-05-24 container-driven rewrite renamed mac-offload.sh's
+                # log banners ("=== Mac Offload Starting ===" → "... Status Check ...")
+                # and dropped the SSH "Mac not on network"/"SSH failed" skip lines, but
+                # this parser was never realigned — so it matched NOTHING and
+                # /offload/history returned [] (the whole history table was empty, not
+                # just the markers column). Match strings realigned to the live format
+                # 2026-06-06; verified against /var/log/mac-offload.log.
+                if "=== Mac Offload Status Check Starting ===" in line:
+                    current = {"start": line[1:20].strip()}
+                elif "Skipping status check" in line:
+                    # Container heartbeat stale → status=skipped, no Complete banner.
+                    current["status"] = "skipped"
+                    current["mac_available"] = False
+                    runs.append(current)
+                    current = {}
+                elif "[MARKERS]" in line and "ok=" in line:
+                    # "[MARKERS] last_run=... ok=N fail=N" — the JS markers column
+                    # extracts /(ok=\d+ fail=\d+)/ from this.
+                    current["markers_line"] = line.strip()
+                elif "=== Mac Offload Status Check Complete" in line:
+                    current["status"] = "success"
+                    current["mac_available"] = True
+                    current["end"] = line[1:20].strip()
+                    runs.append(current)
+                    current = {}
+                elif "Failed" in line or "Aborting" in line:
+                    current["status"] = "failed"
+                    runs.append(current)
+                    current = {}
+    except OSError:
+        pass
+    return runs[-limit:]
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    """Handle incoming HTTP requests for homelab control actions."""
+
+    def _send_json(self, code, data):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def _send_html(self, code, html):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html.encode())
+
+    def _check_auth(self):
+        auth = self.headers.get("Authorization", "")
+        if auth != f"Bearer {TOKEN}":
+            self._send_json(401, {"error": "unauthorized"})
+            return False
+        return True
+
+    def _check_token_param(self):
+        """Check token from query parameter for web panel access."""
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        token = params.get("token", [""])[0]
+        return token == TOKEN
+
+    def do_GET(self):  # noqa: N802
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/":
+            if self._check_token_param():
+                self._send_html(200, PANEL_HTML)
+            else:
+                self._send_json(401, {"error": "unauthorized"})
+        elif parsed.path == "/health":
+            self._send_json(200, {"status": "ok"})
+        elif parsed.path == "/storage":
+            if not self._check_auth():
+                return
+            self._send_json(200, get_storage_stats())
+        elif parsed.path == "/junk":
+            if not self._check_auth():
+                return
+            files = scan_junk()
+            total = sum(f["size"] for f in files)
+            self._send_json(200, {"files": files, "total_count": len(files), "total_size": total})
+        elif parsed.path == "/updates":
+            if not self._check_auth():
+                return
+            sessions = parse_watchtower_updates()
+            self._send_json(200, {"sessions": sessions, "total": len(sessions)})
+        elif parsed.path == "/logs":
+            if not self._check_auth():
+                return
+            params = parse_qs(parsed.query)
+            source = params.get("source", ["system"])[0]
+            try:
+                lines = min(int(params.get("lines", ["100"])[0]), MAX_LOG_LINES)
+            except (ValueError, TypeError):
+                lines = 100
+            if source == "system":
+                cmd = ["journalctl", "-n", str(lines), "--no-pager", "-o", "short-iso"]
+            elif source in DOCKER_CONTAINER_WHITELIST:
+                cmd = ["docker", "logs", "--tail", str(lines), source]
+            else:
+                self._send_json(400, {"error": "invalid source"})
+                return
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)  # noqa: S603
+                raw = result.stdout or result.stderr
+                truncated = len(raw) > MAX_LOG_OUTPUT_CHARS
+                output = raw[-MAX_LOG_OUTPUT_CHARS:]
+                self._send_json(200, {"source": source, "lines": output.splitlines(), "truncated": truncated})
+            except subprocess.TimeoutExpired:
+                self._send_json(504, {"error": "timeout"})
+        elif parsed.path == "/offload/status":
+            if not self._check_auth():
+                return
+            self._send_json(200, get_offload_status())
+        elif parsed.path == "/offload/history":
+            if not self._check_auth():
+                return
+            runs = get_offload_history()
+            self._send_json(200, {"runs": runs, "total": len(runs)})
+        elif parsed.path == "/backup/last":
+            if not self._check_auth():
+                return
+            self._send_json(200, get_backup_status())
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):  # noqa: N802
+        if not self._check_auth():
+            return
+
+        actions = {
+            "/shutdown": self._shutdown,
+            "/restart": self._restart,
+            "/update": self._update,
+            "/clean": self._clean,
+            "/junk": self._junk_clean,
+            "/backup": self._backup,
+        }
+
+        action = actions.get(self.path)
+        if action:
+            action()
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def _shutdown(self):
+        self._send_json(200, {"status": "shutting down"})
+        ntfy(
+            "Homelab Shutting Down",
+            "System is powering off. All containers will stop.",
+            priority="high", tags="red_circle",
+        )
+        subprocess.Popen(  # noqa: S603
+            ["sudo", "{{ homelab_control_dir }}/shutdown.sh"],
+            start_new_session=True,
+        )
+
+    def _restart(self):
+        self._send_json(200, {"status": "restarting"})
+        ntfy(
+            "Homelab Restarting",
+            "System is rebooting. Services will be back in ~2 minutes.",
+            priority="high", tags="arrows_counterclockwise",
+        )
+        subprocess.Popen(  # noqa: S603
+            ["sudo", "{{ homelab_control_dir }}/restart.sh"],
+            start_new_session=True,
+        )
+
+    def _update(self):
+        # Respond immediately (202) and run the pulls in a daemon thread.
+        # docker compose pull on 20 services can take minutes; the ntfy
+        # mobile action button has a short HTTP timeout, so synchronous
+        # work here caused spurious "notification errors" on the phone.
+        self._send_json(202, {"status": "update scheduled"})
+        ntfy(
+            "Container Update Started",
+            "Pulling & restarting compose services in the background.",
+            tags="hourglass_flowing_sand",
+        )
+        threading.Thread(target=self._run_update, daemon=True).start()
+
+    def _run_update(self):
+        results = []
+        for d in COMPOSE_DIRS:
+            if not _is_safe_compose_dir(d):
+                results.append({"dir": d, "rc": -1, "output": "skipped: unsafe path (symlink or outside docker root)"})
+                continue
+            compose_file = os.path.join(d, "docker-compose.yml")
+            if not os.path.isfile(compose_file) or os.path.islink(compose_file):
+                continue
+            rc, out, err = run(["docker", "compose", "-f", compose_file, "pull"])
+            run(["docker", "compose", "-f", compose_file, "up", "-d"])
+            results.append({"dir": d, "rc": rc, "output": out.strip()})
+        updated = [os.path.basename(r["dir"]) for r in results] or ["(none)"]
+        failed = [os.path.basename(r["dir"]) for r in results if r["rc"] not in (0, -1)]
+        title = "Containers Updated" if not failed else "Container Update — partial failure"
+        tags = "package" if not failed else "warning,package"
+        msg = f"Pulled & restarted: {', '.join(updated)}"
+        if failed:
+            msg += f"\nFailed: {', '.join(failed)}"
+        ntfy(
+            title,
+            msg,
+            tags=tags,
+            actions=f"view, Open Panel, {EXTERNAL_URL}/?token={TOKEN}, clear=true",
+        )
+
+    def _clean(self):
+        rc, out, _ = run(["docker", "system", "prune", "-af", "--volumes=false"])
+        lines = out.strip().splitlines()
+        reclaimed = next((l for l in lines if "reclaimed" in l.lower()), "done")
+        ntfy(
+            "Docker Cleaned",
+            f"Pruned unused images & networks.\n{reclaimed}",
+            tags="broom",
+        )
+        self._send_json(200, {"status": "cleaned", "output": out.strip()})
+
+    def _junk_clean(self):
+        files = scan_junk()
+        deleted, freed, errors = 0, 0, []
+        srv_real = os.path.realpath("/srv")
+        for f in files:
+            if not _is_inside_srv(f["path"], srv_real):
+                errors.append({
+                    "path": f["path"],
+                    "error": f"Path escapes /srv, skipped",
+                })
+                continue
+            try:
+                if f.get("is_dir"):
+                    shutil.rmtree(f["path"])
+                else:
+                    os.remove(f["path"])
+                deleted += 1
+                freed += f["size"]
+            except OSError as e:
+                errors.append({"path": f["path"], "error": str(e)})
+        junk_logger.info(
+            "Junk cleanup: deleted=%d freed=%d errors=%d files=%s",
+            deleted, freed, len(errors),
+            [f["path"] for f in files[:deleted]],
+        )
+        freed_mb = freed / (1024 * 1024)
+        msg = f"Deleted {deleted} junk files, freed {freed_mb:.1f} MB"
+        if errors:
+            msg += f"\n\u26a0\ufe0f {len(errors)} errors (symlink/permission)"
+        # Intentionally no action URL — embedding the bearer token in a
+        # notification action leaks it into ntfy server/client logs.
+        ntfy("Junk Cleaned", msg, tags="wastebasket")
+        self._send_json(200, {"status": "cleaned", "deleted": deleted, "freed_bytes": freed, "errors": errors})
+
+    def _backup(self):
+        # Full backup run takes minutes (one 976M *arr DB alone is 15s);
+        # return 202 immediately and let cron-style invocation handle
+        # logging. The orchestrator already sends its own ntfy summary on
+        # completion, so we don't fire a "started" ntfy here — that would
+        # double-ping the phone for a routine manual trigger.
+        if not os.path.isfile(BACKUP_SCRIPT) or not os.access(BACKUP_SCRIPT, os.X_OK):
+            self._send_json(503, {"error": f"backup script not found or not executable: {BACKUP_SCRIPT}"})
+            return
+        self._send_json(202, {
+            "status": "started",
+            "started_ts": datetime.now(UTC).isoformat(),
+        })
+        threading.Thread(target=self._run_backup, daemon=True).start()
+
+    def _run_backup(self):
+        # Detached subprocess; stdout/stderr already redirected by the
+        # cron wrapper to BACKUP_LOG_FILE for scheduled runs, so manual
+        # triggers go to journald via inherited fds (good enough — the
+        # JSONL is what the panel reads).
+        subprocess.Popen(  # noqa: S603
+            ["sudo", BACKUP_SCRIPT],
+            start_new_session=True,
+        )
+
+    def log_message(self, format, *args):  # noqa: A002
+        """Log to stdout for journald capture."""
+        sys.stderr.write(f"[control-api] {args[0]} {args[1]} {args[2]}\n")
+
+
+if __name__ == "__main__":
+    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    print(f"Homelab Control API listening on port {PORT}")
+    server.serve_forever()

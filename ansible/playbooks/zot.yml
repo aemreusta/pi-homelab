@@ -1,0 +1,6 @@
+---
+- name: Deploy Zot OCI registry
+  hosts: pi
+  become: true
+  roles:
+    - zot

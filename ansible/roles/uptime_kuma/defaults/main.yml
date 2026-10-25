@@ -1,0 +1,68 @@
+---
+# Uptime Kuma — multi-protocol uptime monitoring + status page.
+# See docs/archive/prds/009-uptime-kuma.md for design rationale.
+
+uptime_kuma_compose_dir: /home/{{ docker_user }}/docker/core/uptime-kuma
+uptime_kuma_data_dir: /home/{{ docker_user }}/docker/core/uptime-kuma/data
+uptime_kuma_tz: "{{ timezone }}"
+
+# Image — pinned to 1.x until 2.x has a stable persistence migration path.
+uptime_kuma_image: "louislam/uptime-kuma:1"
+
+# Host port → container 3001
+uptime_kuma_port: 3011
+
+# Admin (UI-bootstrap on first run; vault-tracked for documentation + future automation)
+uptime_kuma_username: "{{ vault_uptime_kuma_username | default('admin') }}"
+uptime_kuma_password: "{{ vault_uptime_kuma_password | default('') }}"
+
+# ntfy notification target (single source of truth in group_vars/all/main.yml).
+# MUST be the plain base URL: Uptime Kuma's ntfy provider takes `ntfyserverurl`
+# + `ntfytopic` as separate fields, so a shoutrrr URL (ntfy://host/topic?scheme=)
+# is the wrong SHAPE here — it was set to ntfy_shoutrrr_url and never used,
+# which is how the hardcoded `http://ntfy.example:2586` in the backup JSON
+# survived the 2026-07-15 .example -> .example.internal cut and left all 23
+# monitors unable to notify for three weeks (NXDOMAIN). Never hardcode a host.
+uptime_kuma_ntfy_url: "{{ ntfy_external_base_url }}"
+uptime_kuma_ntfy_topic: "homelab-uptime"
+
+# Drift-check: live monitor set (via /metrics) vs the committed backup JSON.
+uptime_kuma_metrics_url: "http://127.0.0.1:{{ uptime_kuma_port }}"
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+uptime_kuma_mem_limit: 256M
+
+# --- Container security hardening ---
+
+uptime_kuma_pids_limit: 200
+
+# Node binary, no privileged sockets — BUT the image entrypoint runs as root
+# and chowns /app/data on startup, which needs CHOWN/DAC_OVERRIDE/FOWNER +
+# SETUID/SETGID to drop to its runtime user. cap_drop ALL with no cap_add
+# crash-loops on `chown: Operation not permitted` (first-deploy bug 2026-05-30).
+# Same init-cap set as the byparr precedent in the media role.
+uptime_kuma_cap_drop:
+  - ALL
+uptime_kuma_cap_add:
+  - CHOWN
+  - DAC_OVERRIDE
+  - FOWNER
+  - SETGID
+  - SETUID
+
+# Heartbeat retention (days). UK stores one heartbeat per monitor per check;
+# at 180d (the UK default) kuma.db had 1.22M rows / 195 MB (2026-07-07). 30d
+# keeps ~5 weeks of history and bounds the DB to ~30 MB. UK auto-prunes older
+# rows on its cleanup timer once this is set; the one-time VACUUM to reclaim the
+# already-allocated pages is an operational step (UK doesn't auto-VACUUM).
+uptime_kuma_retention_days: 30
+
+# read_only NOT enabled — UK writes to data + node_modules cache.
+
+uptime_kuma_oci_labels:
+  org.opencontainers.image.title: uptime-kuma
+  org.opencontainers.image.description: "Uptime Kuma — multi-protocol uptime monitor"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/uptime_kuma/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://github.com/louislam/uptime-kuma"

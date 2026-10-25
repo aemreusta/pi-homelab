@@ -1,0 +1,8 @@
+---
+- name: Include cAdvisor deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [cadvisor]
+
+- name: Include cAdvisor UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [cadvisor, firewall]

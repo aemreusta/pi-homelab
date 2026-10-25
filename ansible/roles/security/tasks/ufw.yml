@@ -1,0 +1,38 @@
+---
+- name: Install UFW
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+
+- name: Set UFW default deny incoming
+  community.general.ufw:
+    direction: incoming
+    default: deny
+
+- name: Set UFW default allow outgoing
+  community.general.ufw:
+    direction: outgoing
+    default: allow
+
+- name: Allow SSH through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ security_ssh_port }}"
+    proto: tcp
+
+- name: Allow additional UFW ports
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto | default('tcp') }}"
+  loop: "{{ security_ufw_allowed_ports }}"
+  when: security_ufw_allowed_ports | length > 0
+
+- name: Enable UFW
+  community.general.ufw:
+    state: enabled
+
+# NOTE: Docker bypasses UFW by inserting its own iptables rules.
+# Container access is controlled via the DOCKER-USER chain in the docker role,
+# NOT by disabling Docker's iptables management.
+# See: https://docs.docker.com/network/packet-filtering-firewalls/

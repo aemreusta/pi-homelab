@@ -1,0 +1,8 @@
+---
+- name: Include VictoriaLogs deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [victorialogs]
+
+- name: Include VictoriaLogs UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [victorialogs, firewall]

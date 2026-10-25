@@ -1,0 +1,19 @@
+---
+# Enable cgroup memory controller for Docker memory limits.
+# Raspberry Pi kernels disable memory cgroup via DTB bootargs by default.
+# Adding cgroup_enable=memory to cmdline.txt overrides this.
+# Requires reboot to take effect.
+
+- name: Check if cgroup memory controller is enabled
+  ansible.builtin.command: cat /sys/fs/cgroup/cgroup.controllers
+  register: common_cgroup_controllers
+  changed_when: false
+
+- name: Add cgroup_enable=memory to kernel cmdline
+  ansible.builtin.replace:
+    path: /boot/firmware/cmdline.txt
+    regexp: '^((?!.*cgroup_enable=memory).+)$'
+    replace: '\1 cgroup_enable=memory'
+  become: true
+  when: "'memory' not in common_cgroup_controllers.stdout"
+  notify: Reboot required for cgroup

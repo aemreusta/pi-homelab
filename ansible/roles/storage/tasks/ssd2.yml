@@ -1,0 +1,155 @@
+---
+# Second data disk (Kingston XS1000, 931 GiB) — design 042.
+#
+# Mounted by UUID, never by /dev/sdX: this Pi has re-enumerated its USB disks
+# (sdb -> sdc) during every power incident, and mounting by UUID is the only
+# reason those were survivable. See docs/conventions/pi4-usb-power-budget.md.
+#
+# `nofail` is load-bearing, not boilerplate. This drive runs on a KNOWN-marginal
+# USB power budget and has dropped off the bus before. nofail means a dropout
+# degrades service instead of wedging boot in emergency mode.
+
+# --- Teardown path (storage_ssd2_enabled: false) -------------------------
+# Runs FIRST so a disabled disk is fully unwound before anything else looks at
+# it. Leaving stale fstab entries behind would be harmless today (nofail, disk
+# absent) but would silently re-mount the drive the moment it was plugged back
+# in — which, on this hardware, is how the Pi gets taken down.
+# NOTE: `state: absent` is deliberately NOT used here. It unmounts AND rmdir's
+# the mountpoint — which fails on a non-empty dir (it did, 2026-08-02: Docker
+# had auto-created /mnt/ssd2/.beszel on the root fs while the disk was gone),
+# and on a bind target like /srv/backups it would be aimed at live data.
+# Unmount and de-fstab explicitly; leave the empty directories alone.
+- name: Unbind ssd2 subdirectories from /srv (disabled)
+  ansible.posix.mount:
+    path: "{{ item.dest }}"
+    state: unmounted
+  loop: "{{ storage_ssd2_binds }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  when: not (storage_ssd2_enabled | bool)
+
+- name: Drop ssd2 bind entries from fstab (disabled)
+  ansible.posix.mount:
+    path: "{{ item.dest }}"
+    state: absent_from_fstab
+  loop: "{{ storage_ssd2_binds }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  when: not (storage_ssd2_enabled | bool)
+
+- name: Unmount ssd2 (disabled)
+  ansible.posix.mount:
+    path: "{{ storage_ssd2_mount }}"
+    state: unmounted
+  when: not (storage_ssd2_enabled | bool)
+
+- name: Drop the ssd2 fstab entry (disabled)
+  ansible.posix.mount:
+    path: "{{ storage_ssd2_mount }}"
+    state: absent_from_fstab
+  when: not (storage_ssd2_enabled | bool)
+
+# --- Normal path ---------------------------------------------------------
+- name: Create ssd2 mountpoint
+  ansible.builtin.file:
+    path: "{{ storage_ssd2_mount }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: storage_ssd2_enabled | bool
+
+- name: Mount ssd2 by UUID
+  ansible.posix.mount:
+    path: "{{ storage_ssd2_mount }}"
+    src: "UUID={{ storage_ssd2_uuid }}"
+    fstype: "{{ storage_ssd2_fstype }}"
+    opts: "{{ storage_ssd2_opts }}"
+    state: mounted
+  when: storage_ssd2_enabled | bool
+
+# Everything below depends on ssd2 being genuinely mounted. If the drive has
+# dropped, `state: mounted` above leaves the mountpoint as a plain directory on
+# the ROOT filesystem — creating the subdirs and binding them would then
+# silently redirect writes to the disk we were trying to relieve. So gate on
+# the live mount table, not on the task result.
+- name: Check whether ssd2 is actually mounted
+  ansible.builtin.command:
+    cmd: "mountpoint -q {{ storage_ssd2_mount }}"
+  register: storage_ssd2_mountcheck
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: storage_ssd2_enabled | bool
+
+- name: Fail loudly if ssd2 is enabled but not mounted
+  ansible.builtin.fail:
+    msg: >-
+      {{ storage_ssd2_mount }} is not a mountpoint. The Kingston has most likely
+      dropped off the USB bus again (docs/conventions/pi4-usb-power-budget.md).
+      Refusing to create bind mounts, because doing so would silently write to
+      the root filesystem instead. Check `lsblk`, `dmesg -T | grep -i usb`, and
+      whether UUID={{ storage_ssd2_uuid }} is present via `blkid`.
+  when:
+    - storage_ssd2_enabled | bool
+    - not ansible_check_mode
+    - storage_ssd2_mountcheck.rc | default(1) != 0
+
+- name: Create ssd2 data subdirectories
+  ansible.builtin.file:
+    path: "{{ storage_ssd2_mount }}/{{ item.src }}"
+    state: directory
+    owner: "{{ storage_owner }}"
+    group: "{{ storage_group }}"
+    mode: "0755"
+  loop: "{{ storage_ssd2_binds }}"
+  loop_control:
+    label: "{{ item.src }}"
+  when:
+    - storage_ssd2_enabled | bool
+    - storage_ssd2_mountcheck.rc | default(1) == 0 or ansible_check_mode
+
+# Beszel's Docker agent discovers extra disks via a bind mount of a marker
+# directory that lives ON the target filesystem — that is what makes its disk
+# chart survive device renaming. Created here rather than in the beszel role
+# because it must exist on ssd2, behind the mountpoint gate above.
+- name: Create Beszel marker directory on ssd2
+  ansible.builtin.file:
+    path: "{{ storage_ssd2_mount }}/.beszel"
+    state: directory
+    owner: "{{ storage_owner }}"
+    group: "{{ storage_group }}"
+    mode: "0755"
+  when:
+    - storage_ssd2_enabled | bool
+    - storage_ssd2_mountcheck.rc | default(1) == 0 or ansible_check_mode
+
+- name: Create bind mount targets under /srv
+  ansible.builtin.file:
+    path: "{{ item.dest }}"
+    state: directory
+    owner: "{{ storage_owner }}"
+    group: "{{ storage_group }}"
+    mode: "0755"
+  loop: "{{ storage_ssd2_binds }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  when: storage_ssd2_enabled | bool
+
+# Bind into /srv so container paths (/srv:/data) never change — the whole
+# storage namespace stays /srv-shaped regardless of which spindle backs it.
+# x-systemd.requires-mounts-for pins ordering: the bind cannot be attempted
+# before ssd2 itself is up.
+- name: Bind ssd2 subdirectories into /srv
+  ansible.posix.mount:
+    path: "{{ item.dest }}"
+    src: "{{ storage_ssd2_mount }}/{{ item.src }}"
+    fstype: none
+    opts: "bind,nofail,x-systemd.requires-mounts-for={{ storage_ssd2_mount }}"
+    state: mounted
+  loop: "{{ storage_ssd2_binds }}"
+  loop_control:
+    label: "{{ item.dest }} <- {{ item.src }}"
+  when:
+    - storage_ssd2_enabled | bool
+    - storage_ssd2_mountcheck.rc | default(1) == 0 or ansible_check_mode

@@ -1,0 +1,54 @@
+#!/bin/bash
+# Homelab junk file scan — logs findings to /var/log/homelab-junk.log.
+# Run weekly via cron. Does NOT auto-delete; use the web panel to confirm.
+# Web panel: http://raspberrypi.local:{{ homelab_control_port }}/?token=<token>
+
+set -uo pipefail
+
+LOG=/var/log/homelab-junk.log
+TOKEN_FILE="{{ homelab_control_dir }}/.api-token"
+PORT={{ homelab_control_port }}
+
+if [ ! -f "$TOKEN_FILE" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M') [ERROR] API token file not found: $TOKEN_FILE" >> "$LOG"
+    exit 1
+fi
+
+TOKEN=$(cat "$TOKEN_FILE")
+
+RESULT=$(curl -sf -H "Authorization: Bearer $TOKEN" "http://localhost:${PORT}/junk" 2>&1) || {
+    echo "$(date '+%Y-%m-%d %H:%M') [ERROR] Failed to reach control API on port ${PORT}" >> "$LOG"
+    exit 1
+}
+
+COUNT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['total_count'])" 2>/dev/null || echo "?")
+SIZE=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['total_size'])" 2>/dev/null || echo "?")
+
+{
+    echo "$(date '+%Y-%m-%d %H:%M') [SCAN] ${COUNT} junk files found (${SIZE} bytes)"
+    if [ "${COUNT}" != "0" ] && [ "${COUNT}" != "?" ]; then
+        echo "$RESULT" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for f in d['files']:
+    print('  ' + f['path'] + ' (' + str(f['size']) + ' bytes)')
+" 2>/dev/null
+    fi
+} >> "$LOG"
+
+# Send ntfy notification if junk found
+NTFY_URL="{{ ntfy_external_topic_url }}"
+CONTROL_EXTERNAL_URL="{{ homelab_control_external_url | default('https://' ~ control_hostname) }}"
+
+if [ "${COUNT}" != "0" ] && [ "${COUNT}" != "?" ]; then
+    SIZE_MB=$(echo "$SIZE" | python3 -c "import sys; print(f'{int(sys.stdin.read().strip()) / 1048576:.1f}')" 2>/dev/null || echo "?")
+    curl -sf \
+        -H "Title: Junk Scan: ${COUNT} files found" \
+        -H "Tags: mag,wastebasket" \
+        -H "Markdown: yes" \
+        -H "Actions: view, Review & Clean, ${CONTROL_EXTERNAL_URL}/?token=${TOKEN}#junk-section, clear=true" \
+        -d "Found **${COUNT}** junk files (${SIZE_MB} MB).
+
+Tap to review and clean from the web panel." \
+        "$NTFY_URL" >/dev/null 2>&1
+fi

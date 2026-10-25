@@ -1,0 +1,6 @@
+---
+# No ufw.yml — Authelia binds 127.0.0.1:9091 (loopback only); UFW sees no LAN
+# port. All access is via Traefik (auth.<domain>) and the forward-auth middleware.
+- name: Include Authelia deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [authelia]

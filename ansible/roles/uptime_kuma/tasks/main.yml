@@ -1,0 +1,23 @@
+---
+- name: Include Uptime Kuma deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [uptime_kuma]
+
+- name: Include Uptime Kuma settings (retention) tasks
+  ansible.builtin.include_tasks: configure.yml
+  tags: [uptime_kuma]
+
+- name: Include Uptime Kuma drift-check tasks
+  ansible.builtin.include_tasks: monitoring.yml
+  tags: [uptime_kuma, monitoring]
+
+- name: Include Uptime Kuma seed/restore tasks (on-demand only)
+  ansible.builtin.include_tasks: seed.yml
+  args:
+    apply:
+      tags: [never, seed]
+  tags: [never, seed]
+
+- name: Include Uptime Kuma UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [uptime_kuma, firewall]

@@ -1,0 +1,142 @@
+# Container error-rate rules — Sprint 18 Story 3.
+# LogsQL rules evaluated by vmalert-logs (datasource = VictoriaLogs).
+#
+# Field-name dependencies: `container_name` and `log_level` are populated
+# by the Fluent Bit Lua filter in roles/fluentbit/templates/enrich.lua.j2
+# (Sprint 18b, deployed 2026-05-22). container_name is also a VL stream
+# field so the `_stream:{container_name=...}` selectors hit the stream
+# index. log_level is extracted from bracketed `[Level]` markers — covers
+# *arr `[Info]`, Jellyfin `[INF]`, Jellyseerr `[info]`.
+#
+# LogsQL alert pattern (per https://docs.victoriametrics.com/victorialogs/vmalert):
+#   expr: '<filter> | stats by (label) count() as <name> | filter <name>:><threshold>'
+# A row that survives the trailing `filter` fires the alert.
+
+groups:
+  - name: container-error-rate
+    interval: 1m
+    type: vlogs   # explicit even though vmalert-logs has --rule.defaultRuleType=vlogs
+    rules:
+
+      # ── AdGuard upstream resolution failures ─────────────────────────
+      # Added 2026-08-02 after this ran unnoticed for at least two days.
+      #
+      # Symptom: `dnsproxy: exchange failed ... i/o timeout` — a LAN client waited
+      # 20 s and got SERVFAIL. Measured ~250 failed questions/hour against ~2,120
+      # queries/hour (12–15%), climbing to ~614 log events in the final hour.
+      #
+      # Why nothing caught it: AdGuard's own /control/stats reported
+      # avg_processing_time = 3.04 ms the entire time. The mean is computed over
+      # mostly-cached, mostly-fast queries and drowns a 12% tail of 20-SECOND
+      # hangs. This is the same trap as reading `docker stats` memory (page cache
+      # inflates it) — an aggregate that is technically correct and operationally
+      # blind. The SLI here is the failure COUNT, never the average latency.
+      #
+      # Fix shipped alongside: parallel upstream_mode + fallback_dns +
+      # cache_optimistic (roles/adguard/defaults/main.yml). This rule is the
+      # regression detector for that fix, and the reason it is a rule at all:
+      # DNS degrades gradually and every device on the LAN feels it before any
+      # dashboard does.
+      #
+      # MATCH `exchange failed`, NOT `i/o timeout`. This distinction is the whole
+      # rule and it only became visible after the fix deployed. AdGuard logs two
+      # different things:
+      #
+      #   "response received ... i/o timeout"  → ONE UPSTREAM attempt lost a packet
+      #   "exchange failed ..."                → the QUESTION failed; client got SERVFAIL
+      #
+      # Before the fix these were 1:1 (750/750 over 3h) because the upstreams were
+      # tried serially — losing a packet meant losing the question. In parallel
+      # mode they decouple: measured 26 attempts against 9 client failures in the
+      # first 8 minutes post-deploy, i.e. ~2.9:1, because the second upstream
+      # answered while the first was still timing out. Counting `i/o timeout`
+      # would page on upstream packet loss that parallel mode has ALREADY
+      # absorbed — an alert firing on a condition that no longer harms anyone.
+      # Only `exchange failed` means a user waited and got nothing.
+      #
+      # Threshold: >10 client-visible failures in 5m, sustained. Normal is 0; a
+      # brief upstream blip must not page, so `for` is deliberately long.
+      - alert: AdguardUpstreamFailures
+        expr: '_stream:{container_name="adguard"} "exchange failed" | stats by (container_name) count() as failures | filter failures:>10'
+        for: {{ vmalert_adguard_upstream_failure_for | default('15m') }}
+        labels:
+          severity: warn
+          source: vmalert-logs
+          service: adguard
+        annotations:
+          summary: "AdGuard upstream DNS is timing out"
+          description: ">10 upstream i/o timeouts in 5m from AdGuard, sustained. Every one is a LAN client hanging up to upstream_timeout (10 s) and receiving SERVFAIL. Do NOT trust /control/stats avg_processing_time — it averaged 3 ms while 12% of queries were failing. Check in this order: (1) `dig @1.1.1.1 example.com` from the Pi — if that is fast the upstreams are fine and this is egress packet loss, not a dead resolver; (2) confirm upstream_mode is still `parallel` and fallback_dns is non-empty via `curl -s localhost:8080/control/dns_info` — a manual UI change or a factory-default reset silently reverts them; (3) only then look at the ISP/router. Rationale + the full 2026-08-02 measurement: roles/adguard/defaults/main.yml."
+
+      - alert: SonarrErrorRateHigh
+        expr: '_stream:{container_name="sonarr"} log_level:error | stats by (container_name) count() as errors | filter errors:>10'
+        for: 5m
+        labels:
+          severity: warn
+          source: vmalert-logs
+          service: sonarr
+        annotations:
+          summary: "Sonarr error-rate elevated"
+          description: ">10 error-level log lines in 5m from Sonarr. Check VictoriaLogs."
+
+      - alert: RadarrErrorRateHigh
+        expr: '_stream:{container_name="radarr"} log_level:error | stats by (container_name) count() as errors | filter errors:>10'
+        for: 5m
+        labels:
+          severity: warn
+          source: vmalert-logs
+          service: radarr
+        annotations:
+          summary: "Radarr error-rate elevated"
+          description: ">10 error-level log lines in 5m from Radarr."
+
+      - alert: ProwlarrErrorRateHigh
+        expr: '_stream:{container_name="prowlarr"} log_level:error | stats by (container_name) count() as errors | filter errors:>10'
+        for: 5m
+        labels:
+          severity: warn
+          source: vmalert-logs
+          service: prowlarr
+        annotations:
+          summary: "Prowlarr error-rate elevated"
+          description: "Could be indexer outage; check `docker logs prowlarr` and forceSave the failing indexer."
+
+      # Depends on Traefik access logging → stdout (JSON), enabled in the traefik
+      # static config (traefik_access_log_enabled). Match the DownstreamStatus
+      # JSON field for any 5xx — the old bare _msg:"500" substring only caught
+      # 500 and could false-match a 500-byte size/duration; and with access
+      # logging off (the prior state) it could never fire at all.
+      - alert: TraefikErrorRateHigh
+        expr: '_stream:{container_name="traefik"} _msg:~"\"DownstreamStatus\":5[0-9][0-9]" | stats by (container_name) count() as errors | filter errors:>25'
+        for: 5m
+        labels:
+          severity: warn
+          source: vmalert-logs
+          service: traefik
+        annotations:
+          summary: "Traefik 5xx surge"
+          description: ">25 HTTP 5xx responses in 5m via Traefik (DownstreamStatus 5xx in the access log). An upstream service is likely down or erroring — check which ServiceName dominates in VictoriaLogs (`_stream:{container_name=\"traefik\"} _msg:~\"DownstreamStatus.:5\"`)."
+
+      - alert: JellyseerrErrorRateHigh
+        expr: '_stream:{container_name="jellyseerr"} log_level:error | stats by (container_name) count() as errors | filter errors:>10'
+        for: 5m
+        labels:
+          severity: warn
+          source: vmalert-logs
+          service: jellyseerr
+        annotations:
+          summary: "Jellyseerr error-rate elevated"
+          description: ">10 errors in 5m. Likely Jellyfin connectivity loss or sync issue."
+
+      # Label Studio CE has no Prometheus endpoint (no vmagent scrape), so its
+      # only machine-visible health signal is its log stream. A crash-loop or
+      # 500-storm (DB lock, OOM-kill, migrate failure) shows up as an error burst.
+      - alert: LabelStudioErrorRateHigh
+        expr: '_stream:{container_name="label-studio"} log_level:error | stats by (container_name) count() as errors | filter errors:>10'
+        for: 5m
+        labels:
+          severity: warn
+          source: vmalert-logs
+          service: label-studio
+        annotations:
+          summary: "Label Studio error-rate elevated"
+          description: ">10 error-level log lines in 5m from Label Studio. Check `docker logs label-studio` — DB lock, OOM (Pi RAM is tight), or migrate failure."

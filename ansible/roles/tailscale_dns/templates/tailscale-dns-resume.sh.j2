@@ -1,0 +1,24 @@
+#!/bin/bash
+# Wait for tailscale0 to have an IPv4 address, then start tailscale-dns.
+# Solves the boot-order race: Docker restarts the container before
+# tailscale0 is up, the port bind fails, and the container exits 255.
+
+set -euo pipefail
+
+CONTAINER="{{ tailscale_dns_container_name }}"
+TIMEOUT=120   # seconds to wait for tailscale0 IP
+INTERVAL=2
+
+elapsed=0
+while [ "$elapsed" -lt "$TIMEOUT" ]; do
+    if ip -4 addr show tailscale0 2>/dev/null | grep -q 'inet '; then
+        echo "tailscale0 has an IP, starting ${CONTAINER} container"
+        docker start "${CONTAINER}"
+        exit 0
+    fi
+    sleep "$INTERVAL"
+    elapsed=$((elapsed + INTERVAL))
+done
+
+echo "WARNING: tailscale0 did not get an IP within ${TIMEOUT}s" >&2
+exit 1

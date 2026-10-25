@@ -1,0 +1,92 @@
+---
+# Label Studio CE — audio/ASR dataset labeling & QA.
+# https://github.com/HumanSignal/label-studio
+# Managed by Ansible — do not edit manually.
+
+services:
+  label-studio:
+    image: {{ label_studio_image }}
+    container_name: label-studio
+    restart: unless-stopped
+    init: true
+    # No `user:` override — the image is built to run as UID 1001 and writes to
+    # HOME (/label-studio); the host data dir is pre-owned 1001:1001 to match.
+    mem_limit: {{ label_studio_mem_limit }}
+    pids_limit: {{ label_studio_pids_limit }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for c in label_studio_cap_drop %}
+      - {{ c }}
+{% endfor %}
+    labels:
+{% for k, v in label_studio_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - TZ={{ label_studio_tz }}
+      # Absolute-URL base + login redirect behind the reverse proxy.
+      - LABEL_STUDIO_HOST={{ label_studio_host_url }}
+      # Django CSRF must trust every origin the login POST can arrive from
+      # (LAN HTTPS, Tailscale HTTPS, bare LAN host port) or it 403s behind the
+      # proxy. Comma-joined from the list in defaults.
+      - CSRF_TRUSTED_ORIGINS={{ label_studio_csrf_trusted_origins | join(',') }}
+      # Bootstrap admin (created on first boot; no interactive signup).
+      - LABEL_STUDIO_USERNAME={{ label_studio_username }}
+      - LABEL_STUDIO_PASSWORD={{ label_studio_password }}
+      - LABEL_STUDIO_USER_TOKEN={{ label_studio_user_token }}
+      # Lock down open registration + disable telemetry.
+      - LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK={{ label_studio_disable_signup }}
+      - COLLECT_ANALYTICS={{ label_studio_collect_analytics }}
+      # Allow the long-lived legacy API token (label_studio_user_token) the
+      # Faz-2 STT import script uses — LS 1.20+ disables legacy auth by default.
+      - LABEL_STUDIO_ENABLE_LEGACY_API_TOKEN={{ label_studio_enable_legacy_token }}
+{% if label_studio_use_postgres | default(false) %}
+      # Postgres backend on the shared mlstack_net (migrated off the local
+      # SQLite 2026-07-07). Data was copied into the Django-created schema via
+      # pgloader (data-only). The SQLite file is retained untouched as rollback:
+      # set label_studio_use_postgres=false + redeploy to fall back to it.
+      - DJANGO_DB=default
+      - POSTGRE_HOST={{ label_studio_pg_host }}
+      - POSTGRE_PORT={{ label_studio_pg_port }}
+      - POSTGRE_NAME={{ label_studio_pg_name }}
+      - POSTGRE_USER={{ label_studio_pg_user }}
+      - POSTGRE_PASSWORD={{ label_studio_pg_password }}
+{% endif %}
+    ports:
+      # host:container — 8080 host clashes with AdGuard, so remap on the host.
+      - "{{ label_studio_port }}:8080"
+    volumes:
+      - {{ label_studio_data_dir }}:/label-studio/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # No curl in the image; Python is the app runtime, so probe with urllib.
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').status == 200 else 1)"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      # First cold SQLite migrate on a loaded Pi (load ~7, 35 containers) can
+      # exceed 2 min — generous start_period avoids a transient "unhealthy" flap.
+      start_period: 180s
+    networks:
+      - label_studio_net
+{% if label_studio_use_postgres | default(false) %}
+      - mlstack_net
+{% endif %}
+
+networks:
+  label_studio_net:
+    driver: bridge
+{% if label_studio_use_postgres | default(false) %}
+  # Shared ML-stack bridge (created by the postgresql role) — reach postgresql:5432.
+  mlstack_net:
+    external: true
+{% endif %}

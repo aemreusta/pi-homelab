@@ -1,0 +1,8 @@
+---
+- name: Allow ntfy from LAN
+  community.general.ufw:
+    rule: allow
+    port: "{{ ntfy_port }}"
+    proto: tcp
+    from_ip: 192.168.0.0/16
+    comment: ntfy push notifications

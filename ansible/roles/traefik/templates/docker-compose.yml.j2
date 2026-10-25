@@ -1,0 +1,47 @@
+---
+# Traefik — reverse proxy for *.example domains
+# network_mode: host — all backend services publish on localhost ports
+
+services:
+  traefik:
+    image: {{ traefik_image }}
+    container_name: traefik
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ traefik_mem_limit }}
+    pids_limit: {{ traefik_pids_limit }}
+    read_only: {{ traefik_read_only | lower }}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size={{ traefik_tmpfs_size }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in traefik_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+    cap_add:
+{% for cap in traefik_cap_add %}
+      - {{ cap }}
+{% endfor %}
+    labels:
+{% for k, v in traefik_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - TZ={{ traefik_tz }}
+    network_mode: host
+    volumes:
+      - {{ traefik_config_dir }}/traefik.yml:/etc/traefik/traefik.yml:ro
+      - {{ traefik_config_dir }}/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - {{ traefik_certs_dir }}:/certs:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

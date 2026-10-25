@@ -1,0 +1,8 @@
+---
+- name: Include VictoriaMetrics deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [victoriametrics]
+
+- name: Include VictoriaMetrics UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [victoriametrics, firewall]

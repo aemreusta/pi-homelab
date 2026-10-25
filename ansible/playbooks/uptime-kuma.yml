@@ -1,0 +1,6 @@
+---
+- name: Deploy Uptime Kuma uptime monitor
+  hosts: pi
+  become: true
+  roles:
+    - uptime_kuma

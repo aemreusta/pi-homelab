@@ -1,0 +1,8 @@
+---
+- name: Allow VictoriaLogs from LAN
+  community.general.ufw:
+    rule: allow
+    port: "{{ victorialogs_port }}"
+    proto: tcp
+    src: 192.168.0.0/16
+    comment: VictoriaLogs HTTP API + vmui

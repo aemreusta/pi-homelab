@@ -1,0 +1,6 @@
+---
+- name: Deploy Authelia SSO / OIDC provider
+  hosts: pi
+  become: true
+  roles:
+    - authelia

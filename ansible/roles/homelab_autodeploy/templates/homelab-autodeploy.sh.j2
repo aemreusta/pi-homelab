@@ -1,0 +1,310 @@
+#!/bin/bash
+# homelab-autodeploy.sh — Pi-side GitOps CD for the raspi-homelab repo. TAG-GATED
+# (2026-07-13): a plain push to master runs CI only; the CD deploys ONLY the commit
+# a `deploy-v*` tag points at (mirrors the image-repo build split). On a new
+# (CI-green) deploy tag, deploy the roles whose files changed since the last deployed
+# tag, IN DEPENDENCY ORDER (base first); if any deploy fails, reset the checkout to
+# the last-good commit, re-deploy to restore, and stop (failed tag is not retried
+# until a newer deploy tag is cut). Runs ON THE PI (cron, root) against itself (--connection=local):
+# no Mac, no SSH off-box — the vault lives here because the Pi already holds every
+# decrypted secret (design 039: the Mac CI box may NOT hold secrets; the Pi may).
+#
+# ntfy fires at EVERY step (steps = low priority, outcomes = high) so the operator
+# sees the whole pipeline. Orchestration only — all decisions (new-commit?, CI
+# green?, which targets?, state transitions, metrics) are in the tested module
+# homelab_autodeploy.py.
+#
+# MANAGED BY ANSIBLE — role homelab_autodeploy. Edit the template, not the Pi.
+set -uo pipefail
+
+# cron runs root with a bare PATH (/usr/bin:/bin) — /usr/local/bin is NOT on it,
+# so the uv-installed `ansible-playbook` symlink there is invisible and every
+# deploy_target dies "ansible-playbook: command not found", failing the deploy AND
+# the rollback (ntfy-storms the operator). Pin PATH so the script is self-contained
+# regardless of how it's invoked. (2026-06-30: first real deploy hit exactly this.)
+# The default below is the authoritative production PATH; `homelab_autodeploy_path`
+# exists only so the CD drill (tests/test_autodeploy_drill.py) can prepend a
+# sandbox bin dir of mock ansible-playbook/curl/sleep/flock — never set in prod.
+export PATH="{{ homelab_autodeploy_path | default('/usr/local/bin:/root/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin') }}"
+
+REPO_DIR="{{ homelab_autodeploy_repo_dir }}"
+ANSIBLE_DIR="$REPO_DIR/ansible"
+BRANCH="{{ homelab_autodeploy_branch }}"
+STATE="{{ homelab_autodeploy_state_file }}"
+MODULE="{{ homelab_autodeploy_bin_dir }}/homelab_autodeploy.py"
+ROLE_MAP='{{ homelab_autodeploy_role_target_map | to_json }}'
+BASE_ROLES="{{ homelab_autodeploy_base_roles | join(',') }}"
+# Deploy gate (design 039): only these targets auto-deploy; any other changed
+# role is HELD for a manual `make`, surfaced via ntfy (never silently marked
+# done). Empty = no gate (every changed target auto-deploys). FULL ROLLOUT: empty.
+ALLOWLIST="{{ homelab_autodeploy_target_allowlist | default([]) | join(',') }}"
+# Deny-list: targets NEVER auto-deployed, even with an empty allowlist. `base`
+# (host provisioning) stays here — a successful-but-bricking host change won't
+# auto-roll-back (rollback only on ansible non-zero exit) and the CD runs on the
+# Pi it would brick. base is a deliberate manual `make base`. Held like any other.
+NEVER_AUTO="{{ homelab_autodeploy_never_auto_targets | default(['base']) | join(',') }}"
+NEVER_AUTO_ARR=(); while IFS= read -r _l; do [ -n "$_l" ] && NEVER_AUTO_ARR+=("$_l"); done \
+    < <(printf '%s\n' "${NEVER_AUTO//,/$'\n'}")
+DENYLIST_STATE="{{ homelab_autodeploy_denylist_state_file | default('/opt/homelab/.homelab-autodeploy-denylist-state.json') }}"
+CI_TOKEN="{{ homelab_autodeploy_ci_token }}"
+CI_REPO="{{ homelab_autodeploy_ci_repo }}"
+TEXTFILE_DIR="{{ homelab_autodeploy_textfile_dir }}"
+TEXTFILE="$TEXTFILE_DIR/homelab_autodeploy.prom"
+LOG="{{ homelab_autodeploy_log_file }}"
+NTFY_URL="{{ homelab_autodeploy_ntfy_url }}"
+LOCK="/run/lock/homelab-autodeploy.lock"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
+py()  { python3 "$MODULE" "$@"; }
+state_set() { py "$@" > "$STATE.tmp" 2>>"$LOG" && mv "$STATE.tmp" "$STATE"; }
+run_ok=1
+# Progress steps (evaluating, CI green, checkout, per-target start/done) are
+# LOG-ONLY by default. One green deploy used to push 14 messages (2026-09-29),
+# which trains the operator to swipe away the CD channel — including the
+# rollback/held messages that matter. Pushes are reserved for: start, final
+# result, holds, failures and rollback detail. Set
+# homelab_autodeploy_notify_progress=true to get the step-by-step pushes back.
+NOTIFY_PROGRESS="{{ 'true' if (homelab_autodeploy_notify_progress | default(false)) else 'false' }}"
+progress() {
+    log "progress: $1"
+    [ "$NOTIFY_PROGRESS" = "true" ] && notify "$@"
+    return 0
+}
+# $1=step body, $2=priority(default low), $3=tags
+notify() {
+    [ -n "$NTFY_URL" ] || return 0
+    curl -fsS -m 10 -H "Title: homelab-cd" -H "Priority: ${2:-low}" -H "Tags: ${3:-gear}" \
+        -d "$1" "$NTFY_URL" >/dev/null 2>&1 || true
+}
+emit_metrics() {
+    [ -d "$TEXTFILE_DIR" ] || return 0
+    local tmp="$TEXTFILE.$$"
+    if py metrics "$STATE" "$(date +%s)" "$run_ok" > "$tmp" 2>>"$LOG"; then
+        mv "$tmp" "$TEXTFILE" || rm -f "$tmp"
+    else rm -f "$tmp"; fi
+}
+finish() { emit_metrics; exit "${1:-0}"; }
+
+# One deploy of a playbook target, locally, through the deep-check gate.
+# Retries on failure: when a big plan re-deploys many heavy roles back-to-back
+# under load (disk-pressure), individual tasks fail TRANSIENTLY — Prowlarr/*arr
+# API timeouts, `ufw ... ERROR: problem running sysctl`, etc. — that succeed once
+# the load spike passes. Ansible is idempotent, so re-running a target is safe; a
+# genuinely broken deploy still fails all attempts and rolls back. The backoff also
+# lets the system settle between tries. (2026-06-30 whack-a-mole: PATH → *arr
+# API → vmalert ufw, all one transient-under-load class; retry absorbs the class.)
+deploy_target() {
+    local pb="playbooks/$1.yml"
+    [ -f "$ANSIBLE_DIR/$pb" ] || { log "no playbook $pb — skipping target $1"; return 0; }
+    local attempt rc=1
+    for attempt in 1 2 3; do
+        ( cd "$ANSIBLE_DIR" \
+            && ansible-playbook --syntax-check "$pb" \
+            && ansible-playbook --connection=local --check --diff "$pb" \
+            && ansible-playbook --connection=local "$pb" ) >>"$LOG" 2>&1 && return 0
+        rc=$?
+        log "target $1 attempt $attempt/3 failed (rc=$rc) — likely transient-under-load, backing off"
+        [ "$attempt" -lt 3 ] && sleep $(( attempt * 20 ))
+    done
+    return "$rc"
+}
+
+# ── single-flight ────────────────────────────────────────────────────────────
+exec 9>"$LOCK"
+flock -n 9 || { log "another run in progress — skipping"; exit 0; }
+
+cd "$REPO_DIR" || { log "repo dir $REPO_DIR missing"; run_ok=0; finish 1; }
+git fetch origin "$BRANCH" --tags --force >>"$LOG" 2>&1 || { log "git fetch failed"; run_ok=0; finish 0; }
+
+# Deploy target = the commit the NEWEST deploy tag points at — the CD is TAG-GATED
+# (mirrors the image-repo build split, 2026-07-13): a plain push to master
+# runs CI only and NEVER deploys; cutting a `{{ homelab_autodeploy_deploy_tag_glob }}`
+# tag is what authorises a deploy of that exact commit. "Newest" = most recently
+# created tag (for-each-ref creatordate). No deploy tag yet → nothing to deploy, so
+# CI-only pushes are silent here (not held, not applied). To ship: after CI is green,
+#   git tag -a deploy-vX.Y.Z -m "..." <sha> && git push origin deploy-vX.Y.Z
+DEPLOY_TAG="$(git for-each-ref --sort=-creatordate --format='%(refname:short)' 'refs/tags/{{ homelab_autodeploy_deploy_tag_glob }}' 2>/dev/null | head -1)"
+[ -n "$DEPLOY_TAG" ] || { log "no {{ homelab_autodeploy_deploy_tag_glob }} tag — nothing to deploy (CI-only push)"; finish 0; }
+ORIGIN="$(git rev-parse "${DEPLOY_TAG}^{commit}" 2>/dev/null)"
+# Plan/rollback baseline = the last SUCCESSFULLY deployed commit (controller state),
+# NOT the checkout HEAD. A failed run rolls the checkout back to an OLD commit, so
+# keying the plan off `git rev-parse HEAD` made every later run diff from that stale
+# point → the entire heavy stack replayed forever under load → new transient failure
+# → rollback → repeat (2026-07-01 brick loop). state.last_good_sha is authoritative;
+# fall back to HEAD only on the first-ever run (empty state).
+LAST_GOOD="$(python3 -c "import json; print(json.load(open('$STATE')).get('last_good_sha') or '')" 2>/dev/null)"
+[ -n "$LAST_GOOD" ] || LAST_GOOD="$(git rev-parse HEAD 2>/dev/null)"
+[ -n "$ORIGIN" ] || { log "cannot resolve deploy tag $DEPLOY_TAG"; run_ok=0; finish 0; }
+
+# ── deny-list drift watch (runs every cycle, independent of needs-deploy) ────
+# The "held" ntfy below fires once, when a new deploy tag first surfaces a
+# deny-listed target's changes, and never again for that commit — easy to miss
+# and self-clearing the moment the commit is adopted, even though the target's
+# files were never actually applied. That silently left the live
+# homelab-autodeploy controller a day behind repo HEAD on 2026-08-03 (see
+# defaults/main.yml). This emits a gauge per NEVER_AUTO target that stays lit
+# until a real `make <target>` moves the recorded baseline (written by that
+# target's own role tasks) past the target's most recent file change.
+# Untracked targets (no baseline recorded yet, e.g. `base`) emit no sample —
+# absent, not a false "not drifted" zero.
+if [ -d "$TEXTFILE_DIR" ] && [ -n "${NEVER_AUTO_ARR[*]-}" ]; then
+    _dtmp="$TEXTFILE_DIR/homelab_autodeploy_denylist.prom.$$"
+    {
+        echo "# HELP homelab_autodeploy_denylist_drift 1 if a deny-listed CD target's repo files changed since it was last manually deployed."
+        echo "# TYPE homelab_autodeploy_denylist_drift gauge"
+        for t in "${NEVER_AUTO_ARR[@]}"; do
+            marker="$(python3 -c "
+import json
+try:
+    print(json.load(open('$DENYLIST_STATE')).get('$t') or '')
+except Exception:
+    print('')
+" 2>/dev/null)"
+            [ -n "$marker" ] || continue
+            dchanged=(); while IFS= read -r _l; do [ -n "$_l" ] && dchanged+=("$_l"); done \
+                < <(git diff --name-only "$marker..$ORIGIN" 2>/dev/null)
+            drift=0
+            if [ -n "${dchanged[*]-}" ] && py plan "$ROLE_MAP" "$BASE_ROLES" "" "" "${dchanged[@]}" | grep -qx "$t"; then
+                drift=1
+            fi
+            echo "homelab_autodeploy_denylist_drift{target=\"$t\"} $drift"
+        done
+    } > "$_dtmp" 2>>"$LOG" && mv "$_dtmp" "$TEXTFILE_DIR/homelab_autodeploy_denylist.prom" || rm -f "$_dtmp"
+fi
+
+if ! py needs-deploy "$STATE" "$ORIGIN"; then
+    log "deploy tag $DEPLOY_TAG (${ORIGIN:0:8}) already handled — nothing to do"
+    finish 0
+fi
+progress "🔎 new deploy tag $DEPLOY_TAG (${ORIGIN:0:8}) — evaluating" low eyes
+
+# ── CI-green gate (optional; only if a token is configured) ──────────────────
+if [ -n "$CI_TOKEN" ]; then
+    CONCL="$(curl -fsS -m 15 -H "Authorization: Bearer $CI_TOKEN" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$CI_REPO/actions/runs?head_sha=$ORIGIN&per_page=1" 2>/dev/null \
+        | python3 -c 'import sys,json
+try: r=json.load(sys.stdin)["workflow_runs"]; print(r[0]["conclusion"] if r else "")
+except Exception: print("")' 2>/dev/null)"
+    if ! py ci-passed "$CONCL"; then
+        log "CI not green (conclusion=$CONCL) for $ORIGIN — holding"
+        notify "⏸️ ${ORIGIN:0:8} CI not green ($CONCL) — deploy held" default warning
+        finish 0
+    fi
+    progress "✅ CI green for ${ORIGIN:0:8}" low white_check_mark
+fi
+
+# Materialise Git-LFS binaries after EVERY checkout. `git reset --hard` restores
+# LFS-tracked files as 132-byte POINTER TEXT unless the smudge filter runs, and
+# nothing downstream notices: ansible's `copy:` happily ships the pointer, the
+# container serves it with HTTP 200, and the page renders with no background and
+# no logo. Found 2026-09-03 — homepage's background.jpg was 132 bytes on the Pi
+# where it is 4,248,526 bytes in the repo.
+#
+# The asymmetry that hid it: `make homepage` from the Mac resolves `src:` against
+# the OPERATOR's working tree (real bytes), while the CD runs --connection=local
+# and resolves it against THIS checkout (pointer). So it passes by hand and fails
+# only under the CD — the same invocation-delta class as the check-mode skips.
+# `|| true`: a missing git-lfs or an offline LFS endpoint must not abort a deploy
+# that is otherwise fine; the homepage role's own guard catches a bad asset.
+lfs_pull() {
+    command -v git-lfs >/dev/null 2>&1 || { log "git-lfs absent — LFS assets stay pointers"; return 0; }
+    git lfs pull >>"$LOG" 2>&1 || log "git lfs pull failed — LFS assets may be pointers"
+    return 0
+}
+
+# ── adopt the new commit + compute the deploy plan ───────────────────────────
+state_set on-attempt "$STATE" "$ORIGIN"
+git reset --hard "$ORIGIN" >>"$LOG" 2>&1
+lfs_pull
+progress "⬇️ checked out $DEPLOY_TAG → ${ORIGIN:0:8} (was ${LAST_GOOD:0:8})" low arrow_down
+
+# read into arrays with a portable while-read (bash 3.2+ — no `mapfile`, so the
+# CD drill can exercise this on a stock-bash macOS runner too, and the Pi's
+# bash-5 is unaffected).
+CHANGED=(); while IFS= read -r _l; do [ -n "$_l" ] && CHANGED+=("$_l"); done \
+    < <(git diff --name-only "$LAST_GOOD..$ORIGIN" 2>/dev/null)
+TARGETS=(); while IFS= read -r _l; do [ -n "$_l" ] && TARGETS+=("$_l"); done \
+    < <(py plan "$ROLE_MAP" "$BASE_ROLES" "$ALLOWLIST" "$NEVER_AUTO" "${CHANGED[@]}")
+# Roles that changed but the gate (allowlist) or the deny-list (never_auto, e.g.
+# base) withholds from auto-deploy — the operator must `make` them by hand.
+# Surfaced so a held role is NEVER mistaken for 'no changes' (silent-cron).
+SKIPPED=(); while IFS= read -r _l; do [ -n "$_l" ] && SKIPPED+=("$_l"); done \
+    < <(py plan-skipped "$ROLE_MAP" "$BASE_ROLES" "$ALLOWLIST" "$NEVER_AUTO" "${CHANGED[@]}")
+
+# Empty arrays use the ${arr[*]-} default form (trailing '-'): on the stock-bash
+# 3.2 the CD drill runs, a bare ${arr[*]} on an EMPTY array under `set -u` raises
+# "unbound variable" (a 3.2 bug fixed in 4.4); the '-' supplies an empty default
+# and suppresses it. (The array-length form is avoided in this .j2 because its
+# dollar-brace-hash opener collides with Jinja2's own comment tag.)
+if [ -z "${TARGETS[*]-}" ]; then
+    # No auto-deployable target. Either a docs/CI-only commit (nothing held) or
+    # every changed role is outside the pilot allowlist (held for manual). Both
+    # advance last_good (the commit is adopted; there is nothing for the CD to
+    # apply), but the held case is loud so it can't rot unnoticed.
+    if [ -n "${SKIPPED[*]-}" ]; then
+        log "held for manual deploy (outside pilot allowlist): ${SKIPPED[*]}"
+        state_set on-success "$STATE" "$ORIGIN" "$(date +%s)"
+        notify "⏸️ ${ORIGIN:0:8}: ${SKIPPED[*]} changed but outside CD pilot — deploy manually (make …)" default warning
+    else
+        log "no deployable ansible changes in ${LAST_GOOD:0:8}..${ORIGIN:0:8}"
+        state_set on-success "$STATE" "$ORIGIN" "$(date +%s)"
+        progress "ℹ️ ${ORIGIN:0:8}: no ansible changes to deploy (docs/CI only)" low information_source
+    fi
+    finish 0
+fi
+log "deploy plan: ${TARGETS[*]}"
+# Mixed commit: some targets auto-deploy, others are held — say so up front,
+# in the same push (it used to be a second message).
+HELD_NOTE=""
+[ -n "${SKIPPED[*]-}" ] && HELD_NOTE=" | ⏸️ held for manual deploy: ${SKIPPED[*]}"
+notify "🚀 deploying ${ORIGIN:0:8} → targets: ${TARGETS[*]}${HELD_NOTE}" default rocket
+
+# ── deploy each target in order; bail on first failure ───────────────────────
+FAILED=""
+for t in "${TARGETS[@]}"; do
+    progress "⚙️ deploying: $t" low gear
+    if deploy_target "$t"; then
+        progress "✅ $t deployed" low white_check_mark
+    else
+        FAILED="$t"; log "deploy FAILED at target $t"
+        notify "❌ $t FAILED — rolling back" high x
+        break
+    fi
+done
+
+if [ -z "$FAILED" ]; then
+    state_set on-success "$STATE" "$ORIGIN" "$(date +%s)"
+    log "DEPLOY OK → ${ORIGIN:0:8} (${TARGETS[*]})"
+    notify "🎉 homelab deployed ${ORIGIN:0:8} — ${TARGETS[*]} (all green)" default tada
+    finish 0
+fi
+
+# ── rollback: reset to last-good + re-deploy the ATTEMPTED targets ───────────
+run_ok=0
+git reset --hard "$LAST_GOOD" >>"$LOG" 2>&1
+lfs_pull
+notify "↩️ reset to last-good ${LAST_GOOD:0:8} — restoring" high leftwards_arrow_with_hook
+# Restore = every ATTEMPTED target (the ones that succeeded PLUS the one that
+# failed). The failed target ran partial tasks before dying, so `git reset`
+# restores its FILES but not its already-applied runtime — it MUST be
+# re-deployed at last-good to reconverge. Targets after the failure were never
+# reached and stay at last-good. Slice decision lives in the tested module
+# (rollback_targets) — skipping the failed one would silently leave it
+# half-migrated (design 040 R4).
+RESTORE=(); while IFS= read -r _l; do [ -n "$_l" ] && RESTORE+=("$_l"); done \
+    < <(py rollback-targets "$FAILED" "${TARGETS[@]}")
+RB_FAIL=""
+for t in "${RESTORE[@]}"; do
+    notify "⚙️ restoring: $t" low gear
+    deploy_target "$t" || RB_FAIL="$t"
+done
+state_set on-fail "$STATE" "$ORIGIN" "$(date +%s)"
+if [ -z "$RB_FAIL" ]; then
+    notify "↩️ rolled back to ${LAST_GOOD:0:8} (restored). Commit ${ORIGIN:0:8} held — fix + re-push." high warning
+    log "ROLLBACK OK → ${LAST_GOOD:0:8}"
+else
+    notify "🚨 ROLLBACK INCOMPLETE — $RB_FAIL failed to restore. MANUAL FIX NEEDED." max rotating_light
+    log "ROLLBACK FAILED at $RB_FAIL"
+fi
+finish 1

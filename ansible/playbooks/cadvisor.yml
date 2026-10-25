@@ -1,0 +1,6 @@
+---
+- name: Deploy Google cAdvisor (per-container metrics)
+  hosts: pi
+  become: true
+  roles:
+    - cadvisor

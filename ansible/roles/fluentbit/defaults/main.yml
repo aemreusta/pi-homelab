@@ -1,0 +1,78 @@
+---
+# Fluent Bit — log collector that tails Docker container json logs and ships
+# them to VictoriaLogs over the /insert/jsonline endpoint.
+# Phase 2 fallback after vlagent's missing file-input source ruled it out.
+# https://docs.fluentbit.io/
+
+fluentbit_compose_dir: /home/{{ docker_user }}/docker/observability/fluentbit
+fluentbit_data_dir: /home/{{ docker_user }}/docker/observability/fluentbit/data
+fluentbit_config_dir: /home/{{ docker_user }}/docker/observability/fluentbit/config
+fluentbit_tz: "{{ timezone }}"
+
+fluentbit_image: fluent/fluent-bit:latest
+
+# vlagent-style host network (DOCKER-USER blocks bridge→host so we go direct)
+fluentbit_mem_limit: 128M
+
+# --- Container security hardening ---
+fluentbit_pids_limit: 50
+fluentbit_cap_drop:
+  - ALL
+# DAC_OVERRIDE is load-bearing: the fluent/fluent-bit image is distroless and runs
+# as root (no PUID support), and it must (a) read root-owned Docker json logs under
+# /srv/docker/containers AND (b) write its SQLite tail DB into the 1000:1000-owned
+# data dir. Dropping ALL caps strips root's default DAC_OVERRIDE, so SQLite can no
+# longer create its WAL/journal in that dir → "attempt to write a readonly database"
+# crash loop. Re-adding only this one cap restores the write path while still
+# dropping NET_RAW/SETUID/MKNOD/SYS_CHROOT/etc. Verified 2026-06-07.
+fluentbit_cap_add:
+  - DAC_OVERRIDE
+
+# Fluent Bit tail input config
+# NOTE: this Pi's docker daemon root is /srv/docker (custom, see daemon.json),
+# not the /var/lib/docker default. Mount + tail must point at /srv/docker.
+fluentbit_docker_root: /srv/docker
+fluentbit_tail_path: /srv/docker/containers/*/*-json.log
+fluentbit_db_path: /data/tail.db
+fluentbit_mem_buf_limit: 64MB
+
+# VictoriaLogs ingestion endpoint (Fluent Bit reaches it on host loopback).
+fluentbit_vl_host: 127.0.0.1
+fluentbit_vl_port: 9428
+# stream_fields decide which labels build the VL log stream identity.
+# host + container_name + container_id keeps each container as its own
+# stream while making `_stream:{container_name="sonarr"}` queries hit the
+# stream index (fast). container_id stays for stability across renames.
+# Sprint 18b: container_name added so container-error-rate LogsQL rules
+# can resolve. Pre-18b streams keyed only on container_id age out via 30d
+# retention.
+fluentbit_stream_fields: "host,container_name,container_id"
+fluentbit_msg_field: log
+fluentbit_time_field: time
+
+# Static labels added to every record via record_modifier.
+fluentbit_labels:
+  host: homelab
+
+# Known-benign upstream log patterns dropped before VictoriaLogs ingest.
+# Match docker.* tag → emitted as `Exclude log /<pattern>/` in fluent-bit.conf.j2.
+# Per-entry rationale + verification + audit cadence: docs/runbooks/020-known-log-noise.md
+fluentbit_docker_exclude_patterns:
+  - "error encoding and sending metric family.*write: (broken pipe|connection reset by peer)"
+  - "AddMovieCollectionService.*was not found"
+
+  - "failed to collect filesystem stats.*no such file or directory"
+  - "Couldn't fetch app version status"
+  - "Failed to retrieve GitHub releases"
+  - "AcceptableSizeSpecification.*has no runtime information"
+
+# ── Pipeline events (structured JSON) — second [INPUT] tail ────────────────
+# Media pipeline scripts (import hooks, qbit-cleanup, tdarr-watcher, dedup)
+# append JSON lines to this host file. Same file is visible inside the media
+# containers at /data/logs/pipeline-events.log via the /srv:/data bind.
+# Stream fields are bounded (pipeline,step enums) — keeps VL cardinality low.
+fluentbit_pipeline_log_path: /srv/logs/pipeline-events.log
+fluentbit_pipeline_db_path: /data/pipeline-tail.db
+fluentbit_pipeline_buffer_dir: /data/pipeline-buffer
+fluentbit_pipeline_stream_fields: "host,pipeline,step"
+fluentbit_pipeline_time_field: ts

@@ -1,0 +1,7 @@
+# 2026-09-28 — shared Drive quota interrupted restore reads
+
+- **What happened:** Three tiny restore reads failed around 00:23–00:25 TRT while the full backup continued uploading. At 02:01–02:02 a 427-byte read failed once, then returned valid JSON with matching local SHA-256 using the unchanged client. Full backup completion remains unverified.
+- **Why:** The earlier bounded diagnostic returned Google's `RATE_LIMIT_EXCEEDED` for rclone's shared OAuth project, reporting `defaultPerMinutePerProject=840000`. This establishes that sample's quota failure; it does not establish the cause of the earlier rc=7 backup failure or every later unsuccessful read.
+- **Class:** Shared-provider quota makes read/restore reliability intermittent even while write progress is nonzero; migration to a private client also encounters new provider publishing requirements.
+- **Occurrence:** First explicitly diagnosed shared-project quota incident in this repository. Setup/diagnosis spanned more than 30 minutes; service availability alone would have missed the restore failure.
+- **Structural fix:** Retain separate upload, terminal-success and bounded restore evidence. A private Desktop client is created but undeployed. Honor the operator's no-extra-charge and no-public-website constraints; preserve the current configuration and rollback data instead of silently deploying a seven-day Testing token. See [runbook 049](../runbooks/049-gdrive-own-client-id.md).

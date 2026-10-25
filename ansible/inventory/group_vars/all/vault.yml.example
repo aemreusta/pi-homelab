@@ -1,0 +1,176 @@
+---
+# Copy to vault.yml and fill in real values:
+#   cp vault.yml.example vault.yml
+#
+# Then encrypt:
+#   ansible-vault encrypt inventory/group_vars/vault.yml
+#
+# To edit later:
+#   ansible-vault edit inventory/group_vars/vault.yml
+
+vault_qbittorrent_username: "admin"
+vault_qbittorrent_password: "CHANGE_ME"
+
+# NextDNS
+vault_nextdns_api_key: "CHANGE_ME"
+
+# Homelab Control API
+vault_homelab_control_token: "CHANGE_ME"
+
+# Media service API keys (get from each service's web UI → Settings → API Key)
+vault_jellyfin_api_key: "CHANGE_ME"
+vault_jellyfin_username: "pi"
+vault_jellyfin_password: "CHANGE_ME"
+vault_sonarr_api_key: "CHANGE_ME"
+vault_radarr_api_key: "CHANGE_ME"
+vault_prowlarr_api_key: "CHANGE_ME"
+vault_jellyseerr_api_key: "CHANGE_ME"
+
+# Tailscale
+vault_tailscale_auth_key: "CHANGE_ME"
+vault_tailscale_fqdn: "CHANGE_ME"
+
+# Portainer (initial admin password — only used on first run)
+vault_portainer_password: "CHANGE_ME"
+
+# Jellyseerr (initial admin account)
+vault_jellyseerr_email: "admin@raspberrypi.local"
+vault_jellyseerr_password: "CHANGE_ME"
+
+# Beszel monitoring
+vault_beszel_email: "admin@raspberrypi.local"
+vault_beszel_password: "CHANGE_ME"
+# Agent key: copy from Beszel hub UI after first login (Settings → Agent Key)
+vault_beszel_agent_key: ""
+
+# Grafana (admin user — username defined in role defaults as `pi`)
+vault_grafana_admin_password: "CHANGE_ME"
+
+# Uptime Kuma — initial admin (UI-bootstrap on first run; vault kept for docs/automation)
+vault_uptime_kuma_username: "admin"
+vault_uptime_kuma_password: "CHANGE_ME"
+# Uptime Kuma Prometheus metrics endpoint key (Settings → API Keys)
+vault_uptime_kuma_metrics_key: "CHANGE_ME"
+
+# Zot local OCI registry (PRD 013) — htpasswd login, also used as the
+# ZOT_USERNAME/ZOT_PASSWORD GitHub Actions secrets for the fork→Zot build.
+vault_zot_username: "homelab"
+vault_zot_password: "CHANGE_ME"
+
+# Speedtest Tracker
+# APP_KEY: generate with:
+#   docker run --rm lscr.io/linuxserver/speedtest-tracker:latest \
+#     php artisan key:generate --show
+vault_speedtest_app_key: "CHANGE_ME"
+vault_speedtest_admin_email: "admin@raspberrypi.local"
+vault_speedtest_admin_password: "CHANGE_ME"
+
+# MinIO — S3 object storage root (admin) credentials. Password must be >= 8 chars
+# (the role asserts this). Generate strong values, e.g.:
+#   openssl rand -hex 24
+vault_minio_root_user: "minioadmin"
+vault_minio_root_password: "CHANGE_ME"
+
+# Label Studio CE — bootstrap admin (username MUST be an email; password >= 8
+# chars) + a fixed API token for the Faz-2 STT prediction-import script. The
+# role asserts all three are non-empty. Generate, e.g.:
+#   openssl rand -hex 24   (password)   openssl rand -hex 20   (token)
+vault_label_studio_username: "admin@raspberrypi.local"
+vault_label_studio_password: "CHANGE_ME"
+vault_label_studio_user_token: "CHANGE_ME"
+
+# --- PostgreSQL — shared ML backend (PRD-004, Faz-1) ---
+# Superuser password (>= 12 chars, role asserts this). Never used by ML services
+# directly — each service gets its own unprivileged user below.
+# Generate: openssl rand -hex 16
+vault_postgres_password: "CHANGE_ME"
+
+# Per-service database user passwords (>= 8 chars). Add langfuse/prefect entries
+# here when those services are deployed.
+#   postgresql_databases entry: { name: mlflow, user: mlflow, password: vault_mlflow_db_password }
+vault_mlflow_db_password: "CHANGE_ME"
+# Label Studio, migrated off SQLite onto Postgres (2026-07-07).
+vault_label_studio_db_password: "CHANGE_ME"
+
+# --- MLflow scoped MinIO credentials (PRD-004, Faz-2) ---
+# A MinIO service account limited to the mlflow-artifacts bucket (NOT root) so
+# MLflow's artifact proxy can never reach the `datasets` bucket. The mlflow
+# role provisions the matching MinIO user + policy. Secret >= 8 chars.
+# Generate the secret: openssl rand -hex 20
+vault_minio_mlflow_access_key: "mlflow"
+vault_minio_mlflow_secret_key: "CHANGE_ME"
+
+# --- Third-party / external API keys (ML & LLM stack) ---
+# Canonical home for cloud-provider keys consumed by the ML pipeline and any
+# future LLM gateway. Stored here (AES256) like every other secret — NO separate
+# password manager, NO Authelia involved; these are deploy-time secrets Ansible
+# injects, exactly like the *arr API keys above. Reference them in roles/scripts
+# as `{{ vault_<name> | default('') }}` so an empty slot is a safe no-op until a
+# real key is pasted in. Leave "" until you have the key.
+#
+#   LLM provider keys — for the planned unified LLM gateway (Bifrost, docs
+#   000-TODO §"LLM gateway") and any Claude/OpenAI consumer (PRD-004 §LLM obs).
+vault_anthropic_api_key: ""
+vault_openai_api_key: ""
+
+# External dead-man's-switch — healthchecks.io ping URL (composite-liveness beat).
+# Empty = the heartbeat script no-ops. Paste your check URL to activate.
+vault_healthchecks_ping_url: ""
+
+# Internal CA for *.example trusted HTTPS (traefik role; docs/design/033-internal-ca-https.md).
+# CROWN-JEWEL: this private key signs every *.example cert. Anyone with it can
+# impersonate all homelab services to any device that trusts the root. Keep it
+# vaulted (AES256) and never commit the plaintext.
+#
+# Leave BOTH empty for first run — the traefik role generates the CA on the Pi.
+# Afterwards, copy the generated files into vault so an SSD rebuild reuses the
+# SAME CA (no device re-trust). On the Pi:
+#   sudo cat /home/pi/docker/network/traefik/certs/homelab-ca.key
+#   sudo cat /home/pi/docker/network/traefik/certs/homelab-ca.crt
+# Paste with a YAML block scalar (| then indented PEM).
+vault_traefik_internal_ca_key: ""
+vault_traefik_internal_ca_cert: ""
+
+# GitOps CD CI-green gate (homelab_autodeploy). Fine-grained GitHub PAT with
+# Actions: Read on aemreusta/raspi-homelab (the "homelab-ci-runner" PAT). The
+# Pi controller queries the commit's CI conclusion and refuses to deploy until
+# it is "success". Leave empty to run the CD without a CI gate.
+vault_homelab_autodeploy_ci_token: "CHANGE_ME_github_pat_actions_read"
+
+
+# ── Authelia (SSO / OIDC provider) — SSO Phase 1 (research 036) ──────────────
+# Storage/session/OIDC secrets: generate with `openssl rand -hex 32` (or the
+# helper that seeded these). Client secrets are stored as BOTH the plaintext
+# (consumed by the OIDC client: Grafana/Portainer/MinIO) AND the Authelia-side
+# pbkdf2 hash (in the Authelia OIDC client config). The admin login hash is
+# argon2id (generate: `authelia crypto hash generate argon2 --password ...`).
+vault_authelia_db_password: "CHANGE_ME_hex"
+vault_authelia_jwt_secret: "CHANGE_ME_hex"
+vault_authelia_session_secret: "CHANGE_ME_hex"
+vault_authelia_storage_encryption_key: "CHANGE_ME_hex_min20chars"
+vault_authelia_oidc_hmac_secret: "CHANGE_ME_hex"
+vault_authelia_grafana_client_secret: "CHANGE_ME_hex"
+vault_authelia_grafana_client_secret_hash: "$pbkdf2-sha512$CHANGE_ME"
+vault_authelia_portainer_client_secret: "CHANGE_ME_hex"
+vault_authelia_portainer_client_secret_hash: "$pbkdf2-sha512$CHANGE_ME"
+vault_authelia_minio_client_secret: "CHANGE_ME_hex"
+vault_authelia_minio_client_secret_hash: "$pbkdf2-sha512$CHANGE_ME"
+vault_authelia_admin_password_hash: "$argon2id$CHANGE_ME"
+# RS256 OIDC issuer key. Generate a PEM PKCS8 RSA-2048 key and paste the full
+# BEGIN/END PRIVATE KEY block as a literal YAML block scalar:
+#   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048
+vault_authelia_oidc_issuer_private_key: "CHANGE_ME_rsa_2048_pkcs8_pem_block"
+
+# --- Google Drive off-site backup (design 043) ---
+# Mint on a machine with a browser (the Pi is headless and modern rclone has no
+# paste-a-code flow):
+#     brew install rclone && rclone authorize "drive"
+# Paste the whole JSON blob it prints, single-quoted.
+vault_rclone_gdrive_token: '{"access_token":"...","refresh_token":"...","expiry":"..."}'
+
+# OPTIONAL: your own Google Cloud OAuth client. rclone's shared default client
+# ID is heavily rate-limited and shared with every other rclone user; a private
+# one is faster and immune to other people's quota. Leave both empty to use the
+# default.
+vault_rclone_gdrive_client_id: ""
+vault_rclone_gdrive_client_secret: ""

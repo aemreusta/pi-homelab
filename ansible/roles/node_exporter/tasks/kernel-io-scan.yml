@@ -1,0 +1,50 @@
+---
+# Kernel storage-fault scanner. Emits homelab_kernel_io_events gauges so the
+# USB/UAS precursor window is observable before ext4 remounts read-only.
+# Incident: docs/incidents/2026-08-01-usb-ssd-root-dropout-readonly.md
+
+- name: Deploy kernel storage-fault classifier module
+  ansible.builtin.copy:
+    src: kernel_io_scan.py
+    dest: "{{ node_exporter_scan_script_dir }}/kernel_io_scan.py"
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+  when: node_exporter_kernel_io_scan_enabled | bool
+
+- name: Deploy kernel storage-fault scan wrapper
+  ansible.builtin.template:
+    src: kernel-io-scan.sh.j2
+    dest: "{{ node_exporter_scan_script_dir }}/kernel-io-scan.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+  when: node_exporter_kernel_io_scan_enabled | bool
+
+# Runs as root: `journalctl -k` needs root or systemd-journal group, and the
+# textfile dir is docker_user-owned but root-writable.
+- name: Schedule kernel storage-fault scan
+  ansible.builtin.cron:
+    name: kernel-io-scan
+    user: root
+    minute: "{{ node_exporter_kernel_io_scan_cron_minute }}"
+    job: "{{ node_exporter_scan_script_dir }}/kernel-io-scan.sh"
+    cron_file: homelab-kernel-io-scan
+    state: "{{ 'present' if node_exporter_kernel_io_scan_enabled | bool else 'absent' }}"
+  become: true
+
+# Seed the .prom immediately so the series exists before the first cron tick
+# — otherwise the alert rules have no series to evaluate for up to 5 minutes
+# after deploy, and KernelIOScanStale would fire spuriously.
+# check_mode-safe: skipped under --check (the CD's deep-check phase) because
+# it executes a live command. See CLAUDE.md check-mode uri/command-skip class.
+- name: Prime kernel storage-fault metrics
+  ansible.builtin.command:
+    cmd: "{{ node_exporter_scan_script_dir }}/kernel-io-scan.sh"
+  become: true
+  changed_when: false
+  when:
+    - node_exporter_kernel_io_scan_enabled | bool
+    - not ansible_check_mode

@@ -1,0 +1,54 @@
+---
+- name: Check Tailscale status # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: tailscale status --json
+  register: tailscale_status
+  changed_when: false
+  failed_when: false
+  # Read-only probe — must run under --check too. `command` is skipped in
+  # check mode by default, and the set_fact below dereferences .rc/.stdout
+  # unconditionally, so without this the play dies during the CD's
+  # --check --diff phase and rolls the whole tag back. Same class that broke
+  # tailscale-dns on 2026-09-03 (ops-discipline §6). `tailscale status
+  # --json` mutates nothing.
+  check_mode: false
+
+- name: Set Tailscale connection state
+  ansible.builtin.set_fact:
+    tailscale_needs_auth: >-
+      {{ tailscale_status.rc != 0 or
+         (tailscale_status.stdout | from_json).BackendState != "Running" }}
+
+- name: Authenticate and configure Tailscale # noqa: command-instead-of-module no-changed-when
+  ansible.builtin.command:
+    cmd: >-
+      tailscale up
+      --authkey={{ tailscale_auth_key }}
+      --hostname={{ tailscale_hostname }}
+      --advertise-routes={{ tailscale_advertise_routes }}
+      --accept-routes
+      {% if tailscale_accept_dns %}--accept-dns{% endif %}
+      {% if tailscale_exit_node %}--advertise-exit-node{% endif %}
+  when: tailscale_needs_auth | bool
+  # The auth key is a credential and `command:` echoes the full argv on failure.
+  # Without this, a failed re-auth prints
+  #   "cmd": ["tailscale", "up", "--authkey=tskey-auth-...", ...]
+  # into the play output — and therefore into CI logs and any pasted terminal
+  # transcript. Observed for real on 2026-09-09 when the stored key had been
+  # revoked upstream ("backend error: invalid key: API key does not exist").
+  #
+  # Cost, stated plainly because this repo has been bitten by it before (the
+  # Prowlarr indexer task): no_log makes the failure OPAQUE. To diagnose, run the
+  # command by hand on the Pi, where seeing the key is fine:
+  #   sudo tailscale up --authkey='<key from vault>' --hostname=homelab \
+  #     --advertise-routes=192.0.2.0/24 --accept-routes --accept-dns
+  # An expired or deleted key cannot be repaired from here — mint a new one in
+  # the Tailscale admin console and update vault_tailscale_auth_key.
+  no_log: true
+
+- name: Enable IPv6 forwarding for subnet router
+  ansible.posix.sysctl:
+    name: net.ipv6.conf.all.forwarding
+    value: "1"
+    sysctl_set: true
+    reload: true

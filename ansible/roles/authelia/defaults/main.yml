@@ -1,0 +1,111 @@
+---
+# Authelia — self-hosted SSO / OIDC provider + forward-auth (SSO, research 036).
+# Phase 1: OIDC provider for Grafana/Portainer/MinIO. First live use (2026-07-14
+# operator directive): forward-auth gate on the media-tool UIs (*arr apps, filebrowser).
+#
+# Topology: Authelia binds LOOPBACK only (127.0.0.1:9091); host-networked Traefik
+# reaches it over loopback and the forward-auth middleware calls its authz
+# endpoint. It joins mlstack_net to reach Postgres (its storage backend) by
+# container name. The user identity is a file (users_database.yml); Postgres is
+# the storage backend (sessions / OIDC tokens), NOT a user directory.
+
+authelia_compose_dir: /home/{{ docker_user }}/docker/core/authelia
+authelia_config_dir: /home/{{ docker_user }}/docker/core/authelia/config
+authelia_tz: "{{ timezone }}"
+
+# Pinned (matches the version whose `authelia crypto` produced the vault hashes).
+authelia_image: "authelia/authelia:4.39.20"
+
+# Loopback-published host port → container 9091. NOT LAN-exposed: all access is
+# via Traefik (auth.<domain>) / the forward-auth middleware. No ufw rule needed.
+authelia_port: 9091
+
+authelia_puid: 1000
+authelia_pgid: 1000
+
+authelia_mem_limit: 192M
+authelia_pids_limit: 200
+authelia_log_level: info
+
+# Prometheus metrics, loopback-published and scraped by the `authelia` vmagent
+# job → feeds the AutheliaDown alert. Authelia is load-bearing: if it dies, every
+# forward-auth'd service 502s at the gate, so its liveness MUST
+# be observable rather than silently failing (repo observability rule).
+authelia_metrics_port: 9959
+
+# Internal domains (cookie parents + portal URL). First = primary (example.org).
+authelia_domains: "{{ homelab_internal_domains }}"
+authelia_default_redirect_service: homepage
+
+# ── Postgres storage backend (reached over mlstack_net by container name) ──
+authelia_db_host: postgresql
+authelia_db_port: 5432
+authelia_db_name: authelia
+authelia_db_user: authelia
+authelia_db_password: "{{ vault_authelia_db_password | default('') }}"
+
+# ── Secrets (vault) ──
+authelia_jwt_secret: "{{ vault_authelia_jwt_secret | default('') }}"
+authelia_session_secret: "{{ vault_authelia_session_secret | default('') }}"
+authelia_storage_encryption_key: "{{ vault_authelia_storage_encryption_key | default('') }}"
+authelia_oidc_hmac_secret: "{{ vault_authelia_oidc_hmac_secret | default('') }}"
+authelia_oidc_issuer_private_key: "{{ vault_authelia_oidc_issuer_private_key | default('') }}"
+
+# ── Admin login (the single SSO identity) ──
+authelia_admin_user: pi
+authelia_admin_display_name: Operator
+authelia_admin_email: "admin@{{ homelab_internal_domains[0] }}"
+authelia_admin_password_hash: "{{ vault_authelia_admin_password_hash | default('') }}"
+
+# ── Forward-auth: service UIs to gate (bare service names; each gets a
+# one_factor access_control rule for every internal domain, and the Traefik
+# role attaches the `authelia` forwardAuth middleware to their routers). ──
+# MUST stay in lockstep with every `auth: true` entry in `traefik_services`
+# (roles/traefik/defaults/main.yml). The two lists are separate halves of one
+# decision and they desynced once already: filebrowser was flagged `auth: true`
+# on 2026-08-02 but never added here, so no access_control rule matched its
+# domain, `default_policy: deny` took over, and it returned 403 to *authenticated*
+# users — a full outage wearing the costume of a security control. A missing
+# entry here fails closed and looks like a permissions bug, which is why it cost
+# days to spot. Guarded by tests/test_authelia_traefik_sync.py.
+authelia_forward_auth_services:
+  - filebrowser
+  - sonarr
+  - radarr
+  - prowlarr
+
+# ── OIDC provider clients ────────────────────────────────────────────────────
+# Empty disables the whole identity_providers.oidc block. Each client's secret is
+# stored TWICE in vault: the plaintext (consumed by the client app) and the
+# pbkdf2-sha512 hash (below, consumed by Authelia). redirect_uris MUST match what
+# the client actually sends — it is derived from the client's own root/base URL.
+# The back-channel (code→token) runs client→https://auth.<domain> through Traefik
+# under the self-signed internal CA, so each client must either trust that CA or
+# skip verification (see each role's env).
+authelia_oidc_clients:
+  - id: grafana
+    name: Grafana
+    secret_hash: "{{ vault_authelia_grafana_client_secret_hash | default('') }}"
+    redirect_uris:
+      - "https://grafana.{{ authelia_domains[0] }}/login/generic_oauth"
+  - id: portainer
+    name: Portainer
+    secret_hash: "{{ vault_authelia_portainer_client_secret_hash | default('') }}"
+    redirect_uris:
+      - "https://portainer.{{ authelia_domains[0] }}"
+  - id: minio
+    name: MinIO
+    secret_hash: "{{ vault_authelia_minio_client_secret_hash | default('') }}"
+    redirect_uris:
+      - "https://minio.{{ authelia_domains[0] }}/oauth_callback"
+
+authelia_cap_drop:
+  - ALL
+
+authelia_oci_labels:
+  org.opencontainers.image.title: authelia
+  org.opencontainers.image.description: "Authelia — SSO / OIDC provider + forward-auth"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/authelia/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://www.authelia.com"

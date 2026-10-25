@@ -1,0 +1,81 @@
+#!/bin/bash
+# Synthetic HTTP probe for the homepage dashboard + its backing service
+# endpoints. Measures server-side response time + reachability and emits them
+# to the node_exporter textfile collector:
+#   homepage_probe_duration_seconds{target="..."}  — HTTP response time (s)
+#   homepage_probe_up{target="..."}                — 1 if it answered, else 0
+#   homepage_probe_http_code{target="..."}         — last status code (0 = none)
+#   homepage_probe_last_run_timestamp_seconds      — liveness (silent-cron rule)
+#
+# Scraped by vmagent (node_exporter job) -> VictoriaMetrics -> Grafana
+# ("Homepage / Service Probe") and watched by vmalert (homepage-probe.yml).
+# NOTE: this is server-side response time, NOT the in-browser render time.
+# Managed by Ansible (homepage role) — do not edit manually.
+
+set -uo pipefail
+
+HOST="{{ homepage_probe_host }}"
+TIMEOUT="{{ homepage_probe_timeout }}"
+TEXTFILE_DIR="{{ homepage_probe_textfile_dir }}"
+OUT="$TEXTFILE_DIR/homepage_probe.prom"
+
+# "name port" per target (templated from homepage_probe_targets)
+TARGETS=(
+{% for t in homepage_probe_targets %}
+  "{{ t.name }} {{ t.port }}"
+{% endfor %}
+)
+
+[ -d "$TEXTFILE_DIR" ] || mkdir -p "$TEXTFILE_DIR" 2>/dev/null || exit 0
+
+# Self-heal orphaned temp files. The EXIT trap below cannot fire on SIGKILL or
+# an untrapped SIGTERM, so a run killed mid-flight (reboot/deploy while curl is
+# blocked) leaves a "${OUT}.XXXXXX" behind. A live temp lives <1s; anything
+# older than an hour is definitively orphaned. Runs every {{ homepage_probe_schedule_minute }} min,
+# so stale temps are reaped within the next cycle. (2026-07-03: 48 accumulated.)
+find "$TEXTFILE_DIR" -maxdepth 1 -name 'homepage_probe.prom.*' -mmin +60 -delete 2>/dev/null || true
+
+TMP="$(mktemp "${OUT}.XXXXXX")" || exit 0
+trap 'rm -f "$TMP"' EXIT
+
+{
+  echo "# HELP homepage_probe_duration_seconds HTTP response time of a probed target."
+  echo "# TYPE homepage_probe_duration_seconds gauge"
+  echo "# HELP homepage_probe_up 1 if the target answered (any HTTP code), 0 if no response."
+  echo "# TYPE homepage_probe_up gauge"
+  echo "# HELP homepage_probe_http_code Last HTTP status code (0 = no response)."
+  echo "# TYPE homepage_probe_http_code gauge"
+
+  for entry in "${TARGETS[@]}"; do
+    name="${entry%% *}"
+    port="${entry##* }"
+    # curl writes -w output even on failure. Appending an `echo` fallback
+    # corrupts duration into "5.000000000 0", which node_exporter rejects as
+    # a client timestamp and drops the ENTIRE file. Capture status separately.
+    curl_status=0
+    response=$(curl -s -o /dev/null -m "$TIMEOUT" \
+      -w '%{http_code} %{time_total}' "http://${HOST}:${port}/" 2>/dev/null) || curl_status=$?
+    read -r code dur <<< "$response"
+    code="${code:-000}"
+    dur="${dur:-0}"
+    [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+    [[ "$dur" =~ ^[0-9]+([.][0-9]+)?$ ]] || dur=0
+    # Even HTTP headers received before a body timeout are not a completed
+    # probe. Keep the elapsed duration, but report the endpoint down.
+    [ "$curl_status" -eq 0 ] || code=000
+    up=1
+    [ "$code" = "000" ] && up=0
+    printf 'homepage_probe_duration_seconds{target="%s"} %s\n' "$name" "$dur"
+    printf 'homepage_probe_up{target="%s"} %s\n' "$name" "$up"
+    printf 'homepage_probe_http_code{target="%s"} %s\n' "$name" "$code"
+  done
+
+  echo "# HELP homepage_probe_last_run_timestamp_seconds Unix time the probe last completed."
+  echo "# TYPE homepage_probe_last_run_timestamp_seconds gauge"
+  printf 'homepage_probe_last_run_timestamp_seconds %s\n' "$(date +%s)"
+} > "$TMP"
+
+# Atomic publish so node_exporter never reads a half-written file.
+mv -f "$TMP" "$OUT"
+trap - EXIT
+chmod 0644 "$OUT" 2>/dev/null || true

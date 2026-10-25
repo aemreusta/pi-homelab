@@ -1,0 +1,58 @@
+---
+# Homepage — application dashboard
+# https://gethomepage.dev
+
+services:
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    container_name: homepage
+    restart: unless-stopped
+    # tini as PID 1 reaps the image's wget healthcheck children, which
+    # otherwise reparent to `next-server` (a Node process that never
+    # wait()s) and accumulate as <defunct> entries — 4 observed after
+    # 3.5d uptime, drifting up over weeks. Same pattern/fix as jellyseerr
+    # (Sprint 016 Story 2b) and byparr (commit 218e0f2).
+    init: true
+    mem_limit: {{ homepage_mem_limit }}
+    pids_limit: {{ homepage_pids_limit }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in homepage_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+{% if homepage_cap_add | length > 0 %}
+    cap_add:
+{% for cap in homepage_cap_add %}
+      - {{ cap }}
+{% endfor %}
+{% endif %}
+    user: "1000:1000"
+    # Supplementary group so the non-root user can read /var/run/docker.sock.
+    # docker.sock is mounted read-only; Homepage only queries container status.
+    group_add:
+      - "{{ homepage_docker_gid }}"
+    environment:
+      - TZ={{ homepage_tz }}
+      # Homepage validates the Host header against this allowlist. One
+      # homepage.<domain>[:3001] pair per internal domain (homelab + example.org)
+      # so the dashboard works on either name; + the LAN IP:port for direct access.
+      - HOMEPAGE_ALLOWED_HOSTS={{ (homelab_internal_domains | default(['homelab']) | map('regex_replace', '^', 'homepage.') | list) | join(',') }},{{ (homelab_internal_domains | default(['homelab']) | map('regex_replace', '^', 'homepage.') | map('regex_replace', '$', ':3001') | list) | join(',') }},{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}:3001
+    ports:
+      - "3001:3000"
+    volumes:
+      - {{ homepage_config_dir }}:/app/config
+      - {{ homepage_config_dir }}/images:/app/public/images
+      - {{ homepage_config_dir }}/custom.js:/app/public/custom.js:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - homepage_net
+
+networks:
+  homepage_net:
+    driver: bridge

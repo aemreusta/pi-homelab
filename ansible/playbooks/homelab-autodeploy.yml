@@ -1,0 +1,6 @@
+---
+- name: Deploy homelab_autodeploy (Pi-side GitOps CD controller)
+  hosts: pi
+  become: true
+  roles:
+    - homelab_autodeploy

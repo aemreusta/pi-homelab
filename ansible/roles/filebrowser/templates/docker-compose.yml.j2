@@ -1,0 +1,48 @@
+---
+# FileBrowser — web-based file manager
+# https://filebrowser.org
+
+services:
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    container_name: filebrowser
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ filebrowser_mem_limit }}
+    pids_limit: {{ filebrowser_pids_limit }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in filebrowser_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+{% if filebrowser_cap_add | length > 0 %}
+    cap_add:
+{% for cap in filebrowser_cap_add %}
+      - {{ cap }}
+{% endfor %}
+{% endif %}
+    user: "{{ filebrowser_puid | default('1000') }}:{{ filebrowser_pgid | default('1000') }}"
+    environment:
+      - TZ={{ filebrowser_tz }}
+    # Loopback only — Traefik (host network) reaches it at 127.0.0.1:8082.
+    # Auth is Authelia forward-auth + filebrowser's own noauth (see settings.json.j2
+    # and the config-set task in deploy.yml); binding 0.0.0.0 would let anyone on the
+    # LAN reach a noauth file server serving the whole /srv tree directly, bypassing
+    # both gates.
+    ports:
+      - "127.0.0.1:8082:80"
+    volumes:
+      - {{ filebrowser_root }}:/srv
+      - {{ filebrowser_config_dir }}:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - filebrowser_net
+
+networks:
+  filebrowser_net:
+    driver: bridge

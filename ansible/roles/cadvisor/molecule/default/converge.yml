@@ -1,0 +1,27 @@
+---
+- name: Converge — render cAdvisor templates to tmp dir for assertion
+  hosts: localhost
+  gather_facts: false
+  vars:
+    docker_user: pi
+    timezone: Europe/Istanbul
+  pre_tasks:
+    - name: Load role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../defaults/main.yml"
+
+    - name: Override compose dir to a tmp sandbox
+      ansible.builtin.set_fact:
+        cadvisor_compose_dir: /tmp/molecule-cadvisor
+
+    - name: Ensure sandbox dir exists
+      ansible.builtin.file:
+        path: "{{ cadvisor_compose_dir }}"
+        state: directory
+        mode: "0755"
+  tasks:
+    - name: Render docker-compose.yml
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../templates/docker-compose.yml.j2"
+        dest: "{{ cadvisor_compose_dir }}/docker-compose.yml"
+        mode: "0644"

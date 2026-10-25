@@ -1,0 +1,27 @@
+---
+# Synthetic probe — deploys the host-side script + cron that measures dashboard
+# and service response time into the node_exporter textfile collector.
+- name: Deploy homepage probe script
+  ansible.builtin.template:
+    src: homepage-probe.sh.j2
+    dest: /usr/local/bin/homepage-probe.sh
+    owner: root
+    group: root
+    mode: "0755"
+    validate: /bin/bash -n %s
+  become: true
+
+- name: Schedule homepage probe cron
+  ansible.builtin.cron:
+    name: "homepage probe"
+    minute: "{{ homepage_probe_schedule_minute }}"
+    job: "/usr/local/bin/homepage-probe.sh"
+    state: "{{ 'present' if homepage_probe_enabled else 'absent' }}"
+  become: true
+
+- name: Remove homepage probe textfile when disabled
+  ansible.builtin.file:
+    path: "{{ homepage_probe_textfile_dir }}/homepage_probe.prom"
+    state: absent
+  become: true
+  when: not homepage_probe_enabled

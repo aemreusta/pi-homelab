@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Managed by Ansible. All observations/decisions and publication live in Go.
+set -euo pipefail
+exec /usr/bin/timeout 90 \
+  {{ homelab_runtime_binary | default('/usr/local/bin/homelab-agent') | quote }} indexer-health \
+  --prowlarr-url {{ media_indexer_health_prowlarr_url | quote }} \
+  --byparr-url {{ media_indexer_health_byparr_url | quote }} \
+  --target-url {{ media_indexer_health_target_url | quote }} \
+  --prowlarr-config {{ media_indexer_health_config | quote }} \
+  --state {{ media_indexer_health_state | quote }} \
+  --textfile {{ media_indexer_health_textfile | quote }} \
+  --timeout {{ media_indexer_health_timeout | quote }}

@@ -1,0 +1,164 @@
+# GitHub Actions runner (Mac) alerts — design 039.
+#
+# Source metrics: gh_runner.prom, emitted every 5 min by gh-runner-metrics.sh
+# (role github_runner_metrics) from the Mac supervisor's NFS heartbeat +
+# status.json. node_exporter's textfile collector picks it up; vmagent scrapes
+# node_exporter. So these are textfile gauges/counters, NOT an up{job=...} probe.
+#
+# Quoting: any annotation surfacing $value/printf uses single-quoted-outer /
+# escaped-inner per docs/conventions/vmalert-rule-quoting.md.
+
+groups:
+  - name: gh-runner
+    interval: 5m
+    rules:
+
+      # ── Supervisor down (the whole runner system is offline) ──────────
+      # The renderer sets gh_runner_heartbeat_stale=1 when the supervisor's NFS
+      # heartbeat is missing or older than its threshold (≈10 min). This is the
+      # primary "CI runner is dead" signal.
+      - alert: GHRunnerSupervisorDown
+        expr: gh_runner_heartbeat_stale == 1
+        for: {{ vmalert_gh_runner_supervisor_down_for | default('15m') }}
+        labels:
+          severity: warn
+          mac_dependent: "true"
+          source: vmalert
+        annotations:
+          summary: "GitHub Actions runner supervisor heartbeat stale — CI/builds offline"
+          description: "The Mac supervisor stopped refreshing its NFS heartbeat. No runner is being kept ready, so homelab CI and image builds won't run. On the Mac: cd mac-worker/github-runner && docker compose up -d (check `docker compose logs`). See design 039."
+
+      # ── Pi emitter died (textfile not refreshing) ────────────────────
+      # Distinct from SupervisorDown: this catches the Pi-side cron crashing
+      # pre-emit / node_exporter not reading the dir. node_textfile_mtime_seconds
+      # is exported automatically for every *.prom.
+      - alert: GHRunnerMetricsStale
+        expr: time() - node_textfile_mtime_seconds{file=~".*gh_runner.*"} > {{ vmalert_gh_runner_metrics_stale_seconds | default(1800) }}
+        for: {{ vmalert_gh_runner_metrics_stale_for | default('30m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "gh-runner-metrics.sh hasn't refreshed gh_runner.prom in 30m+"
+          description: "The Pi emitter is down (cron missed, script crashed pre-emit, or node_exporter can't read the textfile dir). Emitter runs every 5 min. Check: `tail /var/log/gh-runner-metrics.log`, `ls -l /var/lib/node_exporter/textfile/gh_runner.prom`."
+
+      # ── No idle runner while the supervisor is up ────────────────────
+      # Supervisor alive (heartbeat fresh) but no idle runner AND nothing busy →
+      # it should have spawned an idle runner and didn't (JIT mint failing, image
+      # pull failing, Docker wedged). The busy==0 guard avoids firing during a
+      # legitimately long-running single job (idle drops to 0 while busy=1).
+      - alert: GHRunnerNoIdle
+        expr: |
+          gh_runner_idle_count == 0
+          and gh_runner_heartbeat_stale == 0
+          and sum(gh_runner_busy_count) == 0
+        for: {{ vmalert_gh_runner_no_idle_for | default('30m') }}
+        labels:
+          severity: warn
+          mac_dependent: "true"
+          source: vmalert
+        annotations:
+          summary: "No idle GitHub Actions runner ready (supervisor up, nothing busy)"
+          description: "The supervisor is alive but isn't keeping an idle ephemeral runner registered, and no job is running. Likely JIT-config mint failing (check GHRunnerGitHubAuthFailure), the runner image won't pull, or Docker is wedged on the Mac. `docker compose logs` in mac-worker/github-runner."
+
+      # ── Queued job not picked up ─────────────────────────────────────
+      # GitHub holds a queued job up to ~24h silently. With MAX_CONCURRENT_GLOBAL=2
+      # a brief queue behind the 2 running slots is normal; >15m means nothing is
+      # draining it (dead supervisor that SupervisorDown's soak hasn't tripped yet,
+      # or a label mismatch).
+      #
+      # `sum by (repo)` (not a bare sum): the supervisor serves MULTIPLE repos
+      # (raspi-homelab CI + a separate image-build repo), each a distinct series.
+      # A bare sum() collapsed them into one nameless page, so a benign image
+      # build backlog read as "raspi-homelab CI is stuck" (2026-07-04). Per-repo
+      # keeps the repo label so the page names the culprit and the two backlogs
+      # alert independently.
+      - alert: GHRunnerQueuedTooLong
+        expr: sum by (repo) (gh_runner_queued_jobs) > 0
+        for: {{ vmalert_gh_runner_queued_too_long_for | default('15m') }}
+        labels:
+          severity: warn
+          mac_dependent: "true"
+          source: vmalert
+        annotations:
+          summary: '{{ "{{ $value | printf \"%.0f\" }}" }} job(s) queued for {{ "{{ $labels.repo }}" }} with no runner for 15m'
+          description: "A queued GitHub Actions job isn't being picked up for the {{ "{{ $labels.repo }}" }} repo. With MAX_CONCURRENT_GLOBAL=2 this is often just a push burst draining a couple at a time (the runner shows busy=true and clears itself). A real stall = supervisor down, JIT-config/PAT mint failing, or a runs-on label mismatch. Check mac-worker/github-runner logs + `gh run list -R aemreusta/{{ "{{ $labels.repo }}" }}`."
+
+      # ── PAT auth failing (a revoked/expired token looks like 'offline') ─
+      - alert: GHRunnerGitHubAuthFailure
+        expr: increase(gh_runner_github_api_auth_failures_total[15m]) > 0
+        for: {{ vmalert_gh_runner_auth_failure_for | default('5m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "GitHub API auth failing for the runner supervisor (PAT 401/403)"
+          description: "The supervisor's fine-grained PAT is being rejected (401/403) — likely expired or revoked, or its Administration permission was removed. Rotate the PAT in mac-worker/github-runner/.env and `docker compose restart`. Without it, no runners can register."
+
+      # ── Runner image staleness (the 30-day --disableupdate SLO) ──────
+      # Auto-update is pinned off, so GitHub stops queueing jobs to a runner >30d
+      # behind the latest release. Warn at 21d, crit at 28d — rebuild + re-push
+      # before the cliff. The >0 guard skips the unknown (image not inspected yet).
+      - alert: GHRunnerImageStale
+        expr: |
+          (time() - gh_runner_image_build_timestamp_seconds) > {{ vmalert_gh_runner_image_stale_warn_seconds | default(1814400) }}
+          and gh_runner_image_build_timestamp_seconds > 0
+        for: {{ vmalert_gh_runner_image_stale_for | default('1h') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Runner image is {{ "{{ $value | humanizeDuration }}" }} old — rebuild before the 30-day cliff'
+          description: "The pinned runner image is aging (auto-update is off). GitHub stops queueing jobs to a runner >30 days behind the latest actions/runner release. Rebuild + re-push (bump RUNNER_VERSION) per mac-worker/github-runner/README.md. See design 039."
+
+      - alert: GHRunnerImageStaleCritical
+        expr: |
+          (time() - gh_runner_image_build_timestamp_seconds) > {{ vmalert_gh_runner_image_stale_crit_seconds | default(2419200) }}
+          and gh_runner_image_build_timestamp_seconds > 0
+        for: {{ vmalert_gh_runner_image_stale_for | default('1h') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'Runner image {{ "{{ $value | humanizeDuration }}" }} old — past 28d, the 30-day cliff is imminent'
+          description: "The pinned runner image is within days of GitHub's 30-day cutoff, after which jobs stop being queued to it entirely. Rebuild + re-push NOW (bump RUNNER_VERSION). See design 039 / mac-worker/github-runner/README.md."
+
+      # ── Automated rebuild health (Mac launchd rebuild-runner-image.sh) ──
+      # The rebuild automation keeps the image under the ImageStale cliff. These
+      # catch the "cron RAN but the build/push failed" gap that ImageStale only
+      # notices ~21d later. Both guard on last_attempt>0 so they stay silent
+      # until the automation is actually installed on the Mac.
+      - alert: GHRunnerRebuildFailed
+        expr: |
+          gh_runner_rebuild_last_exit_code != 0
+          and gh_runner_rebuild_last_attempt_timestamp_seconds > 0
+        for: {{ vmalert_gh_runner_rebuild_failed_for | default('1h') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Runner-image auto-rebuild failed (exit {{ "{{ $value }}" }})'
+          description: "The scheduled Mac rebuild of the runner image exited non-zero (build or `--push` to Zot failed). The image will drift toward the 30-day cliff. Check the Mac: `tail mac-worker/github-runner/logs/rebuild.log`; verify Zot login + registry reachability. Design 039."
+
+      - alert: GHRunnerRebuildStale
+        expr: |
+          (time() - gh_runner_rebuild_last_success_timestamp_seconds) > {{ vmalert_gh_runner_rebuild_stale_seconds | default(1382400) }}
+          and gh_runner_rebuild_last_attempt_timestamp_seconds > 0
+        for: {{ vmalert_gh_runner_rebuild_stale_for | default('1h') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'No successful runner-image auto-rebuild in {{ "{{ $value | humanizeDuration }}" }}'
+          description: "The rebuild automation is installed (it has attempted) but has not SUCCEEDED within its expected cadence (~biweekly, warn at 16d). The launchd job may be mis-scheduled or repeatedly failing. Check `launchctl list | grep github-runner-rebuild` + rebuild.log on the Mac. Design 039."
+
+      # ── Repeated job failures ────────────────────────────────────────
+      - alert: GHRunnerJobFailuresBurst
+        expr: increase(gh_runner_jobs_failed_total[1h]) >= {{ vmalert_gh_runner_job_failures_burst | default(3) }}
+        for: {{ vmalert_gh_runner_job_failures_for | default('10m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'GitHub Actions jobs failing in bursts ({{ "{{ $value | printf \"%.0f\" }}" }} non-zero exits in 1h)'
+          description: "Multiple runner jobs exited non-zero in the last hour — CI is broken (a real test/lint failure on master) or the runner environment is broken (deps, Docker, registry). Check the failing workflow's logs in the repo's Actions tab."

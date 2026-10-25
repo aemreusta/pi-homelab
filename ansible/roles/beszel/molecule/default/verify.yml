@@ -1,0 +1,27 @@
+---
+- name: Verify
+  hosts: localhost
+  gather_facts: false
+  vars:
+    sandbox: /tmp/molecule-beszel
+  tasks:
+    - name: Slurp
+      ansible.builtin.slurp:
+        src: "{{ sandbox }}/docker-compose.yml"
+      register: dc
+    - name: Decode
+      ansible.builtin.set_fact:
+        compose_yaml: "{{ (dc.content | b64decode) | from_yaml }}"
+    - name: Assert hardening on both services
+      ansible.builtin.assert:
+        that:
+          - "'no-new-privileges:true' in compose_yaml.services[item].security_opt"
+          - "'ALL' in compose_yaml.services[item].cap_drop"
+          - compose_yaml.services[item].pids_limit | int > 0
+          - compose_yaml.services[item].mem_limit is defined
+          - compose_yaml.services[item].network_mode == 'host'
+          - compose_yaml.services[item].labels['org.opencontainers.image.title'] is defined
+        fail_msg: "{{ item }} hardening incomplete"
+      loop:
+        - beszel
+        - beszel-agent

@@ -1,0 +1,76 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "description": "Ad-hoc error exploration across all container logs (VictoriaLogs). Built on the log_level field fluentbit's enrich.lua sets. COVERAGE CAVEAT: enrich.lua only extracts BRACKETED levels ([Error]/[ERR]/[error]). Services that don't bracket their logs — VictoriaMetrics, VictoriaLogs, fluentbit itself, cadvisor — emit no log_level, so their errors are NOT counted here. Those log to journald and the ones that matter are watched by vmalert directly. PRIVACY: the 'Recent error lines' table shows raw log content, which may include file paths / URLs / tokens from services like qBittorrent — acceptable here because Grafana is LAN-only (UFW) behind login auth.",
+  "panels": [
+    {
+      "id": 1,
+      "type": "barchart",
+      "title": "Top error producers (24h)",
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"},
+      "targets": [{"refId": "A", "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"}, "expr": "log_level:error AND _time:24h | stats by (container_name) count() as errors | sort by (errors desc) | limit 20", "queryType": "stats"}],
+      "options": {"orientation": "horizontal", "showValue": "auto", "stacking": "none", "legend": {"showLegend": false, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "single", "sort": "none"}, "xTickLabelRotation": 0},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"fillOpacity": 80, "lineWidth": 1}}, "overrides": []}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Total errors (1h)",
+      "gridPos": {"h": 10, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"},
+      "targets": [{"refId": "A", "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"}, "expr": "log_level:error AND _time:1h | stats count() as errors", "queryType": "stats"}],
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "value", "colorMode": "background", "graphMode": "none", "justifyMode": "center"},
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 10}, {"color": "red", "value": 100}]}, "noValue": "0"}, "overrides": []}
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Warnings (1h)",
+      "gridPos": {"h": 10, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"},
+      "targets": [{"refId": "A", "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"}, "expr": "log_level:warn AND _time:1h | stats count() as warnings", "queryType": "stats"}],
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "value", "colorMode": "background", "graphMode": "none", "justifyMode": "center"},
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "blue", "value": 1}]}, "noValue": "0"}, "overrides": []}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Error timeline (5m buckets)",
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 10},
+      "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"},
+      "targets": [{"refId": "A", "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"}, "expr": "log_level:error | stats by (_time:5m) count() as errors", "queryType": "stats"}],
+      "options": {"legend": {"showLegend": false, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "single", "sort": "none"}},
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "bars", "lineWidth": 1, "fillOpacity": 70, "showPoints": "never", "spanNulls": false}, "color": {"mode": "fixed", "fixedColor": "red"}}, "overrides": []}
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Recent error lines (last 100)",
+      "gridPos": {"h": 13, "w": 24, "x": 0, "y": 19},
+      "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"},
+      "targets": [{"refId": "A", "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"}, "expr": "log_level:error | sort by (_time desc) | limit 100", "queryType": "instant"}],
+      "options": {"showHeader": true, "footer": {"show": false, "reducer": ["sum"], "fields": ""}, "cellHeight": "sm"},
+      "fieldConfig": {"defaults": {"custom": {"align": "auto", "displayMode": "auto"}}, "overrides": []},
+      "transformations": [
+        {"id": "organize", "options": {"excludeByName": {"_stream": true, "_stream_id": true, "host": true, "container_id": true, "log_path": true, "log_level": true}, "indexByName": {"_time": 0, "container_name": 1, "log": 2}, "renameByName": {}}}
+      ]
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": ["logs", "errors", "homelab"],
+  "templating": {"list": []},
+  "time": {"from": "now-24h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Container Log Errors",
+  "uid": "container-log-errors",
+  "version": 1,
+  "weekStart": ""
+}

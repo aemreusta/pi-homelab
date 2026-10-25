@@ -1,0 +1,62 @@
+---
+# LAN-scoped (Phase 0, docs/research/036-sso-identity-provider-options.md). These UIs/APIs also answer on their
+# own host port, so Traefik gives no access control — the port is the real door.
+# Scope it to the LAN; Tailscale still reaches these via the tailscale0
+# interface allow-rule (roles/tailscale/tasks/ufw.yml). Guarded by
+# tests/test_ufw_scoping.py.
+- name: Allow qBittorrent WebUI through UFW
+  community.general.ufw:
+    rule: allow
+    port: "8181"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: qBittorrent WebUI
+
+- name: Allow Sonarr through UFW
+  community.general.ufw:
+    rule: allow
+    port: "8989"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: Sonarr
+
+- name: Allow Radarr through UFW
+  community.general.ufw:
+    rule: allow
+    port: "7878"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: Radarr
+
+- name: Allow Prowlarr through UFW
+  community.general.ufw:
+    rule: allow
+    port: "9696"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: Prowlarr
+
+- name: Allow Jellyfin HTTP through UFW
+  community.general.ufw:
+    rule: allow
+    port: "8096"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: Jellyfin HTTP
+
+# One-time reconciliation: the pre-2026-07-14 rules opened these ports to
+# Anywhere. UFW is additive — adding the LAN-scoped rule above leaves the old
+# broad rule in place — so delete it explicitly. Idempotent: a no-op once the
+# Anywhere rule is gone (and on fresh installs it never existed).
+- name: Remove superseded Anywhere rules (migrated to LAN scope, Phase 0)
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+    delete: true
+  loop:
+    - "8181"
+    - "8989"
+    - "7878"
+    - "9696"
+    - "8096"

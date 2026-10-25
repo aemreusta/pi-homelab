@@ -1,0 +1,23 @@
+---
+- name: Include Beszel freshness monitoring
+  ansible.builtin.include_tasks: freshness.yml
+  tags: [beszel]
+
+- name: Include Beszel deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [beszel]
+
+- name: Include Beszel UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [beszel, firewall]
+
+# `not ansible_check_mode`: configure.yml is 100% live-API (`uri` auth GET →
+# `.json` consumed in arg-level headers/url + set_facts). In `--check` mode every
+# `uri` task is SKIPPED (no `.json`), so those consumers crash at arg
+# finalization. The autodeploy deep-check (`--check --diff`) would brick the next
+# beszel deploy exactly like the 2026-07-02 brick loop. Check mode can
+# validate nothing here anyway. See docs/operations/ops-discipline.md §6 (class fix).
+- name: Include Beszel configure tasks
+  ansible.builtin.include_tasks: configure.yml
+  tags: [beszel, configure]
+  when: vault_beszel_email is defined and not ansible_check_mode

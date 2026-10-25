@@ -1,0 +1,46 @@
+---
+# NOTE: :53 DNS stays Anywhere — the LAN resolver must answer every client (and
+# it is exempted in tests/test_ufw_scoping.py). The admin UIs (:3000 setup,
+# :8080 dashboard) are LAN-scoped; Tailscale reaches them via the tailscale0
+# interface allow-rule (Phase 0, docs/research/036-sso-identity-provider-options.md).
+- name: Allow DNS (TCP) through UFW
+  community.general.ufw:
+    rule: allow
+    port: "53"
+    proto: tcp
+    comment: AdGuard DNS
+
+- name: Allow DNS (UDP) through UFW
+  community.general.ufw:
+    rule: allow
+    port: "53"
+    proto: udp
+    comment: AdGuard DNS
+
+- name: Allow AdGuard web UI through UFW
+  community.general.ufw:
+    rule: allow
+    port: "3000"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: AdGuard setup UI
+
+- name: Allow AdGuard dashboard through UFW
+  community.general.ufw:
+    rule: allow
+    port: "8080"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: AdGuard dashboard
+
+# One-time reconciliation of the pre-2026-07-14 Anywhere admin-UI rules (NOT :53,
+# which stays Anywhere). Idempotent no-op once removed.
+- name: Remove superseded Anywhere admin-UI rules (migrated to LAN scope, Phase 0)
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+    delete: true
+  loop:
+    - "3000"
+    - "8080"

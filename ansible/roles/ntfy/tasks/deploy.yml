@@ -1,0 +1,34 @@
+---
+- name: Create ntfy compose directory
+  ansible.builtin.file:
+    path: "{{ ntfy_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create ntfy data directory (root-owned — container runs as root)
+  # cap_drop: [ALL] removes CAP_DAC_OVERRIDE; ownership must match container UID (0).
+  ansible.builtin.file:
+    path: "{{ ntfy_data_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+    recurse: true
+
+- name: Copy ntfy docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ ntfy_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart ntfy
+
+- name: Start ntfy containers
+  community.docker.docker_compose_v2:
+    project_src: "{{ ntfy_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

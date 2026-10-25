@@ -1,0 +1,155 @@
+#!/bin/bash
+# /usr/local/bin/tailscale-split-dns-check.sh — managed by Ansible (tailscale_dns)
+#
+# Watches the ONE piece of internal-DNS config Ansible cannot converge: the
+# tailnet's split-DNS routes. Those live in the Tailscale control plane (admin
+# console / `/dns/split-dns` API), so `make tailscale-dns` can render a perfect
+# dnsmasq and still leave MagicDNS pointing at a domain that no longer exists.
+#
+# That is not hypothetical. The 2026-07-15 `.example` -> `.example.internal`
+# cut updated AdGuard, dnsmasq, Traefik, Authelia and every var in the repo; the
+# split-DNS route kept saying `example`, and because `example.internal` is a
+# SIBLING of `example` rather than a child, MagicDNS answered NXDOMAIN for every
+# internal name for three weeks. Every container resolves through
+# 127.0.0.11 -> 100.100.100.100 (tailscaled), so this took out the Uptime Kuma
+# Filebrowser monitor and dropped ntfy-bridge alerts, while reading as an
+# intermittent fault (Docker's resolver caches hits, so names worked until TTL).
+#
+# Diff logic lives in the tested module tailscale_split_dns.py (CLAUDE.md:
+# set-diff logic in Python, bash orchestrates only). This script:
+#   1. reads `tailscale dns status --json`
+#   2. calls the decider
+#   3. emits a node_exporter textfile metric (silent-cron hard rule)
+#   4. logs the ready-to-apply PATCH body when drifted
+#
+# Detection only — see the module docstring for why this does not self-heal.
+
+set -uo pipefail
+
+VERBOSE=0
+[ "${1:-}" = "-v" ] && VERBOSE=1
+
+DECIDER="{{ tailscale_dns_split_check_decider }}"
+DOMAINS="{{ homelab_internal_domains | join(',') }}"
+NAMESERVER="{{ tailscale_dns_ip }}"
+TEXTFILE_DIR="{{ common_node_exporter_textfile_dir | default('/var/lib/node_exporter/textfile') }}"
+TEXTFILE="${TEXTFILE_DIR}/tailscale_split_dns.prom"
+LOG_FILE="{{ tailscale_dns_split_check_log }}"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true; }
+numeric() { case "${1:-}" in ''|*[!0-9-]*) echo 0 ;; *) echo "$1" ;; esac; }
+
+emit() {  # $1=ok $2=missing $3=misrouted $4=stale $5=scrape_ok $6=per-domain lines
+    [ -d "$TEXTFILE_DIR" ] || return 0
+    local tmp="${TEXTFILE}.$$"
+    # Normalise once into locals rather than calling numeric() inline in each
+    # echo. Nested double quotes inside "$( ... )" are valid shell but defeat
+    # the static line-extractor in tests/test_textfile_emitters.py, and an
+    # emitter that cannot be grammar-checked is precisely the thing that
+    # silently ships a malformed gauge.
+    local m_ok m_missing m_misrouted m_stale m_scrape m_now
+    m_ok=$(numeric "${1:-0}")
+    m_missing=$(numeric "${2:-0}")
+    m_misrouted=$(numeric "${3:-0}")
+    m_stale=$(numeric "${4:-0}")
+    m_scrape=$(numeric "${5:-0}")
+    m_now=$(date +%s)
+    if {
+        echo "# HELP tailscale_split_dns_ok 1 if every homelab_internal_domains entry is served by the Pi's tailnet resolver via a split-DNS route."
+        echo "# TYPE tailscale_split_dns_ok gauge"
+        echo "tailscale_split_dns_ok ${m_ok}"
+        echo "# HELP tailscale_split_dns_missing Required internal domains with no covering split-DNS route at all."
+        echo "# TYPE tailscale_split_dns_missing gauge"
+        echo "tailscale_split_dns_missing ${m_missing}"
+        echo "# HELP tailscale_split_dns_misrouted Required internal domains routed somewhere other than our tailnet resolver."
+        echo "# TYPE tailscale_split_dns_misrouted gauge"
+        echo "tailscale_split_dns_misrouted ${m_misrouted}"
+        echo "# HELP tailscale_split_dns_stale Routes still pointing at our resolver for a domain we no longer claim (untidy, not broken)."
+        echo "# TYPE tailscale_split_dns_stale gauge"
+        echo "tailscale_split_dns_stale ${m_stale}"
+        echo "# HELP tailscale_split_dns_scrape_ok 1 if 'tailscale dns status' was readable and parseable this run."
+        echo "# TYPE tailscale_split_dns_scrape_ok gauge"
+        echo "tailscale_split_dns_scrape_ok ${m_scrape}"
+        echo "# HELP tailscale_split_dns_domain_ok Per-domain resolvability via the tailnet split-DNS route (1 ok, 0 missing/misrouted)."
+        echo "# TYPE tailscale_split_dns_domain_ok gauge"
+        # printf '%s\n', not '%s': $6 arrives via command substitution, which
+        # STRIPS trailing newlines, so '%s' glued the last per-domain sample
+        # onto the next `# HELP` and node_exporter rejected the entire file
+        # (node_textfile_scrape_error=1, metric never reached VM — the drift
+        # watchdog silently dead). Guarded so an empty block emits nothing
+        # rather than a stray blank line.
+        [ -n "${6:-}" ] && printf '%s\n' "$6"
+        echo "# HELP tailscale_split_dns_last_run_unix_seconds Unix time of the last drift check."
+        echo "# TYPE tailscale_split_dns_last_run_unix_seconds gauge"
+        echo "tailscale_split_dns_last_run_unix_seconds ${m_now}"
+    } > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$TEXTFILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+}
+
+# `tailscale dns status` can fail wholesale (daemon down, not logged in). That
+# is a scrape failure, NOT "no routes" — reporting 0 routes would fire a drift
+# alert for a dead tailscaled and point the operator at the wrong thing.
+STATUS=$(tailscale dns status --json 2>/dev/null)
+if [ -z "$STATUS" ]; then
+    log "FAIL: 'tailscale dns status --json' produced no output (tailscaled down or not logged in)"
+    [ "$VERBOSE" -eq 1 ] && echo "scrape failed: tailscale dns status returned nothing"
+    emit 0 0 0 0 0 ""
+    exit 2
+fi
+
+VERDICT=$(printf '%s' "$STATUS" | python3 "$DECIDER" --domains "$DOMAINS" --nameserver "$NAMESERVER")
+DECIDER_RC=$?
+if [ -z "$VERDICT" ]; then
+    log "FAIL: decider produced no output"
+    emit 0 0 0 0 0 ""
+    exit 2
+fi
+
+read -r OK N_MISSING N_MISROUTED N_STALE SCRAPE_OK < <(printf '%s' "$VERDICT" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('ok',0), len(d.get('missing',[])), len(d.get('misrouted',[])),
+      len(d.get('stale',[])), d.get('scrape_ok',0))
+" 2>/dev/null)
+
+# Per-domain series so the alert can name the broken domain instead of a count.
+DOMAIN_LINES=$(printf '%s' "$VERDICT" | DOMAINS="$DOMAINS" python3 -c "
+import json, os, sys
+d = json.load(sys.stdin)
+bad = {x.strip() for x in d.get('missing', []) + d.get('misrouted', [])}
+out = []
+for dom in (x.strip() for x in os.environ.get('DOMAINS', '').split(',')):
+    if dom:
+        out.append('tailscale_split_dns_domain_ok{domain=\"%s\"} %d' % (dom, 0 if dom in bad else 1))
+print('\n'.join(out) + ('\n' if out else ''), end='')
+" 2>/dev/null)
+
+emit "$(numeric "$OK")" "$(numeric "$N_MISSING")" "$(numeric "$N_MISROUTED")" \
+     "$(numeric "$N_STALE")" "$(numeric "$SCRAPE_OK")" "$DOMAIN_LINES"
+
+if [ "$(numeric "$OK")" -eq 1 ]; then
+    log "ok: all internal domains covered (stale=$(numeric "$N_STALE"))"
+    [ "$VERBOSE" -eq 1 ] && echo "no drift: $DOMAINS served by $NAMESERVER (stale routes: $(numeric "$N_STALE"))"
+    exit 0
+fi
+
+# Log the exact remediation next to the finding. Nobody reconstructs an API
+# body from a counter at 3am, and this route is not Ansible-convergeable, so
+# the fix has to travel with the alert.
+PATCH=$(printf '%s' "$VERDICT" | python3 -c "
+import json, sys
+print(json.dumps(json.load(sys.stdin).get('desired_patch', {}), separators=(',', ':')))
+" 2>/dev/null)
+log "DRIFT: missing=$(numeric "$N_MISSING") misrouted=$(numeric "$N_MISROUTED") stale=$(numeric "$N_STALE")"
+log "DRIFT: fix -> curl -X PATCH https://api.tailscale.com/api/v2/tailnet/-/dns/split-dns -H 'Authorization: Bearer \$TS_API_KEY' -H 'Content-Type: application/json' -d '${PATCH}'"
+if [ "$VERBOSE" -eq 1 ]; then
+    echo "DRIFT detected (rc=${DECIDER_RC})"
+    printf '%s\n' "$VERDICT"
+    echo "apply: curl -X PATCH https://api.tailscale.com/api/v2/tailnet/-/dns/split-dns \\"
+    echo "  -H \"Authorization: Bearer \$TS_API_KEY\" -H 'Content-Type: application/json' \\"
+    echo "  -d '${PATCH}'"
+fi
+exit 1

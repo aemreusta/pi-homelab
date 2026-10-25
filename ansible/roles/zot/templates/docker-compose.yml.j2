@@ -1,0 +1,47 @@
+---
+# Zot — OCI registry + web UI for locally-built homelab images.
+# Managed by Ansible — do not edit manually.
+{# Docs: docs/archive/prds/013-zot-registry.md #}
+
+services:
+  zot:
+    image: {{ zot_image }}
+    container_name: zot
+    restart: unless-stopped
+    user: "{{ zot_puid }}:{{ zot_pgid }}"
+    mem_limit: {{ zot_mem_limit }}
+    pids_limit: {{ zot_pids_limit }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for c in zot_cap_drop %}
+      - {{ c }}
+{% endfor %}
+{% if zot_cap_add | length > 0 %}
+    cap_add:
+{% for c in zot_cap_add %}
+      - {{ c }}
+{% endfor %}
+{% endif %}
+    labels:
+{% for k, v in zot_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    ports:
+      - "{{ zot_port }}:{{ zot_container_port }}"
+    volumes:
+      - {{ zot_config_dir }}:/etc/zot:ro
+      - {{ zot_data_dir }}:/var/lib/registry
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # No healthcheck: the zot image is distroless (no shell/curl). Liveness is the
+    # /metrics scrape + ZotDown vmalert rule (see roles/vmagent, roles/vmalert).
+    networks:
+      - zot_net
+
+networks:
+  zot_net:
+    driver: bridge

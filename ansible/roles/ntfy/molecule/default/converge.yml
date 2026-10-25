@@ -1,0 +1,39 @@
+---
+- name: Converge — render ntfy templates to tmp dir for assertion
+  hosts: localhost
+  gather_facts: false
+  vars:
+    docker_user: pi
+    timezone: Europe/Istanbul
+    # ntfy_port / ntfy_public_url live in group_vars/all/main.yml (not role
+    # defaults), which this render-only scenario does not load — supply them
+    # explicitly so the compose template resolves standalone.
+    ntfy_port: 2586
+    ntfy_public_url: "https://ntfy.example"
+    ansible_facts:
+      default_ipv4:
+        address: "192.0.2.100"
+  pre_tasks:
+    - name: Load role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../defaults/main.yml"
+
+    - name: Override paths to tmp sandbox
+      ansible.builtin.set_fact:
+        ntfy_compose_dir: /tmp/molecule-ntfy
+        ntfy_data_dir: /tmp/molecule-ntfy/data
+
+    - name: Ensure sandbox dirs exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ ntfy_compose_dir }}"
+        - "{{ ntfy_data_dir }}"
+  tasks:
+    - name: Render docker-compose.yml
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../templates/docker-compose.yml.j2"
+        dest: "{{ ntfy_compose_dir }}/docker-compose.yml"
+        mode: "0644"

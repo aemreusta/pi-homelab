@@ -1,0 +1,54 @@
+# Homepage synthetic-probe alerts.
+#
+# Source: the homepage role's host cron (homepage-probe.sh) emits
+#   homepage_probe_duration_seconds / _up / _http_code / _last_run_timestamp
+# to the node_exporter textfile collector (-> vmagent -> VictoriaMetrics).
+# Dashboard: Grafana "Homepage / Service Probe".
+#
+# Per CLAUDE.md silent-cron hard rule, the probe cron's _last_run gauge is
+# watched here (HomepageProbeStale) so a dead probe is itself an alert — a
+# silent probe would otherwise hide every target it stopped checking.
+#
+# Quoting: annotations surfacing $value/printf use single-quoted-outer /
+# escaped-inner per docs/conventions/vmalert-rule-quoting.md.
+
+groups:
+  - name: homepage-probe
+    interval: 1m
+    rules:
+
+      # ── Probe liveness (the cron itself stopped) ─────────────────────
+      # Cron runs every {{ homepage_probe_schedule_minute | default('*/2') }};
+      # stale => the host cron died or the textfile stopped updating, so every
+      # target below is silently un-checked.
+      - alert: HomepageProbeStale
+        expr: time() - homepage_probe_last_run_timestamp_seconds > {{ vmalert_homepage_probe_stale_seconds | default(900) }}
+        for: 5m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "Homepage probe cron is stale"
+          description: 'No homepage-probe run in over {{ ((vmalert_homepage_probe_stale_seconds | default(900)) / 60) | int }}m. The host cron (homepage-probe.sh) died or the textfile collector stopped — service-latency tracking is blind. Check `crontab -l` and /var/lib/node_exporter/textfile/homepage_probe.prom.'
+
+      # ── A probed target stopped responding ───────────────────────────
+      - alert: HomepageProbeTargetDown
+        expr: homepage_probe_up == 0
+        for: {{ vmalert_homepage_probe_down_for | default('10m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Probe target {{ '{{ $labels.target }}' }} not responding'
+          description: 'homepage_probe_up{target="{{ '{{ $labels.target }}' }}"} == 0 — the dashboard or a backing service stopped answering on its LAN port. The dashboard widget/link for it will be dead. Check the container.'
+
+      # ── A probed target is slow (drags the dashboard render) ─────────
+      - alert: HomepageProbeSlow
+        expr: homepage_probe_duration_seconds > {{ vmalert_homepage_probe_slow_seconds | default(2) }}
+        for: {{ vmalert_homepage_probe_slow_for | default('15m') }}
+        labels:
+          severity: info
+          source: vmalert
+        annotations:
+          summary: 'Probe target {{ '{{ $labels.target }}' }} slow ({{ '{{ $value | printf "%.2f" }}' }}s)'
+          description: 'homepage_probe_duration_seconds{target="{{ '{{ $labels.target }}' }}"} has been over {{ vmalert_homepage_probe_slow_seconds | default(2) }}s — a slow backing endpoint makes the dashboard feel slow to load. Investigate that service.'

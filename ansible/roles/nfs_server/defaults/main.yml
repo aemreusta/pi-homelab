@@ -1,0 +1,44 @@
+---
+# NFS exports — each path is exported to every subnet in `subnets` with the
+# same `options`. We export to LAN and Tailscale so a Mac worker mounts
+# 192.0.2.100:/srv at home and 100.64.0.10:/srv off-LAN flawlessly without
+# server-side changes.
+nfs_server_default_options: "rw,sync,no_subtree_check,no_root_squash,insecure,all_squash,anonuid=1000,anongid=1000"
+nfs_server_default_subnets:
+  - "{{ lan_subnet }}"
+  - "{{ tailscale_subnet }}"
+
+# `crossmnt` lets NFS clients descend into filesystems mounted under /srv
+# (an NFS export does NOT cross into a submount without it); without it a
+# client silently sees the submount's empty mountpoint directory instead.
+nfs_server_srv_options: "{{ nfs_server_default_options }},crossmnt"
+
+nfs_server_exports:
+  - path: /srv
+    subnets: "{{ nfs_server_default_subnets }}"
+    options: "{{ nfs_server_srv_options }}"
+  # Small shared status directory the Mac workers write heartbeats/status into.
+  - path: /home/{{ ansible_user }}/docker/mac-worker/shared
+    subnets: "{{ nfs_server_default_subnets }}"
+    options: "{{ nfs_server_default_options }}"
+
+nfs_server_port: 2049
+# UFW already lets all traffic in via tailscale0; the LAN rule covers wired
+# clients. Tailscale clients pass via the catch-all tailscale0 interface rule.
+nfs_server_allow_from: "{{ lan_subnet }}"
+
+# ── Mac worker presence (homelab-agent mac-presence) ──────────────────────
+# The Mac worker is a MacBook: sleep and low-battery hibernation are normal
+# states, not faults. A one-minute Pi-side TCP probe publishes the single
+# root-cause signal (mac_worker_reachable + reachable_since) that Alertmanager
+# uses to inhibit every mac_dependent alert while the Mac is away or settling
+# after wake. A refused connection counts as present (RST proves the host is
+# awake), so the targets need not be listening services: 5000 is the macOS
+# ControlCenter receiver, 8191 is byparr in OrbStack.
+nfs_server_mac_presence_targets:
+  - "192.0.2.102:5000"
+  - "192.0.2.102:8191"
+nfs_server_mac_presence_fail_threshold: 3
+nfs_server_mac_presence_timeout: 2s
+nfs_server_mac_presence_state: /var/lib/homelab/mac-presence/state.json
+nfs_server_mac_presence_textfile: /var/lib/node_exporter/textfile/mac_worker.prom

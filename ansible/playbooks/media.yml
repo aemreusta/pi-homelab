@@ -1,0 +1,6 @@
+---
+- name: Deploy media stack
+  hosts: pi
+  become: true
+  roles:
+    - media

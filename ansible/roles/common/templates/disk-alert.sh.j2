@@ -1,0 +1,89 @@
+#!/bin/bash
+# Disk usage alert — sends ntfy notification when thresholds exceeded.
+# Cooldown: suppress repeat alerts within {{ common_disk_alert_cooldown_hours | default(24) }}h
+# unless usage has climbed by ≥5 percentage points since the last alert.
+set -uo pipefail
+
+NTFY_URL="{{ ntfy_external_topic_url }}"
+THRESHOLD={{ common_disk_alert_threshold | default(75) }}
+COOLDOWN_HOURS={{ common_disk_alert_cooldown_hours | default(24) }}
+STATE_DIR="{{ common_disk_alert_state_dir | default('/var/lib/homelab') }}"
+CONTROL_URL="{{ homelab_control_internal_url | default('http://127.0.0.1:' ~ (homelab_control_port | default(9099))) }}"
+CONTROL_EXTERNAL_URL="{{ homelab_control_external_url | default('https://' ~ control_hostname) }}"
+CONTROL_TOKEN="{{ homelab_control_token | default('') }}"
+
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+mkdir -p "$STATE_DIR"
+
+# Witness line: proves the cron fired even if no threshold was crossed.
+# Without this, a silently broken disk-alert.sh leaves no trace in the
+# audit log (since ntfy_send only logs when an alert is actually sent).
+alert_event "disk-alert" run ok "threshold=${THRESHOLD}" "cooldown_h=${COOLDOWN_HOURS}"
+
+should_notify() {
+    # Returns 0 (true) if we should send a notification for this mount+usage.
+    local mount_key="$1"
+    local usage="$2"
+    local state_file="$STATE_DIR/disk-alert-${mount_key}.state"
+    local now last_ts last_pct age_hours
+
+    [ -f "$state_file" ] || return 0
+
+    last_ts=$(awk '{print $1}' "$state_file" 2>/dev/null || echo 0)
+    last_pct=$(awk '{print $2}' "$state_file" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    age_hours=$(( (now - last_ts) / 3600 ))
+
+    # Cooldown expired → notify.
+    [ "$age_hours" -ge "$COOLDOWN_HOURS" ] && return 0
+    # Usage jumped ≥5pp since last alert → notify.
+    [ "$((usage - last_pct))" -ge 5 ] && return 0
+    return 1
+}
+
+record_notification() {
+    local mount_key="$1"
+    local usage="$2"
+    echo "$(date +%s) $usage" > "$STATE_DIR/disk-alert-${mount_key}.state"
+}
+
+check_disk() {
+    local mount="$1"
+    local key="$2"
+    local usage
+    usage=$(df --output=pcent "$mount" 2>/dev/null | tail -1 | tr -d ' %')
+    [ -n "$usage" ] || return 0
+    [ "$usage" -ge "$THRESHOLD" ] || return 0
+    should_notify "$key" "$usage" || return 0
+
+    local total used avail
+    total=$(df -h --output=size "$mount" 2>/dev/null | tail -1 | xargs)
+    used=$(df -h --output=used "$mount" 2>/dev/null | tail -1 | xargs)
+    avail=$(df -h --output=avail "$mount" 2>/dev/null | tail -1 | xargs)
+
+    local priority="high"
+    local tag="warning"
+    [ "$usage" -ge 90 ] && priority="urgent" && tag="rotating_light"
+
+    if ntfy_send "disk-alert" \
+        -H "Title: Disk ${usage}% on ${mount}" \
+        -H "Priority: ${priority}" \
+        -H "Tags: ${tag},floppy_disk" \
+        -H "Actions: view, Open Storage, ${CONTROL_EXTERNAL_URL}/?token=${CONTROL_TOKEN}#storage-section, clear=true; http, Clean Junk, ${CONTROL_URL}/junk, headers.Authorization=Bearer ${CONTROL_TOKEN}, method=POST, clear=true" \
+        -d "Used: ${used} / ${total} (${avail} free)" \
+        "$NTFY_URL"; then
+        record_notification "$key" "$usage"
+    fi
+}
+
+# Check main SSD
+check_disk /srv srv
+
+# Check root filesystem only if it's on a different device than /srv
+# (avoids duplicate alerts when both paths map to the same partition).
+SRV_DEV=$(df --output=source /srv 2>/dev/null | tail -1)
+ROOT_DEV=$(df --output=source / 2>/dev/null | tail -1)
+if [ "$SRV_DEV" != "$ROOT_DEV" ]; then
+    check_disk / root
+fi

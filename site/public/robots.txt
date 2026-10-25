@@ -1,0 +1,8 @@
+# Not meant for search engines. Google and Bing may fetch pages only so they
+# can read the noindex tag; a page blocked here could still be listed by URL.
+User-agent: Googlebot
+User-agent: Bingbot
+Disallow:
+
+User-agent: *
+Disallow: /

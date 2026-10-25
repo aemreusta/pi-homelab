@@ -1,0 +1,76 @@
+---
+# MinIO — S3-compatible object storage.
+# Foundation for the AI/ML stack (PRD-004): MLflow artifact store, DVC remote,
+# dataset storage. See docs/design/034-minio-object-storage.md.
+
+minio_compose_dir: /home/{{ docker_user }}/docker/data/minio
+# Object data lives on the SSD under /srv/data (ML-stack namespace), NOT under
+# the compose dir — so a compose-dir wipe never touches buckets.
+minio_data_dir: /srv/data/minio
+minio_tz: "{{ timezone }}"
+
+# PINNED — deliberate exception to the "no version pinning" directive. In May
+# 2025 MinIO stripped the admin web console from the AGPL community edition
+# (minio/object-browser PR #3509): :latest and post-May-2025 releases keep only a
+# basic object browser and move ALL admin (users, policies, config, replication)
+# to `mc` or the commercial AIStor product (~$96k/yr). This release is the
+# homelab's known-good FULL-console version — do NOT bump to :latest or the
+# minio.example management UI disappears. `mc admin` + the S3 API are unaffected.
+# License is still AGPLv3 (fine for a private homelab). See memory:
+# minio_console_stripped_pin.
+minio_image: "minio/minio:RELEASE.2025-04-22T22-12-26Z"
+
+# Host ports. 9000/9001 (MinIO defaults) both clash with Portainer on this Pi,
+# so remap on the host side; the container still listens on 9000/9001 inside.
+#   API : host 9010 → container 9000  (S3 endpoint)
+#   UI  : host 9011 → container 9001  (web console)
+minio_api_port: 9010
+minio_ui_port: 9011
+
+# Run as pi (UID/GID 1000) to match /srv ownership — no root in the container,
+# no startup chown, so cap_drop ALL needs no caps back (Go binary, high ports).
+minio_puid: 1000
+minio_pgid: 1000
+
+# Root credentials (admin). Generated into the vault on first setup; the role
+# fails loudly below if they're empty rather than booting an insecure default.
+minio_root_user: "{{ vault_minio_root_user | default('') }}"
+minio_root_password: "{{ vault_minio_root_password | default('') }}"
+
+# Public console URL (behind Traefik internal-CA HTTPS). Drives login redirects
+# so the web console works cleanly through the reverse proxy. The S3 API stays
+# reachable both directly (LAN host port :9010) and via https://minio-api.example.
+minio_browser_redirect_url: "https://minio.{{ homelab_internal_domains[0] }}"
+
+# Prometheus metrics auth. MinIO's /minio/v2/metrics/* endpoints require a signed
+# bearer token by default; "public" serves them unauthenticated so vmagent can
+# scrape on the LAN host port without minting/rotating a JWT. The endpoints are
+# LAN-only (UFW) + read-only counters, so public is acceptable here. See
+# docs/design/034-minio-object-storage.md.
+minio_prometheus_auth_type: public
+
+# Buckets created idempotently post-boot (mc mb --ignore-existing). These back
+# the Faz-2 ML tools; creating them now means MLflow/DVC have their store ready.
+minio_buckets:
+  - mlflow-artifacts
+  - dvc-remote
+  - datasets
+
+# Container memory limit (requires kernel cgroup_enable=memory). PRD-004 budgets
+# 200–300 MB idle; 512M is a runaway-containment ceiling, not a reservation.
+minio_mem_limit: 512M
+
+# --- Container security hardening ---
+minio_pids_limit: 200
+# Go binary, runs as 1000:1000 on a pre-owned data dir, binds only high ports →
+# no capabilities required. Drop everything.
+minio_cap_drop:
+  - ALL
+
+minio_oci_labels:
+  org.opencontainers.image.title: minio
+  org.opencontainers.image.description: "MinIO — S3-compatible object storage (ML artifact/dataset store)"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/minio/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://github.com/minio/minio"

@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  role_name: authelia
+  namespace: homelab
+  author: operator
+  description: Authelia — self-hosted SSO / OIDC provider + forward-auth
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+        - trixie
+# Pulls in the docker role's defaults (docker_user) + ensures Docker is present.

@@ -1,0 +1,26 @@
+# Grafana datasources — managed by Ansible
+# https://grafana.com/docs/grafana/latest/administration/provisioning/#data-sources
+
+apiVersion: 1
+
+datasources:
+  - name: VictoriaMetrics
+    type: prometheus
+    uid: victoriametrics
+    access: proxy
+    url: {{ grafana_victoriametrics_url }}
+    isDefault: true
+    jsonData:
+      timeInterval: 30s
+      httpMethod: POST
+    editable: false
+
+  - name: VictoriaLogs
+    type: victoriametrics-logs-datasource
+    uid: victorialogs
+    access: proxy
+    url: {{ grafana_victorialogs_url }}
+    jsonData:
+      timeout: 60
+      maxLines: 5000
+    editable: false

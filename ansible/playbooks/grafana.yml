@@ -1,0 +1,6 @@
+---
+- name: Deploy Grafana (dashboards & explore UI)
+  hosts: pi
+  become: true
+  roles:
+    - grafana

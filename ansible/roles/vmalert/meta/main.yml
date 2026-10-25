@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  role_name: vmalert
+  namespace: homelab
+  author: operator
+  description: vmalert — alerting rule evaluator for VictoriaMetrics + VictoriaLogs
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+        - trixie
+# Pull docker_user (UID-mapped owner of all compose dirs) from the docker role.

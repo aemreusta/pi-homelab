@@ -1,0 +1,71 @@
+#!/bin/bash
+# External dead-man's-switch — managed by Ansible (common role), do not edit.
+#
+# Every on-box watcher (vmalert, VictoriaMetrics, ntfy, Uptime Kuma) runs on
+# this Pi, so a power/SSD/NIC/kernel failure silences ALL alert paths at once —
+# total blackout, zero notifications. This is the one signal that survives the
+# Pi itself dying: a cron beat to an off-box service (healthchecks.io). If the
+# beat stops, healthchecks.io emails/pushes you.
+#
+# COMPOSITE liveness (not a dumb ping): only beat "ok" if the minimal invariants
+# hold — (a) we can write to disk, and (b) VictoriaMetrics answers a local query.
+# Deliberately just two checks: this catches the blackout class, it is NOT a
+# re-implementation of vmalert (a flaky 3rd check would stop the beat and page
+# for things the on-box alerts already cover, and you'd stop trusting it).
+#   - invariants hold  → ping the bare URL (success)
+#   - cron runs but a check fails → ping <URL>/fail (fast explicit page)
+#   - Pi/cron/NIC dead → no ping at all → healthchecks.io grace timeout pages
+#
+# No-ops safely until vault_healthchecks_ping_url is set (deploy-before-signup).
+
+set -uo pipefail
+
+PING_URL="{{ vault_healthchecks_ping_url | default('') }}"
+VM_URL="{{ deadman_vm_url | default('http://127.0.0.1:8428') }}"
+STATE_DIR="{{ common_alert_state_dir | default('/var/lib/homelab') }}"
+TEXTFILE_DIR="{{ common_node_exporter_textfile_dir | default('/var/lib/node_exporter/textfile') }}"
+TEXTFILE="${TEXTFILE_DIR}/deadman_heartbeat.prom"
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+configured=0; invariants_ok=0
+[ -n "$PING_URL" ] && configured=1
+
+if [ "$configured" -eq 1 ]; then
+    ok=1
+    # (a) disk writable
+    testfile="${STATE_DIR}/.deadman-write-test"
+    if ! { echo ok > "$testfile" && rm -f "$testfile"; } 2>/dev/null; then ok=0; fi
+    # (b) VictoriaMetrics answers a query
+    if ! curl -sf --max-time 8 "${VM_URL}/api/v1/query?query=vm_app_version" 2>/dev/null | grep -q '"status":"success"'; then ok=0; fi
+    invariants_ok=$ok
+
+    if [ "$ok" -eq 1 ]; then
+        curl -fsS -m 10 --retry 2 "$PING_URL" >/dev/null 2>&1 || true
+    else
+        # explicit failure signal → healthchecks.io pages immediately
+        curl -fsS -m 10 --retry 2 "${PING_URL%/}/fail" >/dev/null 2>&1 || true
+    fi
+fi
+
+# ── Observability: atomic textfile emit (silent-cron hard rule) ──────────
+if [ -d "$TEXTFILE_DIR" ]; then
+    tmp="${TEXTFILE}.$$"
+    if {
+        echo "# HELP deadman_heartbeat_last_run_unix_seconds Unix time of the last dead-man's-switch run."
+        echo "# TYPE deadman_heartbeat_last_run_unix_seconds gauge"
+        echo "deadman_heartbeat_last_run_unix_seconds $(date +%s)"
+        echo "# HELP deadman_heartbeat_configured 1 if vault_healthchecks_ping_url is set."
+        echo "# TYPE deadman_heartbeat_configured gauge"
+        echo "deadman_heartbeat_configured ${configured}"
+        echo "# HELP deadman_heartbeat_invariants_ok 1 if disk-writable AND VictoriaMetrics responded this run."
+        echo "# TYPE deadman_heartbeat_invariants_ok gauge"
+        echo "deadman_heartbeat_invariants_ok ${invariants_ok}"
+    } > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$TEXTFILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+fi
+
+exit 0

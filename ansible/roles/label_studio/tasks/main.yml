@@ -1,0 +1,12 @@
+---
+- name: Include Label Studio deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [label_studio]
+
+- name: Include Label Studio configuration tasks
+  ansible.builtin.include_tasks: configure.yml
+  tags: [label_studio, configure]
+
+- name: Include Label Studio UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [label_studio, firewall]

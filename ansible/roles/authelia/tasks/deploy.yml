@@ -1,0 +1,76 @@
+---
+- name: Create Authelia compose directory
+  ansible.builtin.file:
+    path: "{{ authelia_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create Authelia config directory
+  ansible.builtin.file:
+    path: "{{ authelia_config_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0750"
+
+- name: Template Authelia user database
+  ansible.builtin.template:
+    src: users_database.yml.j2
+    dest: "{{ authelia_config_dir }}/users_database.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0640"
+  no_log: true
+  notify: Restart authelia
+
+- name: Template Authelia configuration
+  ansible.builtin.template:
+    src: configuration.yml.j2
+    dest: "{{ authelia_config_dir }}/configuration.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0640"
+  no_log: true
+  notify: Restart authelia
+
+- name: Copy Authelia docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ authelia_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart authelia
+
+# Validate the rendered config with the Authelia binary BEFORE the container
+# (re)starts — an invalid config fails the play here, and the Restart handler
+# (flushed at play end) never fires with a broken config. Skipped under --check
+# because the template above does not write the file in check mode (the config
+# is validated at apply, per the deep-check trade-off; see adguard/main.yml).
+- name: Validate Authelia configuration
+  ansible.builtin.command: # noqa command-instead-of-module
+    argv:
+      - docker
+      - run
+      - --rm
+      - --pull
+      - missing
+      - --entrypoint
+      - authelia
+      - -v
+      - "{{ authelia_config_dir }}:/config:ro"
+      - "{{ authelia_image }}"
+      - validate-config
+      - --config
+      - /config/configuration.yml
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Start Authelia container
+  community.docker.docker_compose_v2:
+    project_src: "{{ authelia_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

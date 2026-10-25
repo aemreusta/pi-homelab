@@ -1,0 +1,9 @@
+---
+- name: Deploy the disk-health collector without host provisioning
+  hosts: pi
+  become: true
+  tasks:
+    - name: Deploy SMART script and schedule
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: smart

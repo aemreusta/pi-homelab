@@ -1,0 +1,20 @@
+---
+# LAN-only access to the S3 API + console host ports. Internal ML clients
+# (MLflow, DVC) reach the S3 API on the LAN IP:9010; the web console on :9011.
+# External/HTTPS access goes through Traefik (minio.example / minio-api.example),
+# which terminates on the host and needs no extra rule here.
+- name: Allow MinIO S3 API through UFW (LAN only)
+  community.general.ufw:
+    rule: allow
+    port: "{{ minio_api_port }}"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: MinIO S3 API
+
+- name: Allow MinIO console through UFW (LAN only)
+  community.general.ufw:
+    rule: allow
+    port: "{{ minio_ui_port }}"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: MinIO console

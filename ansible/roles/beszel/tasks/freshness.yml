@@ -1,0 +1,20 @@
+---
+- name: Deploy Beszel sample freshness collector
+  ansible.builtin.copy:
+    src: beszel_freshness.py
+    dest: /usr/local/bin/beszel-freshness.py
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule independent Beszel sample freshness check
+  ansible.builtin.cron:
+    name: "beszel sample freshness"
+    user: root
+    minute: "*/5"
+    job: >-
+      /usr/bin/flock -n /run/lock/beszel-freshness.lock
+      /usr/bin/timeout 60 /usr/bin/python3 /usr/local/bin/beszel-freshness.py
+      --db {{ (beszel_data_dir ~ '/data.db') | quote }}
+      --system-name {{ beszel_system_name | quote }}
+      --output /var/lib/node_exporter/textfile/beszel_freshness.prom

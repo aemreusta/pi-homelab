@@ -1,0 +1,6 @@
+---
+- name: Deploy VictoriaLogs (single-node log DB)
+  hosts: pi
+  become: true
+  roles:
+    - victorialogs

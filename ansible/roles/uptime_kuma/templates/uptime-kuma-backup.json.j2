@@ -1,0 +1,439 @@
+{
+    "_comment": "TEMPLATED by Ansible (roles/uptime_kuma/templates/uptime-kuma-backup.json.j2) — ntfyserverurl comes from uptime_kuma_ntfy_url; never hardcode a hostname here. Uptime Kuma config source-of-truth (Sprint 020 / runbook 039). Seeded 2026-05-31 via the socket.io API (UK 1.x has no monitor-CRUD REST API). 25 monitors + ntfy + a maintenance window + a grouped status page (slug 'homelab', groups Linchpins/Media/Infra). This is the reviewable record; to restore, re-seed from this list or UI-import a fresh export (Settings > Backup). Notification id 1 = ntfy; all monitors reference it.",
+    "statusPage": {
+        "slug": "homelab",
+        "title": "Homelab Status",
+        "published": true,
+        "groups": [
+            "Linchpins",
+            "Media",
+            "Infra & Observability"
+        ]
+    },
+    "version": "1.23.16",
+    "notificationList": [
+        {
+            "id": 1,
+            "name": "ntfy-homelab-uptime",
+            "type": "ntfy",
+            "isDefault": true,
+            "ntfyserverurl": "{{ uptime_kuma_ntfy_url }}",
+            "ntfytopic": "homelab-uptime",
+            "ntfyPriority": 4,
+            "ntfyAuthenticationMethod": "none"
+        },
+        {
+            "id": 2,
+            "name": "ntfy-uptime-crit",
+            "type": "ntfy",
+            "isDefault": false,
+            "ntfyserverurl": "{{ uptime_kuma_ntfy_url }}",
+            "ntfytopic": "homelab-uptime-crit",
+            "ntfyPriority": 5,
+            "ntfyAuthenticationMethod": "none"
+        }
+    ],
+    "maintenanceList": [
+        {
+            "id": 1,
+            "title": "Nightly restart band",
+            "description": "byparr/*arr restarts + smart-check + backup",
+            "strategy": "recurring-interval",
+            "intervalDay": 1,
+            "active": true,
+            "timeRange": [
+                {
+                    "hours": 3,
+                    "minutes": 55
+                },
+                {
+                    "hours": 5,
+                    "minutes": 20
+                }
+            ],
+            "appliesToMonitors": [
+                "Jellyfin",
+                "Jellyseerr",
+                "qBittorrent",
+                "Sonarr",
+                "Radarr",
+                "Prowlarr",
+                "Tdarr",
+                "byparr"
+            ]
+        }
+    ],
+    "monitorList": [
+        {
+            "name": "Traefik (edge)",
+            "group": "Linchpins",
+            "type": "http",
+            "url": "http://192.0.2.100:80",
+            "accepted_statuscodes": [
+                "200-399"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "2": true
+            },
+            "maxredirects": 0
+        },
+        {
+            "name": "AdGuard",
+            "group": "Linchpins",
+            "type": "http",
+            "url": "http://192.0.2.100:8080",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "2": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "Router DNS",
+            "group": "Linchpins",
+            "type": "dns",
+            "hostname": "google.com",
+            "dns_resolve_server": "192.0.2.1",
+            "dns_resolve_type": "A",
+            "port": 53,
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "2": true
+            }
+        },
+        {
+            "name": "Pi (LAN)",
+            "group": "Linchpins",
+            "type": "ping",
+            "hostname": "192.0.2.100",
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "2": true
+            }
+        },
+        {
+            "name": "Internet (1.1.1.1)",
+            "group": "Linchpins",
+            "type": "ping",
+            "hostname": "1.1.1.1",
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "2": true
+            }
+        },
+        {
+            "name": "Tailscale",
+            "group": "Linchpins",
+            "type": "ping",
+            "hostname": "100.64.0.10",
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "2": true
+            }
+        },
+        {
+            "name": "Jellyfin",
+            "group": "Media",
+            "type": "http",
+            "url": "http://192.0.2.100:8096/health",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "Jellyseerr",
+            "group": "Media",
+            "type": "http",
+            "url": "http://192.0.2.100:5055",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "qBittorrent",
+            "group": "Media",
+            "type": "http",
+            "url": "http://192.0.2.100:8181",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "Sonarr",
+            "group": "Media",
+            "type": "http",
+            "url": "http://192.0.2.100:8989/ping",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "Radarr",
+            "group": "Media",
+            "type": "http",
+            "url": "http://192.0.2.100:7878/ping",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "Prowlarr",
+            "group": "Media",
+            "type": "http",
+            "url": "http://192.0.2.100:9696/ping",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "Tdarr",
+            "group": "Media",
+            "type": "http",
+            "url": "http://192.0.2.100:8265",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "byparr",
+            "group": "Media",
+            "type": "http",
+            "url": "http://192.0.2.102:8191/docs",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399"
+            ],
+            "interval": 300,
+            "retryInterval": 300,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "_note": "raw IP:port \u2014 byparr isn't behind Traefik; /docs is its real healthcheck (leak/restart history). interval 300s not 60s: byparr has no live consumer (0 /v1/24h, its only indexer disabled), only failure mode is a slow days-long PID leak \u2014 60s polling just spammed /docs. NOTE: this seed value applies on re-seed only; the LIVE Kuma interval must also be changed in the UI.",
+            "maxredirects": 10
+        },
+        {
+            "name": "Homepage",
+            "group": "Infra & Observability",
+            "type": "http",
+            "url": "http://192.0.2.100:3001",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "Grafana",
+            "group": "Infra & Observability",
+            "type": "http",
+            "url": "http://192.0.2.100:3003/api/health",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "Portainer",
+            "group": "Infra & Observability",
+            "type": "http",
+            "url": "http://192.0.2.100:9000",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "ntfy",
+            "group": "Infra & Observability",
+            "type": "http",
+            "url": "http://192.0.2.100:2586",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "Speedtest",
+            "group": "Infra & Observability",
+            "type": "http",
+            "url": "http://192.0.2.100:8765",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "Filebrowser",
+            "group": "Infra & Observability",
+            "type": "http",
+            "url": "https://filebrowser.example.internal",
+            "ignoreTls": true,
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        },
+        {
+            "name": "Beszel",
+            "group": "Infra & Observability",
+            "type": "http",
+            "url": "http://192.0.2.100:8090",
+            "accepted_statuscodes": [
+                "200-299",
+                "300-399",
+                "401",
+                "403"
+            ],
+            "interval": 60,
+            "retryInterval": 60,
+            "maxretries": 2,
+            "notificationIDList": {
+                "1": true
+            },
+            "maxredirects": 10
+        }
+    ]
+}

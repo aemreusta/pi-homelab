@@ -1,0 +1,11 @@
+---
+- name: Include PostgreSQL deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [postgresql]
+
+- name: Include PostgreSQL database/user provisioning tasks
+  ansible.builtin.include_tasks: configure.yml
+  tags: [postgresql, configure]
+
+# No ufw.yml — port 5432 is bound to 127.0.0.1 (loopback) only; UFW sees no
+# host-port exposure on the LAN. ML services reach Postgres via mlstack_net.

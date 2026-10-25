@@ -1,0 +1,6 @@
+---
+- name: Deploy ntfy push notifications
+  hosts: pi
+  become: true
+  roles:
+    - ntfy

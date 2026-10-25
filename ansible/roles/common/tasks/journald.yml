@@ -1,0 +1,85 @@
+---
+# Persistent systemd journal.
+#
+# Pi reboot on 2026-05-20 was undiagnosable because journald defaulted to
+# volatile storage (`auto` → /run/log/journal, lost on boot). With persistent
+# storage enabled, journalctl -b -1 survives reboots and post-mortems work.
+#
+# Drop-in is preferred over editing /etc/systemd/journald.conf so apt upgrades
+# to systemd don't overwrite our settings (systemd docs: man journald.conf,
+# section "CONFIGURATION DIRECTORIES AND PRECEDENCE").
+#
+# 2026-05-21: first version deployed `00-homelab-persistent.conf` but Raspberry
+# Pi OS ships `/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf`
+# with `Storage=volatile`, and drop-ins merge in lexicographic order (last
+# wins). The 40- prefix always beat our 00-. Renamed to 99- so we win, plus
+# create /var/log/journal BEFORE the drop-in is in place, run systemd-tmpfiles
+# explicitly, and flush the handler immediately so verification runs against
+# the restarted daemon.
+- name: Ensure /etc/systemd/journald.conf.d exists
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure /var/log/journal exists (persistent storage root)
+  ansible.builtin.file:
+    path: /var/log/journal
+    state: directory
+    owner: root
+    group: systemd-journal
+    mode: "2755"
+
+- name: Materialise journal directory layout (per-machine-id subdir)
+  ansible.builtin.command: systemd-tmpfiles --create --prefix=/var/log/journal
+  register: common_journald_tmpfiles
+  changed_when: false
+
+- name: Remove old 00-prefix journald drop-in (superseded by 99- variant)
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d/00-homelab-persistent.conf
+    state: absent
+  notify: Restart journald
+
+- name: Deploy journald persistent storage drop-in
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/99-homelab-persistent.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (common role) — see ansible/roles/common/tasks/journald.yml
+      [Journal]
+      Storage=persistent
+      SystemMaxUse={{ common_journald_max_use | default('500M') }}
+      SystemKeepFree={{ common_journald_keep_free | default('200M') }}
+      MaxFileSec={{ common_journald_max_file_sec | default('1week') }}
+      # Time-based log retention: drop journal data older than this even if the
+      # size cap hasn't been hit. Pairs with the retention-cleanup job (docker
+      # images / transcode scratch) for a uniform 30-day disposable-data window.
+      MaxRetentionSec={{ common_journald_max_retention_sec | default('1month') }}
+      ForwardToSyslog=no
+  notify: Restart journald
+
+- name: Flush journald handler now (so verification runs against the restarted daemon)
+  ansible.builtin.meta: flush_handlers
+
+# systemd-journal-flush.service migrates runtime journals to /var/log/journal/
+# but is a `static` one-shot — only fires at boot. A config change made after
+# boot leaves journald writing to /run/log/journal/ until the next reboot
+# unless we re-trigger the flush manually.
+- name: Migrate runtime journal to persistent storage
+  ansible.builtin.systemd:
+    name: systemd-journal-flush.service
+    state: restarted
+  changed_when: false
+
+- name: Verify journald is using persistent storage
+  ansible.builtin.command: journalctl --verify
+  register: common_journald_verify
+  changed_when: false
+  failed_when:
+    - "'PASS: /var/log/journal/' not in common_journald_verify.stdout"
+    - "'PASS: /var/log/journal/' not in common_journald_verify.stderr"

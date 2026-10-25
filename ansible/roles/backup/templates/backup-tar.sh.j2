@@ -1,0 +1,59 @@
+#!/bin/bash
+# backup-tar.sh — no-quiesce tar of one service's source paths.
+# Invoked by homelab-backup.sh with: $1=service_name, $2..N=source_paths
+#
+# Writes one .tar.gz archive into ${BACKUP_ROOT}/<service>/<date>/, prints
+# a JSON status line on stdout that the orchestrator captures and folds
+# into the run summary.
+set -uo pipefail
+
+BACKUP_ROOT="{{ backup_root }}"
+SERVICE="$1"
+shift
+PATHS=("$@")
+
+DATE="$(date -u +%Y-%m-%d)"
+DEST_DIR="${BACKUP_ROOT}/${SERVICE}/${DATE}"
+ARCHIVE="${DEST_DIR}/${SERVICE}.tar.gz"
+# Atomic write: build into .partial, mv to final at the end.
+PARTIAL="${ARCHIVE}.partial.$$"
+
+mkdir -p "$DEST_DIR"
+
+cleanup_partial() {
+    rm -f "$PARTIAL"
+}
+trap cleanup_partial EXIT INT TERM
+
+start_ms=$(date +%s%3N)
+
+# Build the tar arg list. -C / keeps absolute paths intact in the archive.
+tar -czf "$PARTIAL" -C / "${PATHS[@]#/}" 2>/tmp/backup-${SERVICE}.err
+rc=$?
+
+duration_ms=$(( $(date +%s%3N) - start_ms ))
+
+if [ "$rc" -ne 0 ]; then
+    err=$(head -c 200 /tmp/backup-${SERVICE}.err 2>/dev/null | tr '\n' ' ')
+    rm -f /tmp/backup-${SERVICE}.err
+    printf '{"service":"%s","method":"tar","status":"fail","bytes":0,"duration_ms":%d,"error":"%s"}\n' \
+        "$SERVICE" "$duration_ms" "$err"
+    exit 1
+fi
+
+# Verify the archive has contents.
+entries=$(tar -tzf "$PARTIAL" 2>/dev/null | wc -l)
+if [ "$entries" -lt 1 ]; then
+    printf '{"service":"%s","method":"tar","status":"fail","bytes":0,"duration_ms":%d,"error":"empty archive"}\n' \
+        "$SERVICE" "$duration_ms"
+    exit 1
+fi
+
+mv -f "$PARTIAL" "$ARCHIVE"
+trap - EXIT INT TERM
+
+bytes=$(stat -c '%s' "$ARCHIVE")
+rm -f /tmp/backup-${SERVICE}.err
+
+printf '{"service":"%s","method":"tar","status":"ok","bytes":%d,"duration_ms":%d,"entries":%d}\n' \
+    "$SERVICE" "$bytes" "$duration_ms" "$entries"

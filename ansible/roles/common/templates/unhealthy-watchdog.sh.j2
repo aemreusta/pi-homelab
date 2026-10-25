@@ -1,0 +1,21 @@
+#!/bin/bash
+# Managed by Ansible. Go owns decisions; retained legacy engine is rollback.
+set -euo pipefail
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+alert_event "unhealthy-watchdog" run ok "engine={{ common_watchdog_engine }}"
+exec /usr/bin/flock -n /var/lock/unhealthy-watchdog.lock \
+{% if common_watchdog_engine == 'go' %}
+    /usr/bin/timeout 240 {{ homelab_runtime_binary | default('/usr/local/bin/homelab-agent') | quote }} unhealthy-watchdog \
+    --docker /usr/bin/docker \
+    --notify-helper /usr/local/bin/watchdog-notify.sh \
+    --state-dir {{ common_watchdog_state_dir | quote }} \
+    --state {{ common_watchdog_ledger | quote }} \
+    --textfile {{ common_watchdog_textfile | quote }} \
+    --log /var/log/unhealthy-watchdog.log \
+    --threshold {{ common_watchdog_unhealthy_threshold | string | quote }} \
+    --max-restarts {{ common_watchdog_max_restarts | string | quote }} \
+    --alert-cooldown {{ common_watchdog_overbudget_alert_cooldown | string | quote }}
+{% else %}
+    /usr/bin/timeout 240 /usr/local/bin/unhealthy-watchdog-legacy.sh
+{% endif %}

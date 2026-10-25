@@ -1,0 +1,137 @@
+#!/bin/bash
+# /usr/local/bin/cpu-load-alert.sh
+# CPU saturation alert via the kernel's 5-min loadavg vs nproc.
+#
+# Why a separate script and not vmalert? No vmalert deployment yet; this
+# closes the dominant outage shape on a 4-core Pi (2026-05-22: load 14.30,
+# one *arr app at 124% CPU, all other metrics green). Same state-file + ntfy
+# hysteresis as memory-alert.sh / pid-budget-alert.sh. Sprint 017 Story 1.
+#
+#   - warn when load5 >= {{ common_cpu_load_warn_ratio | default(1.5) }} × nproc
+#   - urgent when load5 >= {{ common_cpu_load_crit_ratio | default(3.0) }} × nproc
+#   - 24 h cooldown per severity, with a clear event when load5 drops back
+#     below warn (re-arms next escalation)
+#
+# Managed by Ansible (common role) — do not edit manually.
+
+set -uo pipefail
+
+NTFY_URL="{{ ntfy_external_topic_url }}"
+WARN_RATIO="{{ common_cpu_load_warn_ratio | default(1.5) }}"
+CRIT_RATIO="{{ common_cpu_load_crit_ratio | default(3.0) }}"
+COOLDOWN_HOURS={{ common_cpu_load_cooldown_hours | default(24) }}
+STATE_DIR="{{ common_alert_state_dir | default('/var/lib/homelab') }}"
+STATE_FILE="$STATE_DIR/cpu-load-alert.state"
+LOG=/var/log/cpu-load-alert.log
+BESZEL_URL="http://{{ beszel_hostname }}:{{ beszel_port | default(8090) }}"
+
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+mkdir -p "$STATE_DIR"
+
+CORES=$(nproc)
+# Compute warn/crit thresholds as floating point — loadavg is fractional.
+WARN_THRESHOLD=$(awk -v c="$CORES" -v r="$WARN_RATIO" 'BEGIN { printf "%.2f", c * r }')
+CRIT_THRESHOLD=$(awk -v c="$CORES" -v r="$CRIT_RATIO" 'BEGIN { printf "%.2f", c * r }')
+
+# Witness line: proves the 5-min cron fired even when load is healthy.
+alert_event "cpu-load-alert" run ok "cores=${CORES}" "warn=${WARN_THRESHOLD}" "crit=${CRIT_THRESHOLD}"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M') $*" >> "$LOG"
+}
+
+# State file format: "<last_fire_ts>\n<last_load>\n<fired_severity>"
+# fired_severity: 0 = quiet, 1 = warned, 2 = crit
+read_state() {
+    if [ -f "$STATE_FILE" ]; then
+        cat "$STATE_FILE"
+    else
+        printf "0\n0\n0\n"
+    fi
+}
+
+write_state() {
+    local ts="$1" load="$2" sev="$3"
+    printf "%s\n%s\n%s\n" "$ts" "$load" "$sev" > "$STATE_FILE"
+}
+
+# Read 5-min loadavg directly from /proc/loadavg (field 2).
+LOAD5=$(awk '{print $2}' /proc/loadavg)
+NOW=$(date +%s)
+
+mapfile -t s < <(read_state)
+LAST_TS=${s[0]:-0}
+LAST_SEV=${s[2]:-0}
+AGE_HOURS=$(( (NOW - LAST_TS) / 3600 ))
+
+# Determine current severity. awk for floating-point comparison.
+SEV=$(awk -v l="$LOAD5" -v w="$WARN_THRESHOLD" -v c="$CRIT_THRESHOLD" \
+    'BEGIN { if (l+0 >= c+0) print 2; else if (l+0 >= w+0) print 1; else print 0 }')
+
+# Top-3 CPU consumers — useful diagnostic in the ntfy body.
+top_consumers() {
+    docker stats --no-stream --format '{%raw%}{{.Name}}: {{.CPUPerc}}{%endraw%}' 2>/dev/null \
+        | sort -t: -k2 -h -r | head -3
+}
+
+ntfy() {
+    local title="$1" prio="$2" tags="$3" body="$4"
+    ntfy_send "cpu-load-alert" \
+        -H "Title: ${title}" \
+        -H "Priority: ${prio}" \
+        -H "Tags: ${tags}" \
+        -H "Markdown: yes" \
+        -H "Actions: view, Open Beszel, ${BESZEL_URL}, clear=true" \
+        -d "${body}" \
+        "$NTFY_URL" || true
+}
+
+case "$SEV" in
+    2)  # CRIT — re-fire only if escalating or cooldown expired
+        if [ "$LAST_SEV" != "2" ] || [ "$AGE_HOURS" -ge "$COOLDOWN_HOURS" ]; then
+            TOP3=$(top_consumers)
+            ntfy "CPU load CRIT: ${LOAD5} (${CORES} cores)" "urgent" "rotating_light,fire" \
+"**5-min load:** ${LOAD5} (threshold ≥ ${CRIT_THRESHOLD})
+
+**Top CPU consumers:**
+\`\`\`
+${TOP3}
+\`\`\`
+
+SSH may be unresponsive. Check Beszel; consider docker pause / restart of the top consumer."
+            write_state "$NOW" "$LOAD5" 2
+            log "[CRIT] load5=${LOAD5} threshold=${CRIT_THRESHOLD}"
+        else
+            write_state "$LAST_TS" "$LOAD5" 2
+        fi
+        ;;
+    1)  # WARN — re-fire only if rising from quiet, or cooldown elapsed
+        if [ "$LAST_SEV" = "0" ] || [ "$AGE_HOURS" -ge "$COOLDOWN_HOURS" ]; then
+            TOP3=$(top_consumers)
+            ntfy "CPU load warn: ${LOAD5} (${CORES} cores)" "high" "warning,fire" \
+"**5-min load:** ${LOAD5} (threshold ≥ ${WARN_THRESHOLD})
+
+**Top CPU consumers:**
+\`\`\`
+${TOP3}
+\`\`\`
+
+Trending toward saturation. Investigate before SSH lag begins."
+            write_state "$NOW" "$LOAD5" 1
+            log "[WARN] load5=${LOAD5} threshold=${WARN_THRESHOLD}"
+        else
+            write_state "$LAST_TS" "$LOAD5" "$LAST_SEV"
+        fi
+        ;;
+    0)  # Quiet — send one clear event if previously firing
+        if [ "$LAST_SEV" != "0" ]; then
+            ntfy "CPU load recovered: ${LOAD5}" "low" "white_check_mark,fire" \
+"5-min load dropped to ${LOAD5} (was sev=${LAST_SEV}). Alert cleared."
+            log "[CLEARED] load5=${LOAD5} was sev=${LAST_SEV}"
+        fi
+        write_state "$NOW" "$LOAD5" 0
+        ;;
+esac
+
+# Log rotation handled by /etc/logrotate.d/cpu-load-alert (weekly×4).

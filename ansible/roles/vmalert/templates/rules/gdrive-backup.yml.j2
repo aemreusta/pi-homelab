@@ -1,0 +1,105 @@
+# Off-site backup to Google Drive — design 043.
+#
+# This is the ONLY copy of the backup set that survives the Pi losing its disk,
+# which on this box is a live risk (five USB power outages 2026-08-01/02, see
+# docs/conventions/pi4-usb-power-budget.md). An off-site backup that quietly
+# stopped running is worse than none, because you believe you have one.
+#
+# Metrics come from homelab-gdrive-sync.sh via the node_exporter textfile
+# collector, emitted on EVERY exit path including the failures.
+
+groups:
+  - name: gdrive-backup
+    interval: 5m
+    rules:
+
+      # Weekly job (Sunday 05:00). Alert well after two missed runs rather than
+      # one, so a single skipped week during maintenance is not a page — but
+      # never so late that the off-site copy silently rots for a month.
+      - alert: GdriveBackupStale
+        expr: |
+          time() - max(gdrive_backup_last_run_unix_seconds)
+            > {{ vmalert_gdrive_backup_stale_seconds | default(1209600) }}
+        for: 1h
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'off-site backup has not run in {{ '{{ $value | printf "%.0f" }}' }}s'
+          description: 'homelab-gdrive-sync.sh (cron, Sunday 05:00) has not reported a run in over two weeks, so the Google Drive copy is stale and the local backups on the root disk are the only ones left. Check `systemctl status cron`, /var/log/homelab-gdrive-sync.log, and that /root/.config/rclone/rclone.conf still has a valid token — Google refresh tokens can be revoked from the account page.'
+
+      - alert: GdriveBackupFailing
+        expr: max(gdrive_backup_success) == 0
+        for: 15m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'off-site backup to Google Drive FAILED'
+          description: 'The last rclone sync exited non-zero. The off-site copy is now stale — the local set under backup_root is the only backup. Most common causes: expired/revoked OAuth token, Google Drive quota, or a network failure. Log: /var/log/homelab-gdrive-sync.log'
+
+      - alert: GdriveBackupProgressStalled
+        expr: |
+          (gdrive_backup_running == 1)
+          and (time() - gdrive_backup_progress_timestamp_seconds > 900)
+        for: 5m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'off-site backup progress observer stopped updating'
+          description: 'The sync observer is still marked running but has emitted no update for over 15 minutes. Check the sync process and /var/log/homelab-gdrive-rclone.log; an old successful completion does not establish current progress.'
+
+      # A sync that transfers nothing every week is indistinguishable from a
+      # working one on the success gauge alone — rclone exits 0 when the source
+      # is empty. The script refuses an empty source outright (it would DELETE
+      # the off-site copy), but this catches the subtler shape: runs succeed,
+      # nothing ever changes, backups silently stopped being produced.
+      - alert: GdriveBackupNoData
+        expr: |
+          (max(gdrive_backup_success) == 1)
+          and (max_over_time(gdrive_backup_transferred_bytes[{{ vmalert_gdrive_backup_nodata_window | default('30d') }}]) == 0)
+        for: 2h
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'off-site backup succeeded but has moved 0 bytes for {{ vmalert_gdrive_backup_nodata_window | default('30d') }}'
+          description: 'Every sync reports success but nothing has been transferred in a month. Either the weekly local backup stopped producing new files, or the source path is wrong. A green backup that copies nothing is the silent-zero class from CLAUDE.md — verify by listing the remote: rclone ls gdrive:homelab/backups --config /root/.config/rclone/rclone.conf'
+
+      # --- Quota tracking -------------------------------------------------
+      # `> 0` on the denominator is deliberate: if the quota probe breaks the
+      # gauges go to 0, and a plain division would yield NaN — a rule that can
+      # never fire while looking perfectly healthy. Filtering the series out
+      # instead means a broken probe shows up as GdriveBackupStale/Failing
+      # rather than as a silently reassuring 0%.
+      # 5 TB account, ~6 GiB/week of backups. Nowhere near full today, but the
+      # tree is also a general storage channel, so usage is operator-driven and
+      # will not stay predictable. A full Drive fails the sync silently-ish:
+      # rclone errors, GdriveBackupFailing fires, and by then the off-site copy
+      # is already stale.
+      - alert: GdriveQuotaHigh
+        expr: |
+          gdrive_quota_bytes{state="used"}
+            / (gdrive_quota_bytes{state="total"} > 0) * 100
+            >= {{ vmalert_gdrive_quota_warn_pct | default(80) }}
+        for: 1h
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Google Drive at {{ '{{ $value | printf "%.0f" }}' }}%'
+          description: 'The Drive account is filling. Backups are the smallest tenant (~6 GiB/week); check what else is under homelab/ — movies and archive are operator-managed and have no retention policy. Note deletions bypass the Drive trash (--drive-use-trash=false), so freeing space is immediate rather than 30 days delayed.'
+
+      - alert: GdriveQuotaCritical
+        expr: |
+          gdrive_quota_bytes{state="used"}
+            / (gdrive_quota_bytes{state="total"} > 0) * 100
+            >= {{ vmalert_gdrive_quota_crit_pct | default(93) }}
+        for: 15m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'Google Drive CRIT at {{ '{{ $value | printf "%.0f" }}' }}%'
+          description: 'The Drive account is nearly full. The weekly off-site backup will start failing, leaving the local set on the root disk as the only copy — on a 97%-full disk that has failed five times. Free space under homelab/ now.'

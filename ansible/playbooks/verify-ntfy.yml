@@ -1,0 +1,114 @@
+---
+# Verify the ntfy.example plumbing is healthy.
+#
+# Run after a deploy that touched any of: common, ntfy, homelab_control,
+# watchtower, beszel. Cheap (read-only) and idempotent — safe to wire
+# into `make validate` or CI.
+#
+# Covers the three failure modes the PM review flagged:
+#   1. Host DNS regression — ntfy.example must resolve on the Pi to the
+#      LAN IP, regardless of AdGuard state (proves /etc/hosts pin works).
+#   2. ntfy reachability — /v1/health on the resolved address.
+#   3. Container resolution — watchtower runs on a bridge network and
+#      depends on `extra_hosts` (Docker's embedded DNS does NOT consult
+#      the host's /etc/hosts). beszel runs `network_mode: host` and
+#      inherits the host /etc/hosts pin directly, so its check is
+#      implicit in (1).
+#
+# Both watchtower and beszel are scratch-based — no `getent`, no `sh` —
+# so we verify the container's /etc/hosts entry via `docker inspect`
+# instead of exec.
+
+- name: Verify ntfy.example end-to-end
+  hosts: pi
+  become: false
+  gather_facts: true
+
+  vars:
+    verify_ntfy_health_path: /v1/health
+
+  tasks:
+    - name: Resolve ntfy.example on the Pi (must hit /etc/hosts first)
+      ansible.builtin.command:
+        cmd: getent hosts {{ ntfy_hostname }}
+      register: verify_ntfy_host_lookup
+      changed_when: false
+      check_mode: false
+
+    - name: Assert host resolves to the LAN IP
+      ansible.builtin.assert:
+        that:
+          - verify_ntfy_host_lookup.stdout.split()[0] == lan_ip
+        fail_msg: >-
+          {{ ntfy_hostname }} resolved to
+          '{{ verify_ntfy_host_lookup.stdout.split()[0] | default('?') }}'
+          but expected {{ lan_ip }}. Check /etc/hosts and AdGuard rewrites.
+        success_msg: "{{ ntfy_hostname }} → {{ lan_ip }} (OK)"
+
+    - name: Hit ntfy /v1/health
+      ansible.builtin.uri:
+        url: "{{ ntfy_external_base_url }}{{ verify_ntfy_health_path }}"
+        return_content: true
+        status_code: 200
+        timeout: 5
+      register: verify_ntfy_health
+      check_mode: false
+
+    - name: Assert ntfy reports healthy
+      ansible.builtin.assert:
+        that:
+          - verify_ntfy_health.json.healthy | default(false)
+        fail_msg: "ntfy /v1/health returned: {{ verify_ntfy_health.content }}"
+        success_msg: "ntfy /v1/health: healthy"
+
+    # --- watchtower (bridge network): extra_hosts entry must exist ---
+
+    - name: Read watchtower ExtraHosts via docker inspect
+      ansible.builtin.command:
+        cmd: >-
+          docker inspect watchtower
+          --format={% raw %}'{{json .HostConfig.ExtraHosts}}'{% endraw %}
+      register: verify_ntfy_wt_inspect
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Assert watchtower has the ntfy hostname pinned via extra_hosts
+      ansible.builtin.assert:
+        that:
+          - verify_ntfy_wt_inspect.rc == 0
+          # Domain-agnostic (2026-07-15 clean cut): derived from ntfy_hostname,
+          # regex_escape'd so the dots match literally.
+          - >-
+            (verify_ntfy_wt_inspect.stdout | from_json | default([]))
+            | select('match', (ntfy_hostname | regex_escape) ~ ':' ~ (lan_ip | regex_escape) ~ '$')
+            | list | length > 0
+        fail_msg: >-
+          watchtower compose is missing
+          `extra_hosts: ["{{ ntfy_hostname }}:{{ lan_ip }}"]`. Without it, Docker's
+          embedded resolver depends on AdGuard for {{ ntfy_hostname }} — and
+          shoutrrr update notifications go silent during an AdGuard outage.
+        success_msg: "watchtower has {{ ntfy_hostname }} pinned (OK)"
+
+    # --- beszel (host network): inherits host /etc/hosts, already proven by (1) ---
+
+    - name: Confirm beszel is on host networking (inherits host /etc/hosts)
+      ansible.builtin.command:
+        cmd: >-
+          docker inspect beszel
+          --format={% raw %}'{{.HostConfig.NetworkMode}}'{% endraw %}
+      register: verify_ntfy_beszel_inspect
+      changed_when: false
+      check_mode: false
+
+    - name: Assert beszel uses host network
+      ansible.builtin.assert:
+        that:
+          - verify_ntfy_beszel_inspect.stdout | trim == "host"
+        fail_msg: >-
+          beszel is no longer on `network_mode: host` (got
+          '{{ verify_ntfy_beszel_inspect.stdout | trim }}'). It now needs
+          its own `extra_hosts` entry to keep the AdGuard-outage safety
+          net — update beszel/templates/docker-compose.yml.j2 to match
+          watchtower.
+        success_msg: "beszel inherits host /etc/hosts via host networking (OK)"

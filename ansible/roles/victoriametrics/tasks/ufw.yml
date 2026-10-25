@@ -1,0 +1,8 @@
+---
+- name: Allow VictoriaMetrics from LAN
+  community.general.ufw:
+    rule: allow
+    port: "{{ victoriametrics_port }}"
+    proto: tcp
+    src: 192.168.0.0/16
+    comment: VictoriaMetrics HTTP API + vmui

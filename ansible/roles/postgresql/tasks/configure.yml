@@ -1,0 +1,86 @@
+---
+# Database and user provisioning — idempotent via existence checks.
+# Credentials are passed as environment variables (never in argv / process list).
+# no_log guards tasks that carry embedded passwords.
+
+# One user can back multiple databases (Servarr apps use a main + a log
+# database under a single role). Dedup by user so the create loop
+# doesn't issue CREATE USER twice for the same role — the existence check runs
+# for the whole loop BEFORE any create, so duplicate users would both read
+# "missing" and the second CREATE would fail "role already exists".
+- name: Derive unique DB users (dedup for multi-DB-per-user services)
+  ansible.builtin.set_fact:
+    postgresql_db_users: >-
+      {{ postgresql_databases | groupby('user') | map('last') | map('first') | list }}
+
+- name: Check which database users already exist
+  ansible.builtin.command:
+    cmd: >-
+      docker exec postgresql psql -U postgres -At
+      -c "SELECT rolname FROM pg_roles WHERE rolname = '{{ item.user }}'"
+  loop: "{{ postgresql_db_users }}"
+  register: postgresql_role_check
+  changed_when: false
+  # items carry the per-service password — no_log keeps it out of run output.
+  no_log: true
+
+- name: Create missing database users
+  ansible.builtin.command:
+    cmd: >-
+      docker exec
+      -e PGPASSWORD="{{ postgresql_postgres_password }}"
+      postgresql
+      psql -U postgres
+      -c "CREATE USER {{ item.item.user }} WITH LOGIN PASSWORD '{{ item.item.password }}';"
+  loop: "{{ postgresql_role_check.results }}"
+  when: item.stdout.strip() == ''
+  no_log: true
+  changed_when: true
+
+- name: Ensure database user passwords match vault (idempotent rotation)
+  # ALTER ROLE is idempotent and runs every deploy so rotating a vault password
+  # (then re-running the role) updates the live user — fixes the create-only gap.
+  ansible.builtin.command:
+    cmd: >-
+      docker exec
+      -e PGPASSWORD="{{ postgresql_postgres_password }}"
+      postgresql
+      psql -U postgres
+      -c "ALTER ROLE {{ item.user }} WITH LOGIN PASSWORD '{{ item.password }}';"
+  loop: "{{ postgresql_db_users }}"
+  no_log: true
+  changed_when: false
+
+- name: Check which databases already exist
+  ansible.builtin.command:
+    cmd: >-
+      docker exec postgresql psql -U postgres -At
+      -c "SELECT datname FROM pg_database WHERE datname = '{{ item.name }}'"
+  loop: "{{ postgresql_databases }}"
+  register: postgresql_db_check
+  changed_when: false
+  # Loop items carry the per-service password — keep it out of run output.
+  no_log: true
+
+- name: Create missing databases
+  ansible.builtin.command:
+    cmd: >-
+      docker exec postgresql psql -U postgres
+      -c "CREATE DATABASE {{ item.item.name }} OWNER {{ item.item.user }};"
+  loop: "{{ postgresql_db_check.results }}"
+  when: item.stdout.strip() == ''
+  changed_when: true
+  no_log: true
+
+# pg_stat_statements is loaded via shared_preload_libraries (compose command);
+# the extension object must still be created once in a database to expose the
+# view. Idempotent — CREATE EXTENSION IF NOT EXISTS is a no-op after the first
+# run. Requires the library preloaded (restart), which the deploy step applies
+# before this task runs.
+- name: Enable pg_stat_statements extension
+  ansible.builtin.command:
+    cmd: >-
+      docker exec postgresql psql -U postgres -d {{ postgresql_stat_statements_db }}
+      -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+  register: postgresql_pgss_ext
+  changed_when: "'CREATE EXTENSION' in postgresql_pgss_ext.stdout"

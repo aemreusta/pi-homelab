@@ -1,0 +1,37 @@
+---
+- name: Include media stack deploy tasks
+  ansible.builtin.include_tasks:
+    file: deploy.yml
+  tags: [media, qbittorrent]
+
+- name: Include media stack UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [media, firewall]
+
+- name: Include read-only indexer health observation
+  ansible.builtin.include_tasks:
+    file: indexer-health.yml
+    apply:
+      tags: [media, indexer-health]
+  tags: [media, indexer-health]
+
+# `not ansible_check_mode`: configure-jellyfin.yml is a 100% live-API phase and
+# consumes `media_jellyfin_users.json` in a `loop:`. In `--check` mode ansible
+# SKIPS every `uri` task, registering `{skipped: true}` with no `.json`, so the
+# loop crashes at arg finalization and the autodeploy deep-check
+# (`ansible-playbook --check --diff`, default-ON) would brick the next media
+# deploy. Check mode can validate nothing here anyway. 2026-07-02 class —
+# see docs/operations/ops-discipline.md and tests/test_uri_check_mode_safety.py.
+- name: Include Jellyfin playback policy tasks
+  ansible.builtin.include_tasks: configure-jellyfin.yml
+  tags: [media, configure]
+  when: vault_jellyfin_api_key is defined and not ansible_check_mode
+
+# Live-API only, same check-mode gate as Jellyfin above.
+- name: Include Radarr/Sonarr release size tasks
+  ansible.builtin.include_tasks:
+    file: configure-arr-quality.yml
+    apply:
+      tags: [media, configure, arr-quality]
+  tags: [media, configure, arr-quality]
+  when: vault_radarr_api_key is defined and vault_sonarr_api_key is defined and not ansible_check_mode

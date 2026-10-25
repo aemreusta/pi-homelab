@@ -1,0 +1,41 @@
+---
+# Declarative Uptime Kuma settings that aren't exposed as env vars — applied
+# directly to kuma.db via the container's bundled sqlite3. Cheap single-row
+# writes; the bulk heartbeat prune + VACUUM is a separate operational step (see
+# runbook / the retention default comment), not run every deploy.
+
+- name: Set Uptime Kuma heartbeat retention (keepDataPeriodDays)
+  ansible.builtin.command:
+    cmd: >-
+      docker exec uptime-kuma sqlite3 /app/data/kuma.db
+      "UPDATE setting SET value='{{ uptime_kuma_retention_days }}'
+       WHERE key='keepDataPeriodDays' AND value != '{{ uptime_kuma_retention_days }}';
+       SELECT changes();"
+  register: uptime_kuma_retention_set
+  changed_when: uptime_kuma_retention_set.stdout | trim != '0'
+  notify: Restart uptime_kuma
+
+# Reconcile the LIVE ntfy target back to uptime_kuma_ntfy_url.
+#
+# seed.yml cannot do this: it is `never`-tagged AND idempotent-by-skip, so an
+# already-present notification row is left exactly as it was. That is how the
+# dead `http://ntfy.example:2586` survived the .example -> .example.internal
+# cut — the committed JSON was fixed but the row in kuma.db never was, and all
+# 23 monitors silently failed to notify for three weeks with
+# `getaddrinfo ENOTFOUND ntfy.example` buried in the container log.
+#
+# Keyed on json_extract rather than a literal string replace so it repairs ANY
+# future divergence, not just this one hostname. Idempotent: the WHERE clause
+# matches nothing once the URL is correct, so `changes()` returns 0.
+- name: Reconcile Uptime Kuma ntfy server URL to the managed value
+  ansible.builtin.command:
+    cmd: >-
+      docker exec uptime-kuma sqlite3 /app/data/kuma.db
+      "UPDATE notification
+       SET config = json_set(config, '$.ntfyserverurl', '{{ uptime_kuma_ntfy_url }}')
+       WHERE json_extract(config, '$.type') = 'ntfy'
+         AND json_extract(config, '$.ntfyserverurl') != '{{ uptime_kuma_ntfy_url }}';
+       SELECT changes();"
+  register: uptime_kuma_ntfy_url_set
+  changed_when: uptime_kuma_ntfy_url_set.stdout | trim != '0'
+  notify: Restart uptime_kuma

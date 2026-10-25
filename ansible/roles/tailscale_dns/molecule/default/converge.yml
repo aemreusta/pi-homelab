@@ -1,0 +1,35 @@
+---
+- name: Converge
+  hosts: localhost
+  gather_facts: false
+  vars:
+    docker_user: pi
+    timezone: Europe/Istanbul
+    tailscale_ip: "100.64.0.10"
+  pre_tasks:
+    - name: Load role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../defaults/main.yml"
+    - name: Override paths
+      ansible.builtin.set_fact:
+        tailscale_dns_compose_dir: /tmp/molecule-tailscale-dns
+        tailscale_dns_config_dir: /tmp/molecule-tailscale-dns/config
+    - name: Ensure dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ tailscale_dns_compose_dir }}"
+        - "{{ tailscale_dns_config_dir }}"
+    - name: Stub config file
+      ansible.builtin.copy:
+        content: "# stub\n"
+        dest: "{{ tailscale_dns_config_dir }}/dnsmasq.conf"
+        mode: "0644"
+  tasks:
+    - name: Render
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../templates/docker-compose.yml.j2"
+        dest: "{{ tailscale_dns_compose_dir }}/docker-compose.yml"
+        mode: "0644"

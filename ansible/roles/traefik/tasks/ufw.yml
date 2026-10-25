@@ -1,0 +1,52 @@
+---
+- name: Allow HTTP through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ traefik_http_port | string }}"
+    proto: tcp
+    comment: Traefik HTTP
+
+- name: Allow HTTPS through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ traefik_https_port | string }}"
+    proto: tcp
+    comment: Traefik HTTPS
+
+- name: Allow Traefik dashboard through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ traefik_dashboard_port | string }}"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: Traefik Dashboard
+
+# Traefik runs network_mode: host, so :8180 is a HOST port and traffic to it
+# traverses UFW's INPUT chain — unlike a docker-published port, which the
+# DOCKER-USER chain handles and which never reaches INPUT at all. A container
+# therefore arrives here with a bridge source address (homepage is 172.22.0.2),
+# which the LAN-scoped rule above drops. Symptom: homepage's Traefik widget
+# showed `connect ETIMEDOUT 192.0.2.100:8180` while its AdGuard widget on the
+# textually IDENTICAL :8080 rule worked fine — because AdGuard's port is
+# published, not host-owned. Found 2026-09-03.
+#
+# Scoped deliberately to this one port rather than granting the bridge pool
+# blanket access: the dashboard is read-only routing metadata and was already
+# reachable from the whole LAN, so admitting local containers to exactly it is
+# a smaller widening than what already exists.
+- name: Allow Traefik dashboard from Docker bridges (host-network port, INPUT chain)
+  community.general.ufw:
+    rule: allow
+    port: "{{ traefik_dashboard_port | string }}"
+    proto: tcp
+    from_ip: "{{ docker_bridge_subnet }}"
+    comment: Traefik Dashboard (docker bridges — host-network port)
+
+# One-time reconciliation of the pre-2026-07-14 Anywhere dashboard rule (NOT
+# :80/:443, which stay Anywhere as the reverse-proxy entrypoints). Idempotent.
+- name: Remove superseded Anywhere dashboard rule (migrated to LAN scope, Phase 0)
+  community.general.ufw:
+    rule: allow
+    port: "{{ traefik_dashboard_port | string }}"
+    proto: tcp
+    delete: true

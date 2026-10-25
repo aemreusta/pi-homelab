@@ -1,0 +1,44 @@
+---
+homelab_control_dir: /opt/homelab/control
+homelab_control_port: 9099
+homelab_control_token: "{{ vault_homelab_control_token }}"
+homelab_control_junk_scan_dirs:
+  - /srv/downloads
+  - /srv/media
+
+# ntfy publish endpoint — resolved via split-DNS (ntfy.example), works
+# uniformly from host scripts whether the user is on LAN or Tailscale.
+# Defined once in group_vars/all/main.yml as ntfy_external_topic_url.
+homelab_control_ntfy_url: "{{ ntfy_external_topic_url }}"
+
+# External reachable URL for ntfy action buttons that open the Control
+# API panel. Sprint 016 Story 1: switched from raw LAN IP to hostname so
+# the URL works from cellular over Tailscale (LAN IP is unreachable when
+# the phone is off the home network). Split-DNS handles resolution
+# (AdGuard wildcard on LAN, dnsmasq on Tailscale).
+# Override per host via `homelab_control_external_url` in group/host vars.
+homelab_control_external_url: "https://{{ control_hostname }}"
+
+# On-host URL for Pi-side scripts (cron jobs, alert scripts) that call the
+# control API. Points to loopback because the API binds 127.0.0.1 only —
+# external access goes through Traefik reverse proxy.
+homelab_control_internal_url: "http://127.0.0.1:{{ homelab_control_port }}"
+
+# Mac compute offload monitoring
+homelab_control_offload_status_file: /opt/homelab/control/offload-status.json
+homelab_control_offload_log_file: /var/log/mac-offload.log
+
+# Backup integration (Sprint 10). Paths must match the backup role's
+# `backup_state_file` and `backup_log` defaults; we don't pull them
+# through here because role-to-role var inheritance is fragile —
+# duplicate-and-keep-in-sync is the safer pattern.
+homelab_control_backup_state_file: /var/lib/homelab/backup.state
+homelab_control_backup_log_file: /var/log/homelab-backup.log
+homelab_control_backup_script: /usr/local/bin/homelab-backup.sh
+homelab_control_backup_log_tail_lines: 50
+
+# Directories outside /srv whose bytes are on the root disk and matter to the
+# operator. `_dir_size` uses `du -x` semantics, so it will not descend into a
+# filesystem mounted under /srv — list such a tree's on-disk location here so
+# the panel can still show what is actually on disk. Empty by default.
+homelab_control_extra_size_dirs: []

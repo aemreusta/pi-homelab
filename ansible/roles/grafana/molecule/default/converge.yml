@@ -1,0 +1,36 @@
+---
+- name: Converge — render Grafana templates to tmp dir for assertion
+  hosts: localhost
+  gather_facts: false
+  vars:
+    docker_user: pi
+    timezone: Europe/Istanbul
+    vault_grafana_admin_password: ""
+  pre_tasks:
+    - name: Load role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../defaults/main.yml"
+
+    - name: Override paths to tmp sandbox
+      ansible.builtin.set_fact:
+        grafana_compose_dir: /tmp/molecule-grafana
+        grafana_data_dir: /tmp/molecule-grafana/data
+        grafana_provisioning_dir: /tmp/molecule-grafana/provisioning
+        grafana_dashboards_dir: /tmp/molecule-grafana/dashboards
+
+    - name: Ensure sandbox dirs exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ grafana_compose_dir }}"
+        - "{{ grafana_data_dir }}"
+        - "{{ grafana_provisioning_dir }}"
+        - "{{ grafana_dashboards_dir }}"
+  tasks:
+    - name: Render docker-compose.yml
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../templates/docker-compose.yml.j2"
+        dest: "{{ grafana_compose_dir }}/docker-compose.yml"
+        mode: "0644"

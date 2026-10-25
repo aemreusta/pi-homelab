@@ -1,0 +1,46 @@
+---
+# Docker manages its own iptables rules for container networking.
+# The DOCKER-USER chain is evaluated BEFORE Docker's own rules,
+# giving us control over which traffic reaches containers.
+#
+# Strategy:
+#   - Pass through traffic from Docker bridges (container outbound)
+#   - Allow LAN (192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12)
+#   - Allow Tailscale (100.64.0.0/10)
+#   - Allow established/related connections
+#   - Drop everything else destined for containers
+#
+# NOTE: iptables-persistent conflicts with UFW, so we use a
+# standalone systemd oneshot unit to load rules after Docker starts.
+
+- name: Create iptables rules directory
+  ansible.builtin.file:
+    path: /etc/iptables
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Configure DOCKER-USER chain rules
+  ansible.builtin.template:
+    src: docker-user-iptables.j2
+    dest: /etc/iptables/docker-user-rules.v4
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload docker user iptables
+
+- name: Install docker-user-iptables systemd unit
+  ansible.builtin.template:
+    src: docker-user-iptables.service.j2
+    dest: /etc/systemd/system/docker-user-iptables.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload docker user iptables
+
+- name: Enable docker-user-iptables service
+  ansible.builtin.systemd:
+    name: docker-user-iptables
+    enabled: true
+    daemon_reload: true

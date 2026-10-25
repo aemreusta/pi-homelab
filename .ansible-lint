@@ -1,0 +1,74 @@
+---
+offline: true
+
+exclude_paths:
+  # Two forms each — when ansible-lint runs from the repo root (pre-commit hook)
+  # paths begin with "ansible/", but when it runs from inside ansible/ (Makefile)
+  # paths begin with "roles/". Both patterns are required.
+  - roles/*/tests/
+  - roles/*/molecule/
+  - roles/*/molecule
+  - ansible/roles/*/tests/
+  - ansible/roles/*/molecule/
+  - ansible/roles/*/molecule
+  - inventory/group_vars/all/vault.yml
+  - ansible/inventory/group_vars/all/vault.yml
+
+mock_roles:
+  - common
+  - security
+  - storage
+  - docker
+  - adguard
+  - authelia
+  - portainer
+  - media
+  - watchtower
+  - homepage
+  - beszel
+  - filebrowser
+  - homelab_control
+  - homelab_runtime
+  - tailscale
+  - tailscale_dns
+  - traefik
+  - jellyseerr
+  - ntfy
+  - nfs_server
+  - victorialogs
+  - victoriametrics
+  - vmagent
+  - node_exporter
+  - cadvisor
+  - grafana
+  - fluentbit
+  - backup
+  - vmalert
+  - alertmanager
+  - uptime_kuma
+  - speedtest_tracker
+  - postgresql
+  - minio
+  - mlflow
+  - label_studio
+  - zot
+  - github_runner_metrics
+  - homelab_autodeploy
+  - gdrive_backup
+
+mock_modules:
+  - community.general.timezone
+  - community.general.ufw
+  - community.general.htpasswd
+  - community.docker.docker_login
+  - ansible.posix.sysctl
+  - ansible.posix.mount
+  - ansible.posix.acl
+  - community.docker.docker_compose_v2
+  - community.docker.docker_container
+  - community.docker.docker_image_info
+  - community.docker.docker_network
+
+# args[module] fires false positives for mocked modules in offline mode
+skip_list:
+  - args[module]

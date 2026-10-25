@@ -1,0 +1,524 @@
+# Host-saturation alert rules — Sprint 18 Story 2.
+# These mirror the cron-based scripts (cpu-load-alert.sh, pid-budget-alert.sh,
+# disk-alert.sh, memory-alert.sh) for parallel-run. Once vmalert has soaked
+# for 1 week and the operator confirms parity, the cron entries get gated off
+# via `common_use_vmalert: true` (default false → true after soak).
+#
+# Datasource: node-exporter (host metrics) + cAdvisor (container metrics).
+
+groups:
+  - name: host-saturation
+    interval: 1m
+    rules:
+
+      # ── CPU load (sole owner; cpu-load-alert.sh is off under vmalert) ─
+      # These are the host's only flap-free CPU alerts (2026-10-15). Until
+      # then the selector said job="node" while the scrape job is
+      # "node-exporter": both rules matched zero series, and CPU paging came
+      # from Beszel's 85% rule, which has no hysteresis and pushed an
+      # above/below pair every few minutes while a Tdarr log flood held the
+      # host at ~85% for 30 h. `for` filters the normal short bursts and
+      # keep_firing_for holds one episode open across brief dips. Backtest
+      # over 10-05..10-13: the 30m window fired only on the genuine 10-09
+      # saturation day.
+      - alert: CPULoadHigh
+        expr: |
+          node_load5{job="node-exporter"} /
+          count(count(node_cpu_seconds_total{job="node-exporter"}) by (cpu)) >= {{ vmalert_cpu_load_warn_ratio }}
+        for: 30m
+        keep_firing_for: 30m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "CPU load high on homelab"
+          description: "5-min load {{ '{{ $value }}' }} >= {{ vmalert_cpu_load_warn_ratio }}x cores. Investigate before SSH lag begins."
+
+      - alert: CPULoadCritical
+        expr: |
+          node_load5{job="node-exporter"} /
+          count(count(node_cpu_seconds_total{job="node-exporter"}) by (cpu)) >= {{ vmalert_cpu_load_crit_ratio }}
+        for: 10m
+        keep_firing_for: 30m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: "CPU load CRIT on homelab"
+          description: "5-min load {{ '{{ $value }}' }} >= {{ vmalert_cpu_load_crit_ratio }}x cores. SSH may be unresponsive."
+
+      # ── Memory / swap pressure (mirrors memory-alert.sh) ─────────────
+      - alert: SwapUsageHigh
+        expr: |
+          (node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes) /
+          node_memory_SwapTotal_bytes * 100 >= {{ common_swap_alert_high_pct | default(85) }}
+        for: 30m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Swap at {{ '{{ $value | printf "%.0f" }}' }}%'
+          description: "Sustained swap usage above {{ common_swap_alert_high_pct | default(85) }}% for 30m. Pi has a single 6 GiB zram swap device (writeback to /var/swap on SSD) — see rpi-swap redesign 2026-05-26. Effective surface is less than the old 12 GiB layout, so OOM risk is real if container limits sum > RAM + 6 GiB."
+
+      - alert: OOMKilled
+        expr: increase(node_vmstat_oom_kill[1h]) > 0
+        for: 1m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: "OOM kill detected"
+          description: "Kernel OOM-killer fired in the last hour."
+
+      # ── Disk usage (mirrors disk-alert.sh) ───────────────────────────
+      # /srv is a *directory* on the root SSD, NOT its own mountpoint —
+      # node_exporter only reports the underlying filesystem at `/`.
+      # Querying mountpoint="/srv" returns an empty series, so the
+      # earlier version of these rules silently never fired. If a separate
+      # data disk is ever mounted at /srv, flip the label back to /srv.
+      - alert: SrvDiskHigh
+        expr: |
+          (node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"} - node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"}) /
+          node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"} * 100 >= {{ common_disk_alert_threshold | default(85) }}
+        for: 10m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'root fs (hosts /srv) at {{ '{{ $value | printf "%.0f" }}' }}%'
+          description: "Storage trending toward full. 1.8 TB SSD; check the transcode cache, qBit downloads and the media library."
+
+      - alert: SrvDiskCritical
+        expr: |
+          (node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"} - node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"}) /
+          node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"} * 100 >= {{ common_disk_alert_crit_threshold | default(90) }}
+        for: 10m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'root fs (hosts /srv) CRIT at {{ '{{ $value | printf "%.0f" }}' }}%'
+          description: "Storage critical. Imports will start failing soon. Reclaim deliberately — NOT a blind prune; media is never deleted without the operator."
+
+      # ── Predictive disk fill (early-warning ahead of SrvDiskCritical) ──
+      # SrvDiskCritical only fires at {{ common_disk_alert_crit_threshold | default(90) }}% — by then you have hours, not days.
+      # This projects the last-24h fill trend forward 7d and fires if free
+      # space is heading below 5% (i.e. 95% full) within that window, giving
+      # a week of lead time to act deliberately instead of at 02:47.
+      #
+      # mountpoint="/" is DELIBERATE and was verified on the Pi 2026-05-29:
+      # /dev/sda is mounted at / only; /srv is a *directory* on that root
+      # ext4 fs (df /srv → /dev/sda at /). node_exporter exports only
+      # mountpoint="/", so mountpoint="/srv" returns an EMPTY series and the
+      # rule would never fire. (This corrects the PM-review B2 assumption that
+      # /srv is a separate filesystem — it is not on this host.) Must stay in
+      # lockstep with SrvDiskHigh/SrvDiskCritical above.
+      #
+      # Single-series ratio form (avail/size) keeps predict_linear label-safe
+      # — no cross-series join between two metrics. The [24h:1h] subquery
+      # samples the ratio hourly; predict_linear extrapolates 7*86400 s ahead.
+      #
+      # `max by (mountpoint)` is LOAD-BEARING, added 2026-08-02 after catching
+      # this rule firing on a ghost. node_exporter labels the series with
+      # `device`, and this host RENAMES its root device when the USB bus
+      # re-enumerates (documented, recurring — pi4-usb-power-budget.md). Measured
+      # that day: 2,366 samples on /dev/sda and **13** on /dev/sdb over 24h, none
+      # on sdb for 6h. Without the aggregation the [24h:1h] window spans BOTH
+      # series, and predict_linear happily extrapolated 7 days forward from the
+      # dead one — reporting 0.66% free while the live series was fine. The
+      # `unless` was equally broken: left side device=/dev/sdb, right side
+      # device=/dev/sda, so it could never match and never suppressed anything.
+      # `mountpoint="/"` already identifies this filesystem uniquely, so `device`
+      # carries no information and only splits the series. Guard:
+      # TestDiskThresholds::test_disk_rules_aggregate_away_the_device_label.
+      # Operator exit-criterion (what to do at the crit line): docs/runbooks/037-2026-05-29-srv-disk-fill-exit-criterion.md.
+      #
+      # The trailing `unless` (added 2026-08-02) suppresses this once the disk is
+      # ALREADY past the crit threshold. A 7-day forecast of a state that has
+      # arrived is not early warning, it is a second copy of SrvDiskCritical —
+      # and for weeks all three disk rules paged simultaneously about the one
+      # fact "the disk is full". Alertmanager already inhibits SrvDiskHigh under
+      # SrvDiskCritical; this closes the same hole at the rule level, where the
+      # predicate is expressible. Fail-open by construction: if the label sets
+      # ever stop matching, `unless` drops nothing and the alert still fires.
+      - alert: SrvDiskFillRateHigh
+        expr: |
+          predict_linear(
+            (
+              max by (mountpoint) (
+                node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"} /
+                node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"}
+              )
+            )[24h:1h],
+            7 * 86400
+          ) < {{ vmalert_srv_disk_fill_rate_floor | default(0.05) }}
+          unless
+          max by (mountpoint) (
+            (node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"} - node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"}) /
+            node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"} * 100
+          ) >= {{ common_disk_alert_crit_threshold | default(90) }}
+        for: {{ vmalert_srv_disk_fill_rate_for | default('2h') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'root fs (/srv) projected below the free-space floor within 7d'
+          description: 'On the last-24h fill rate, free space on / (hosts /srv) is trending below the configured floor (default 5%) within 7 days (predicted free ratio {{ "{{ $value | printf \"%.3f\" }}" }}). Early warning ahead of SrvDiskCritical@{{ common_disk_alert_crit_threshold | default(90) }}%. Decide now — operator exit-criterion + candidate actions in runbook 037. Reclaim path is the Google Drive archive tier (design 044). NO automatic prune (no-data-removal rule).'
+
+{% if storage_ssd2_enabled | default(false) %}
+      # ── Second data disk: Kingston XS1000 @ {{ storage_ssd2_mount | default('/mnt/ssd2') }} ──
+      #
+      # GATED on storage_ssd2_enabled (2026-08-02). These rules ship WITH the
+      # mount and must retire WITH it. When the drive was pulled, DataDiskMissing
+      # kept firing crit forever — `absent()` on a filesystem that no longer
+      # exists is true by definition. That left BOTH of this host's crit alerts
+      # permanently on, which is how a severity class stops carrying information.
+      # Flip storage_ssd2_enabled back to true (with a powered USB3 hub) and the
+      # monitoring returns with the disk. Guard: tests/test_vmalert_rules.py
+      # TestSecondDiskRulesAreGated.
+      # Added with the mount itself (design 042 Phase 1) — a new filesystem that
+      # no rule selects is a disk that silently fills. The Srv* rules above
+      # deliberately stay pinned to mountpoint="/" so their thresholds and
+      # descriptions keep meaning exactly one thing.
+      #
+      # This drive is on a KNOWN-marginal USB power budget and has dropped off
+      # the bus four times (docs/conventions/pi4-usb-power-budget.md). It is
+      # mounted `nofail`, so a dropout does NOT wedge boot — it just silently
+      # disappears. Hence DataDiskMissing: absence is the expected failure here,
+      # and an absent series fires nothing unless you ask for it explicitly.
+      - alert: DataDiskMissing
+        expr: absent(node_filesystem_size_bytes{mountpoint="{{ storage_ssd2_mount | default('/mnt/ssd2') }}"})
+        for: 5m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'second SSD is GONE from {{ storage_ssd2_mount | default("/mnt/ssd2") }}'
+          description: "The Kingston XS1000 is no longer mounted. It is fstab'd `nofail`, so the Pi boots and runs without it — nothing else will tell you. Backups abort by design (backup_require_mountpoint) rather than silently filling the root disk, so expect a backup-aborted alert too. This drive runs directly off the Pi's USB ports, which cannot reliably power two bus-powered SSDs; the fix is a powered USB3 hub. Check `lsblk`, `blkid`, `dmesg -T | grep -i usb`, and docs/conventions/pi4-usb-power-budget.md."
+
+      - alert: DataDiskReadOnly
+        expr: node_filesystem_readonly{mountpoint="{{ storage_ssd2_mount | default('/mnt/ssd2') }}"} == 1
+        for: 2m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'second SSD remounted READ-ONLY'
+          description: "ext4 hit an unrecoverable I/O error on the Kingston and remounted it read-only. On this host that has always meant the drive dropped off the USB bus, not that the flash wore out. Anything writing there (backups first) is now failing. Do not try to fix it live — power-cycle. docs/conventions/pi4-usb-power-budget.md"
+
+      - alert: DataDiskHigh
+        expr: |
+          (node_filesystem_size_bytes{mountpoint="{{ storage_ssd2_mount | default('/mnt/ssd2') }}"} - node_filesystem_avail_bytes{mountpoint="{{ storage_ssd2_mount | default('/mnt/ssd2') }}"}) /
+          node_filesystem_size_bytes{mountpoint="{{ storage_ssd2_mount | default('/mnt/ssd2') }}"} * 100 >= {{ vmalert_data_disk_warn_pct | default(80) }}
+        for: 30m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'second SSD at {{ '{{ $value | printf "%.0f" }}' }}%'
+          description: 'The Kingston (931 GiB) is filling. It holds backups, and later media + downloads (design 042 §3). Decide before it reaches the critical threshold — the root disk is at 97% and cannot absorb an overflow. NO automatic prune (no-data-removal rule).'
+
+      - alert: DataDiskCritical
+        expr: |
+          (node_filesystem_size_bytes{mountpoint="{{ storage_ssd2_mount | default('/mnt/ssd2') }}"} - node_filesystem_avail_bytes{mountpoint="{{ storage_ssd2_mount | default('/mnt/ssd2') }}"}) /
+          node_filesystem_size_bytes{mountpoint="{{ storage_ssd2_mount | default('/mnt/ssd2') }}"} * 100 >= {{ vmalert_data_disk_crit_pct | default(93) }}
+        for: 10m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'second SSD CRIT at {{ '{{ $value | printf "%.0f" }}' }}%'
+          description: 'The Kingston is nearly full. Backups will start aborting on the free-space gate (backup_min_free_gb), and imports targeting this disk will fail. The root filesystem is at 97% and is NOT a fallback.'
+{% endif %}
+
+      # ── Storage-stack integrity (2026-08-01 USB root-dropout) ────────
+      # NOT gated on storage_ssd2_enabled — these watch the ROOT disk, which
+      # is what actually dropped off the bus on 2026-08-01.
+      # A second bus-powered USB3 SSD was attached; the ROOT SanDisk SSD
+      # dropped off the bus, re-enumerated (/dev/sdb -> /dev/sdc), and ext4
+      # honoured errors=remount-ro. The Pi then ran read-only for ~15 min:
+      # sshd reset every connection, 40 of 41 containers were down, and NOT
+      # ONE alert fired because vmalert/Alertmanager/ntfy all live on the
+      # failed disk. node_exporter survived (host network, already resident,
+      # read-only scrape) and was exporting the answer the whole time:
+      #   node_filesystem_readonly{mountpoint="/"} 1
+      #
+      # These rules close the in-band gap. They do NOT close the out-of-band
+      # gap — when the disk dies hard enough to take vmalert with it, only an
+      # off-Pi watchdog can page. That is TODO §Storage-watchdog.
+      # Incident: docs/incidents/2026-08-01-usb-ssd-root-dropout-readonly.md
+      - alert: RootFilesystemReadOnly
+        expr: node_filesystem_readonly{mountpoint="/",fstype!~"tmpfs|ramfs"} == 1
+        for: 1m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'root filesystem is READ-ONLY'
+          description: "ext4 remounted / read-only (errors=remount-ro), which means the kernel hit an unrecoverable I/O error — on this host that has meant the USB SSD dropped off the bus, not that the flash wore out. Nothing can write: containers, sshd sessions and cron are all degraded or dead. Do NOT try to fix this live — check `dmesg -T | grep -iE 'uas|reset|I/O error'` and `lsblk` for a re-enumerated device, then power-cycle. Root mounts by UUID so the device-letter change is survivable. Runbook: docs/incidents/2026-08-01-usb-ssd-root-dropout-readonly.md"
+
+      # Fatal classes: the storage stack is failing RIGHT NOW. Threshold is
+      # >0 because a single 'rejecting I/O to offline device' is already the
+      # disk being gone. Series is zero-filled by kernel_io_scan.py, so this
+      # rule always has something to evaluate (an absent series would make it
+      # silently un-fireable — the textfile trap in CLAUDE.md).
+      - alert: HostStorageFaultsFatal
+        expr: max by (class) (homelab_kernel_io_events{severity="fatal"}) > 0
+        for: 2m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'kernel storage fault: {{ '{{ $labels.class }}' }} x{{ '{{ $value | printf "%.0f" }}' }}'
+          description: 'The kernel logged {{ "{{ $value | printf \"%.0f\" }}" }} {{ "{{ $labels.class }}" }} event(s) this boot — ext4 errors, journal aborts, block I/O failures or an offline SCSI device. Data is at risk. Counts are per-boot gauges (they reset on reboot by design), so do NOT wrap this in rate()/increase(). Check: journalctl -k -b | grep -iE "ext4-fs error|I/O error|offline"'
+
+      # Dropout tier: a storage device left the bus, or the controller
+      # reported over-current. Every drive on this host is permanently
+      # attached, so ONE occurrence is signal — the 2026-08-01 incident
+      # logged exactly one line, `usb 2-1: USB disconnect, device number 2`,
+      # and nothing else. A >=2 threshold would have missed it entirely.
+      # Expect a benign firing whenever the operator physically adds or
+      # removes a drive; that is the correct trade.
+      - alert: HostStorageLinkDropout
+        expr: max by (class) (homelab_kernel_io_events{severity="dropout"}) > 0
+        for: 2m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'USB storage device left the bus: {{ '{{ $labels.class }}' }} x{{ '{{ $value | printf "%.0f" }}' }}'
+          description: 'A storage device disconnected from USB, or the controller reported over-current. If nobody physically touched the Pi, this is the Pi 4B USB power budget being exceeded — the 2026-08-01 shape, where the root SSD browned out during spin-up while a second bus-powered SSD was attached, re-enumerated as a 0-byte disk, and took the root filesystem read-only ~8 minutes later. Check `lsblk` for a device that changed letter or reports 0B, and move any second bus-powered drive onto a POWERED USB3 hub. Incident: docs/incidents/2026-08-01-usb-ssd-root-dropout-readonly.md'
+
+      # Precursor tier: the link flapped and the kernel RECOVERED.
+      # Threshold defaults to 2 rather than 1: a single reset during boot
+      # enumeration is normal on this hardware, and an alert that fires every
+      # reboot gets muted within a week (the alert-fatigue failure mode).
+      - alert: HostStorageFaultsPrecursor
+        expr: max by (class) (homelab_kernel_io_events{severity="precursor"}) >= {{ vmalert_kernel_io_precursor_threshold | default(2) }}
+        for: 10m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'USB storage link unstable: {{ '{{ $labels.class }}' }} x{{ '{{ $value | printf "%.0f" }}' }}'
+          description: 'The kernel logged {{ "{{ $value | printf \"%.0f\" }}" }} recoverable {{ "{{ $labels.class }}" }} event(s) this boot (UAS abort, link reset, disconnect or USB over-current). The link is flapping but has recovered so far — this is the precursor to a full dropout and a read-only root. On a Pi 4B the usual cause is the shared USB power budget: check what else is plugged in, and move any second bus-powered drive onto a POWERED USB3 hub. Escalates to RootFilesystemReadOnly if it degrades.'
+
+      # ── The fault that ended the PREVIOUS boot ───────────────────────
+      # Added 2026-08-02. Every rule above reads a per-boot gauge, and the
+      # failure they exist to catch — dropout, host death, reboot — resets
+      # those gauges to 0 before the `for:` window can elapse. Verified: a
+      # usb_disconnect ended a boot at 02:58 and minutes later every class
+      # read 0. The outage destroys its own evidence.
+      #
+      # kernel_io_scan.py now promotes the dying boot's counts into
+      # *_last_boot on the first scan after the boot id changes (the .prom
+      # file outlives the reboot; dmesg does not). This rule is what makes
+      # that snapshot observable — an emitted-but-unselected series is the
+      # same silent class as an unwatched textfile metric.
+      #
+      # Deliberately fatal+dropout only: precursor resets are normal during
+      # boot enumeration on this hardware, so including them here would fire
+      # after almost every reboot and get muted (the HostStorageFaultsPrecursor
+      # threshold=2 reasoning, applied to the snapshot).
+      #
+      # Read together with HostUnexpectedReboot: "we restarted" AND "the
+      # previous boot ended in a storage fault" is the signal. Either alone
+      # is ambiguous.
+      - alert: HostPreviousBootEndedInStorageFault
+        expr: max by (class) (homelab_kernel_io_events_last_boot{severity=~"fatal|dropout"}) > 0
+        for: {{ vmalert_kernel_io_last_boot_for | default('5m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'previous boot ended with {{ '{{ $labels.class }}' }} x{{ '{{ $value | printf "%.0f" }}' }}'
+          description: 'The boot BEFORE this one logged a fatal or dropout-class storage fault, and the host is now running again — i.e. the Pi did not shut down cleanly, it died with storage failing. The live homelab_kernel_io_events series was zeroed by the reboot, so this snapshot is the only surviving evidence; do not read the live series as "all clear". Check `journalctl --list-boots` for a boot with no shutdown target, then `journalctl -k -b -1 | tail -40` for the last lines before it stopped. On a Pi 4B the usual cause is the shared USB power budget — docs/conventions/pi4-usb-power-budget.md. This alert clears on the next clean boot.'
+
+      # Silent-cron guard: kernel-io-scan.sh runs every 5m. If the timestamp
+      # stops advancing the fault gauges freeze at their last value and look
+      # reassuringly healthy — the silent-zero class from CLAUDE.md.
+      - alert: KernelIOScanStale
+        expr: time() - max(homelab_kernel_io_scan_timestamp_seconds) > {{ vmalert_kernel_io_scan_stale_seconds | default(3600) }}
+        for: 15m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'kernel storage-fault scan stale ({{ '{{ $value | printf "%.0f" }}' }}s)'
+          description: "kernel-io-scan.sh (cron, every 5m, node_exporter role) has not refreshed its textfile in over an hour, so homelab_kernel_io_events is frozen and RootFilesystemReadOnly's companion rules are blind. Check `systemctl status cron`, /var/lib/node_exporter/textfile/kernel_io.prom mtime, and that journalctl -k still works."
+
+      # ── PID budget per container (mirrors pid-budget-alert.sh) ───────
+      # cAdvisor exports `container_processes` (current) and
+      # `container_spec_pids_limit_total` (limit). Skip series where limit=0.
+      - alert: ContainerPIDBudgetHigh
+        expr: |
+          (container_processes{name!="",name!="POD"} /
+           on(id) container_spec_pids_limit_total{name!="",name!="POD"} * 100) >= {{ common_pid_budget_warn_pct | default(70) }}
+          unless on(id) container_spec_pids_limit_total == 0
+        for: 15m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'PID budget {{ '{{ $value | printf "%.0f" }}' }}% on {{ '{{ $labels.name }}' }}'
+          description: "Container {{ '{{ $labels.name }}' }} approaching PID limit. byparr/Camoufox leak suspected if this is byparr."
+
+      - alert: ContainerPIDBudgetCritical
+        expr: |
+          (container_processes{name!="",name!="POD"} /
+           on(id) container_spec_pids_limit_total{name!="",name!="POD"} * 100) >= {{ common_pid_budget_crit_pct | default(90) }}
+          unless on(id) container_spec_pids_limit_total == 0
+        for: 5m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'PID budget CRIT {{ '{{ $value | printf "%.0f" }}' }}% on {{ '{{ $labels.name }}' }}'
+          description: "Container {{ '{{ $labels.name }}' }} at >=90% PID limit. Restart imminent if it climbs further."
+
+      # ── Container memory headroom vs its OWN mem_limit ───────────────
+      # Added 2026-08-02 after a 20-day sweep found 41 containers carrying a
+      # `mem_limit` and NOT ONE rule observing any of them. Measured over that
+      # window, six ran at >=99% of their own cap the whole time — mlflow,
+      # homepage, tdarr, byparr at 100%, minio 99.5%, jellyseerr 99.1% — with
+      # zero OOM kills. They survive by reclaiming at the boundary, which is
+      # luck holding rather than a margin, and nothing would have told us if it
+      # stopped holding. Same silent-zero shape CLAUDE.md legislates for cron.
+      #
+      # METRIC CHOICE IS LOAD-BEARING — read before editing:
+      #   container_memory_usage_bytes       INCLUDES reclaimable page cache.
+      #                                      Measured that way 13 containers
+      #                                      read a flat ~100% and this alert
+      #                                      becomes permanent noise → muted →
+      #                                      strictly worse than no rule.
+      #   container_memory_working_set_bytes usage minus inactive file cache.
+      #                                      The real pressure signal. USE THIS.
+      # Pinned by tests/test_vmalert_rules.py::TestContainerMemoryHeadroom.
+      # Rationale: docs/conventions/container-mem-limits.md.
+      #
+      # This does NOT contradict the ceiling-sum overcommit convention. The
+      # caps intentionally sum past RAM; that is containment by design and is
+      # not what is alerted here. What is alerted is ONE container against ITS
+      # OWN declared cap — the case where a limit is genuinely too tight.
+      # Never "fix" a firing instance by shrinking some other container.
+      #
+      # `on(id)` because working-set and the spec limit share the cAdvisor
+      # cgroup id; `group_left()` because MetricsQL's plain `on(id)` keeps
+      # ONLY `id` on the result, which rendered `$labels.name` empty (the
+      # 2026-10-02 page named no container). `unless ... == 0` drops
+      # unlimited containers (limit 0), which would otherwise divide to +Inf
+      # and fire forever.
+      - alert: ContainerMemoryHeadroomLow
+        expr: |
+          (container_memory_working_set_bytes{name!="",name!="POD"} /
+           on(id) group_left() container_spec_memory_limit_bytes{name!="",name!="POD"} * 100) >= {{ vmalert_container_mem_warn_pct | default(85) }}
+          unless on(id) container_spec_memory_limit_bytes == 0
+        for: {{ vmalert_container_mem_for | default('30m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: '{{ '{{ $labels.name }}' }} at {{ '{{ $value | printf "%.0f" }}' }}% of its mem_limit'
+          description: 'Working set has held above {{ vmalert_container_mem_warn_pct | default(85) }}% of this container''s OWN mem_limit for {{ vmalert_container_mem_for | default("30m") }}. It has no headroom left for a burst. Raise THIS container''s limit (roles/<svc>/defaults/main.yml) after checking the live working set — do NOT shrink other containers to compensate, and do NOT reason from the sum of all mem_limit values, which overcommits RAM by design. docs/conventions/container-mem-limits.md'
+
+      - alert: ContainerMemoryHeadroomCritical
+        expr: |
+          (container_memory_working_set_bytes{name!="",name!="POD"} /
+           on(id) group_left() container_spec_memory_limit_bytes{name!="",name!="POD"} * 100) >= {{ vmalert_container_mem_crit_pct | default(95) }}
+          unless on(id) container_spec_memory_limit_bytes == 0
+        for: {{ vmalert_container_mem_crit_for | default('10m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: '{{ '{{ $labels.name }}' }} CRIT {{ '{{ $value | printf "%.0f" }}' }}% of its mem_limit'
+          description: 'Working set is within {{ 100 - (vmalert_container_mem_crit_pct | default(95)) }}% of this container''s cap — the cgroup OOM killer is the next event, and `restart: unless-stopped` will mask it as a silent restart. Check `docker stats --no-stream` and raise this one container''s mem_limit. docs/conventions/container-mem-limits.md'
+
+      # ── Host restarted ───────────────────────────────────────────────
+      # Added 2026-08-02. Seven boots in 5.5h on 2026-08-01/02 produced ZERO
+      # pages. Those were operator-initiated and fine in themselves; the defect
+      # is that nothing here could distinguish a planned reboot from an
+      # unplanned one, so the next genuinely unexpected restart would be just
+      # as silent. Incident class-detection (docs/incidents/README.md) starts
+      # with knowing a restart happened at all.
+      #
+      # node_boot_time_seconds is an absolute timestamp, so only its CHANGE
+      # marks a restart — hence changes(), not a level check. `for:` MUST stay
+      # well under the range window: changes(...[1h]) returns to 0 an hour
+      # after the boot, so a longer soak could never complete and the rule
+      # would be structurally dead. Pinned by
+      # tests/test_vmalert_rules.py::TestHostUnexpectedReboot.
+      #
+      # Expected to fire on deliberate reboots too. That is the point: a
+      # restart you performed is a restart you can acknowledge in seconds,
+      # whereas one you did not perform is the whole signal.
+      - alert: HostUnexpectedReboot
+        expr: changes(node_boot_time_seconds[{{ vmalert_host_reboot_window | default('1h') }}]) > 0
+        for: {{ vmalert_host_reboot_for | default('2m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'homelab restarted ({{ '{{ $value | printf "%.0f" }}' }} boot(s) in the last {{ vmalert_host_reboot_window | default("1h") }})'
+          description: 'node_boot_time_seconds changed — the Pi rebooted. If you did this, acknowledge and move on. If you did NOT, treat it as an unplanned restart: check `journalctl --list-boots` for a boot that ends with no shutdown target, and check homelab_kernel_io_events_last_boot for a storage fault that ended the previous boot (those per-boot counters are reset by the reboot itself, so the _last_boot snapshot is the only surviving evidence). More than one firing per hour is a boot loop — stop deploying and investigate.'
+
+      # ── Container unhealthy (parity with unhealthy-watchdog) ─────────
+      # ENABLED 2026-09-03. The former placeholder was disabled "until we
+      # confirm the metric exists" and guessed the name
+      # `docker_container_health_status` — which nothing ever emitted. The
+      # metric DOES exist and always did: cAdvisor exports
+      # `container_health_state` (job="cadvisor"), 1=healthy, 0=unhealthy,
+      # -1=no healthcheck defined. `name!=""` drops the root-cgroup series
+      # (id="/") which reports -1 and carries no container name.
+      #
+      # Why this matters (2026-09-02 tailscale-dns): the container went
+      # netless — its docker network was gone, so it held NO listener on
+      # the tailnet IP and the split-DNS resolver was dead for 25 h. Docker
+      # health said unhealthy the whole time and container_health_state was
+      # 0 for 25 unbroken hours, but NOTHING consumed the metric (grep for
+      # it across ansible/ returned zero hits). The only signal was
+      # unhealthy-watchdog's raw ntfy — which flooded ~247 URGENT pushes at
+      # 5-min intervals and was tuned out. Routing through vmalert gives us
+      # alertmanager grouping/dedup instead of a per-poll page.
+      #
+      # Tiering mirrors the watchdog's own escalation: warn once the
+      # watchdog's restart threshold (3 polls) has demonstrably not fixed
+      # it; crit once its 5-restart budget is spent and self-healing has
+      # definitively failed — that tier means a human is required.
+      #
+      # The `for:` is NOT decorative — this metric flaps. It briefly reads 0
+      # on containers Docker still reports healthy (a transient probe miss,
+      # and every container restart passes through it). Measured over 6 h on
+      # 2026-09-03: label-studio 2 min, vmalert 3 min, vmalert-logs 1 min of
+      # spurious 0 — while the genuine tailscale-dns outage held 0 for 344
+      # continuous minutes. So noise tops out around 3 min and signal is
+      # two orders of magnitude longer; 15m sits 5× above the noise ceiling
+      # and still catches a real outage inside a quarter hour. Do not
+      # rewrite this as min_over_time(...[15m]) == 0 — that inverts the
+      # semantics and fires on exactly the 2-min dips this survives.
+      - alert: ContainerUnhealthy
+        expr: container_health_state{name!=""} == 0
+        for: {{ vmalert_container_unhealthy_for | default('15m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Container {{ '{{ $labels.name }}' }} is unhealthy'
+          # NOTE: do NOT put a Docker --format Go-template (e.g. the literal
+          # braces around `json .State.Health`) in an annotation. vmalert
+          # renders annotations as its OWN Go template, so it tries to
+          # evaluate those braces and dies with `function "json" not
+          # defined` — a hard parse failure that crash-loops vmalert and
+          # takes ALL alerting down with it. Describe the command in prose
+          # instead. (Shipped-and-reverted 2026-09-03.)
+          description: "Docker reports {{ '{{ $labels.name }}' }} unhealthy for over {{ vmalert_container_unhealthy_for | default('15m') }}. unhealthy-watchdog restarts it after 3 consecutive polls; if this is still firing, the restart did not fix it. Inspect the container's State.Health.Log for the probe output, then `docker logs {{ '{{ $labels.name }}' }}`."
+
+      - alert: ContainerUnhealthyCritical
+        expr: container_health_state{name!=""} == 0
+        for: {{ vmalert_container_unhealthy_critical_for | default('2h') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'Container {{ '{{ $labels.name }}' }} unhealthy — self-healing exhausted'
+          description: "{{ '{{ $labels.name }}' }} has been unhealthy for over {{ vmalert_container_unhealthy_critical_for | default('2h') }}. unhealthy-watchdog's 5-restart/24h budget is spent, so nothing will retry automatically — this needs a human. A restart loop that never converges usually means the container's environment changed underneath it (missing docker network, vanished bind-mount, upstream image went distroless and broke an exec healthcheck) rather than a crash: `docker restart` cannot fix any of those. Check State.Health.Log first, then NetworkSettings.Networks."

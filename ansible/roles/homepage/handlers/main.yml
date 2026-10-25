@@ -1,0 +1,7 @@
+---
+- name: Restart homepage
+  community.docker.docker_compose_v2:
+    project_src: "{{ homepage_compose_dir }}"
+    state: restarted
+  become: true
+  become_user: "{{ docker_user }}"

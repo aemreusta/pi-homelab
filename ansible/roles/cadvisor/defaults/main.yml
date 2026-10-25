@@ -1,0 +1,62 @@
+---
+# Google cAdvisor — per-container CPU, RAM, network, IO metrics
+# https://github.com/google/cadvisor
+# Default port 8080 already used by AdGuard, so we publish the host on 8081
+# (container still listens on 8080 internally).
+
+cadvisor_compose_dir: /home/{{ docker_user }}/docker/observability/cadvisor
+cadvisor_tz: "{{ timezone }}"
+
+cadvisor_image: ghcr.io/google/cadvisor:latest
+cadvisor_port: 8081
+
+# Headroom for ~40 containers. Recursive filesystem accounting is disabled
+# below: its charged inode/dentry cache exhausted even a 384M ceiling.
+cadvisor_mem_limit: 384M
+
+# Upstream defaults plus disk (recursive image filesystem size/inode scans).
+# Keep diskIO (cgroup block I/O) and node-exporter's host filesystem capacity.
+# No homelab dashboard/alert consumes the expensive container size totals.
+cadvisor_disabled_metrics:
+  - advtcp
+  - cpu_topology
+  - cpuset
+  - disk
+  - hugetlb
+  - memory_numa
+  - process
+  - referenced_memory
+  - resctrl
+  - sched
+  - tcp
+  - udp
+
+# --- Container security hardening ---
+
+# PID limit — cAdvisor walks cgroups and spawns goroutines per container monitored.
+cadvisor_pids_limit: 200
+
+# Read-only root filesystem; /tmp via tmpfs. cAdvisor mostly reads /rootfs, /sys, /var/lib/docker.
+cadvisor_read_only: true
+cadvisor_tmpfs_size: 32m
+
+# Linux capabilities. Replaces privileged: true with the Kubernetes-style minimal set
+# that cAdvisor needs to read cgroups, walk /proc, and inspect container processes.
+# - DAC_READ_SEARCH: bypass dir-read perm checks (walking /rootfs, /var/lib/docker)
+# - SYS_PTRACE: read /proc/<pid>/status of other processes
+# - SYS_ADMIN: required for various namespace + cgroup operations cAdvisor performs
+cadvisor_cap_drop:
+  - ALL
+cadvisor_cap_add:
+  - DAC_READ_SEARCH
+  - SYS_PTRACE
+  - SYS_ADMIN
+
+# OCI image labels (applied to the container).
+cadvisor_oci_labels:
+  org.opencontainers.image.title: cadvisor
+  org.opencontainers.image.description: "Google cAdvisor — per-container CPU/RAM/network/IO metrics"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/cadvisor/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://github.com/google/cadvisor"

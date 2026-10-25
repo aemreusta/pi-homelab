@@ -1,0 +1,160 @@
+---
+# Sprint 10 — Automated Backups. See docs/archive/sprints/010-automated-backups.md
+# and docs/runbooks/028-backup-restore.md.
+#
+# Backup root and retention. /srv/backups is created by the storage role
+# (storage_path entries) — no mkdir task here.
+backup_root: /srv/backups
+backup_retention_days: 28
+
+# Sunday 03:00 — one hour before docker-prune (04:00) so a fresh
+# snapshot exists before the prune touches anything.
+backup_schedule_minute: "0"
+backup_schedule_hour: "3"
+backup_schedule_weekday: "0"
+
+backup_log: /var/log/homelab-backup.log
+backup_state_file: /var/lib/homelab/backup.state
+backup_state_dir: /var/lib/homelab
+
+backup_ntfy_url: "{{ ntfy_external_topic_url }}"
+backup_control_url: "{{ homelab_control_internal_url
+  | default('http://127.0.0.1:' ~ (homelab_control_port | default(9099))) }}"
+backup_control_token: "{{ homelab_control_token | default('') }}"
+
+# Abort if backup_root is not a mountpoint. Guards the bind-mount case: a
+# dropped drive leaves backup_root as an empty dir on the ROOT filesystem, and
+# an unguarded run then writes 5+ GiB onto the disk it is meant to protect
+# while reporting success.
+#
+# OFF as of 2026-08-02: backup_root is back on the root filesystem after the
+# ssd2 rollback, so requiring a mountpoint would abort every run. Turn it back
+# on in the same change that moves backup_root onto a separate device.
+backup_require_mountpoint: false
+
+# Pre-flight free-space gates (GiB on backup_root's filesystem). Sized for the
+# 1.8 T root disk, which sits at 97%. These were briefly 40/90 while backup_root
+# lived on the 931 GiB ssd2 — if it ever moves off root again, rescale them in
+# the same change, because a gate that can never fire is not a safety net.
+backup_min_free_gb: 10            # abort with urgent ntfy below this
+backup_warn_free_gb: 30           # warn (not abort) below this
+
+# Per-service config. Each entry is backed up via its `method` recipe:
+#   tar       — file-level copy, no quiesce (config files that are
+#               written atomically; adguard).
+#   stop_tar  — docker stop --time=30 → tar → docker start, with EXIT
+#               trap to ensure the container restarts even on tar
+#               failure.
+#   sqlite    — host-side `sqlite3 <db> ".backup ..."` while the
+#               container is running. SQLite's online backup API is
+#               WAL-safe across processes; verified live on a
+#               976M *arr DB (15s, 320854 rows preserved). No
+#               sqlite3 binary in any container, so this MUST run on
+#               the host.
+#
+# Paths and db_host_path were SSH-verified 2026-05-18 against running
+# containers. See section 10.4 of docs/archive/sprints/010-automated-backups.md.
+backup_services:
+  # Cluster globals: roles, their passwords, grants. MUST exist or none of the
+  # per-database dumps below are restorable — every object references an owner
+  # that would not exist on a fresh cluster, and every service password would
+  # be gone. Restore order: this first, then the databases.
+  - name: postgresql-globals
+    method: pg_globals
+    container: postgresql
+
+  - name: qbittorrent
+    method: stop_tar
+    container: qbittorrent
+    paths:
+      - "/home/{{ docker_user }}/docker/media/config/qbittorrent"
+
+
+  - name: sonarr
+    method: sqlite
+    db_host_path: "/home/{{ docker_user }}/docker/media/config/sonarr/sonarr.db"
+
+  - name: radarr
+    method: sqlite
+    db_host_path: "/home/{{ docker_user }}/docker/media/config/radarr/radarr.db"
+
+  - name: prowlarr
+    method: sqlite
+    db_host_path: "/home/{{ docker_user }}/docker/media/config/prowlarr/prowlarr.db"
+
+
+  - name: tdarr
+    method: stop_tar
+    container: tdarr
+    paths:
+      - "/home/{{ docker_user }}/docker/media/tdarr/config/server/Tdarr/DB2/SQL"
+
+  - name: jellyseerr
+    method: stop_tar
+    container: jellyseerr
+    paths:
+      - "/home/{{ docker_user }}/docker/media/jellyseerr/config/db"
+
+  - name: adguard
+    method: tar
+    paths:
+      - "/home/{{ docker_user }}/docker/network/adguard/data/conf"
+
+  - name: grafana
+    method: sqlite
+    db_host_path: "/home/{{ docker_user }}/docker/observability/grafana/data/grafana.db"
+
+  # Sprint 18: vmalert rule files + Alertmanager silences DB.
+  # vmalert rules are static templates managed by Ansible, but backing up
+  # the rendered set keeps the bare-metal restore self-contained — no need
+  # to re-run `make vmalert` immediately on a recovered host.
+  - name: vmalert
+    method: tar
+    paths:
+      - "/home/{{ docker_user }}/docker/observability/vmalert/rules"
+
+  # Alertmanager state directory holds the silences DB (`silences`) and the
+  # nflog (notification log). Losing these forces operators to re-create any
+  # active silences manually after restore. Container is stopped via the
+  # stop_tar recipe because nflog can be written mid-snapshot.
+  - name: alertmanager
+    method: stop_tar
+    container: alertmanager
+    paths:
+      - "/home/{{ docker_user }}/docker/observability/alertmanager/data"
+
+  # Label Studio migrated SQLite -> Postgres 2026-07-07 (design 041): the live
+  # project/tasks/annotations DB is now `label_studio` in the postgresql
+  # container (dumped below). This stop_tar still protects the data DIR — config,
+  # MinIO import-storage links, and the retained SQLite rollback file — which the
+  # pg_dump does not cover. Audio lives in MinIO, so the dir is small.
+  - name: label-studio
+    method: stop_tar
+    container: label-studio
+    paths:
+      - /srv/data/label-studio
+
+  # pg_dump — online, MVCC-consistent, no container stop needed. Back up every
+  # tenant DB in the shared postgresql container; add langfuse/prefect here when
+  # deployed.
+  - name: postgresql-mlflow
+    method: pg_dump
+    container: postgresql
+    db_name: mlflow
+
+  - name: postgresql-label-studio
+    method: pg_dump
+    container: postgresql
+    db_name: label_studio
+
+  # Authelia SSO storage (sessions + OIDC tokens). The user identity + config are
+  # regenerated from vault/templates, so the Postgres DB is the only stateful bit.
+  - name: postgresql-authelia
+    method: pg_dump
+    container: postgresql
+    db_name: authelia
+
+# node_exporter textfile collector target. The backup emits its counters
+# here on every exit path (CLAUDE.md hard rule #1) — see BackupStale /
+# BackupFailing in roles/vmalert/templates/rules/backup.yml.j2.
+backup_textfile_dir: "{{ node_exporter_textfile_dir | default('/var/lib/node_exporter/textfile') }}"

@@ -1,0 +1,45 @@
+---
+- name: Converge
+  hosts: localhost
+  gather_facts: false
+  vars:
+    docker_user: pi
+    timezone: Europe/Istanbul
+    vault_beszel_email: "admin@example.com"
+    vault_beszel_password: ""
+    vault_beszel_agent_key: "stub-key"
+    # group_vars/all/main.yml normally provides these; stub them here so the
+    # molecule play works in isolation.
+    ntfy_port: 2586
+    ntfy_topic: homelab
+    ntfy_hostname: ntfy.example
+    ntfy_external_base_url: "http://ntfy.example:2586"
+    ntfy_external_topic_url: "http://ntfy.example:2586/homelab"
+    ntfy_shoutrrr_url: "ntfy://ntfy.example:2586/homelab?scheme=http"
+    ansible_facts:
+      default_ipv4:
+        address: "192.0.2.100"
+  pre_tasks:
+    - name: Load role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../defaults/main.yml"
+    - name: Override paths
+      ansible.builtin.set_fact:
+        beszel_compose_dir: /tmp/molecule-beszel
+        beszel_data_dir: /tmp/molecule-beszel/data
+        beszel_agent_data_dir: /tmp/molecule-beszel/agent-data
+    - name: Ensure dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ beszel_compose_dir }}"
+        - "{{ beszel_data_dir }}"
+        - "{{ beszel_agent_data_dir }}"
+  tasks:
+    - name: Render
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../templates/docker-compose.yml.j2"
+        dest: "{{ beszel_compose_dir }}/docker-compose.yml"
+        mode: "0644"

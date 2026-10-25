@@ -1,0 +1,38 @@
+# MLflow tracking server alerts (PRD-004, Faz-2).
+#
+# Scope: liveness. vmagent scrapes MLflow's Prometheus /metrics endpoint (enabled
+# via the role's --expose-prometheus flag) as job="mlflow"; `up` is 1 when the
+# scrape succeeds and 0 when MLflow is unreachable or crash-looping. The Docker
+# healthcheck (urllib /health every 60s) is the in-container first-line detector;
+# this rule is the out-of-band page for when the container exits or the port dies.
+#
+# NOTE: the scrape target is /metrics, NOT /health — /health returns plain "OK",
+# which fails Prometheus parsing and would pin up=0. The mlflow job lives in
+# ansible/roles/vmagent/defaults/main.yml.
+#
+# Datasource: VictoriaMetrics (PromQL).
+
+groups:
+  - name: mlflow
+    interval: 1m
+    rules:
+
+      # ── MLflow liveness ────────────────────────────────────────────────
+      # Fires when the MLflow /health HTTP probe has been failing for 5 min.
+      # Threshold: 5 min tolerates a single healthcheck miss (60s interval × 3
+      # retries = 3 min) plus one scrape cycle before paging.
+      - alert: MlflowDown
+        expr: up{job="mlflow"} == 0
+        for: {{ vmalert_mlflow_down_for | default('5m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'MLflow tracking server is unreachable'
+          description: >-
+            MLflow /health probe (job=mlflow) has been failing for
+            {{ '{{ $labels.instance }}' }} for at least
+            {{ vmalert_mlflow_down_for | default('5m') }}.
+            Experiment tracking and artifact proxy are unavailable.
+            Check: docker logs mlflow — likely OOM (mem_limit 1G), PG
+            connection failure, or MinIO unreachable.

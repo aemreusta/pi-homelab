@@ -1,0 +1,55 @@
+### Mac Worker — on-demand compute offload for Pi homelab.
+
+name: homelab-worker
+
+networks:
+  # byparr talks to the public internet (Cloudflare-protected indexer sites),
+  # not to the Pi, so it gets a normal default-MTU (1500) bridge network.
+  byparr_net:
+    driver: bridge
+
+services:
+  # ── byparr — Cloudflare bypass for the Pi's Prowlarr (offloaded from Pi) ──
+  # Moved here 2026-07-13. On the Pi 4B, Camoufox/Playwright leaks ~130 PIDs
+  # per /v1 request and could NOT solve a Cloudflare challenge inside
+  # Prowlarr's 60s proxy timeout — a 200s direct solve still returned nothing,
+  # and the container wedged at its 1 GiB cap while the /docs healthcheck kept
+  # reporting "healthy" (blind to the dead browser). This left Cloudflare-
+  # fronted indexers (e.g. EZTV for Sonarr) dark for 6h+. On this
+  # Apple-Silicon Mac the identical solve completes in ~3s (HTTP 200, 85 KB).
+  #
+  # The Pi's Prowlarr points its FlareSolverr indexer-proxy at
+  # http://192.0.2.102:8191 (this Mac's LAN IP — see README "byparr").
+  # Stateless: no NFS volumes. Default caps (the Pi's cap_drop ALL + SYS_ADMIN
+  # dance is unnecessary under OrbStack — the proven manual test ran with
+  # defaults). init:true + core:0 carry over the Pi's zombie-reap / no-core
+  # hardening; the leak is far milder here but the mitigations are free.
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: homelab-byparr
+    restart: unless-stopped
+    init: true
+    ulimits:
+      core: 0
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+    networks:
+      - byparr_net
+    ports:
+      - "8191:8191"
+    environment:
+      - LOG_LEVEL=INFO
+      - TZ=Europe/Istanbul
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8191/docs"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30s

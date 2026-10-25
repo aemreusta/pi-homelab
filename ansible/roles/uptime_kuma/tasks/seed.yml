@@ -1,0 +1,40 @@
+---
+# Idempotent restore/seed of notifications + monitors from the committed backup
+# JSON, run INSIDE the uptime-kuma container (bundles socket.io-client + node).
+# Tag-gated `never` — only runs with `--tags seed` (or `make uptime-kuma-seed`),
+# so a normal `make uptime-kuma` never reseeds. Idempotent: existing items are
+# skipped, so re-running is the non-destructive restore drill (expect created=0).
+# See templates/seed-from-backup.js.j2 + runbook 039 §7.
+
+- name: Render UK seed script
+  ansible.builtin.template:
+    src: seed-from-backup.js.j2
+    dest: "{{ uptime_kuma_compose_dir }}/seed-from-backup.js"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+
+- name: Copy seed script + backup JSON into the container
+  ansible.builtin.command:
+    cmd: "docker cp {{ uptime_kuma_compose_dir }}/{{ item.src }} uptime-kuma:{{ item.dest }}"
+  loop:
+    - { src: "seed-from-backup.js", dest: "/tmp/uk-seed.js" }
+    - { src: "uptime-kuma-backup.json", dest: "/tmp/uk-backup.json" }
+  changed_when: false
+
+- name: Run idempotent seed (notifications + monitors)
+  ansible.builtin.command:
+    cmd: >-
+      docker exec
+      -e NODE_PATH=/app/node_modules
+      -e UK_USER={{ uptime_kuma_username }}
+      -e UK_PASS={{ uptime_kuma_password }}
+      -e BACKUP_JSON=/tmp/uk-backup.json
+      uptime-kuma node /tmp/uk-seed.js
+  register: uptime_kuma_seed
+  changed_when: "'created=0' not in uptime_kuma_seed.stdout"
+  failed_when: "'seed ok' not in uptime_kuma_seed.stdout"
+
+- name: Show seed result
+  ansible.builtin.debug:
+    msg: "{{ uptime_kuma_seed.stdout }}"

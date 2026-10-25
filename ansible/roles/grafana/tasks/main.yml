@@ -1,0 +1,8 @@
+---
+- name: Include Grafana deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [grafana]
+
+- name: Include Grafana UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [grafana, firewall]

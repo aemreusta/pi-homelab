@@ -1,0 +1,64 @@
+---
+- name: Ensure versioned runtime build directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ homelab_runtime_root }}"
+    - "{{ homelab_runtime_root }}/toolchains/{{ homelab_runtime_go_version }}"
+    - "{{ homelab_runtime_root }}/releases/{{ homelab_runtime_release_id }}"
+
+- name: Download checksum-pinned Linux ARM64 Go compiler
+  ansible.builtin.get_url:
+    url: "https://go.dev/dl/go{{ homelab_runtime_go_version }}.linux-arm64.tar.gz"
+    dest: "{{ homelab_runtime_root }}/go{{ homelab_runtime_go_version }}.linux-arm64.tar.gz"
+    checksum: "sha256:{{ homelab_runtime_go_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: not ansible_check_mode
+
+- name: Extract the isolated Go compiler
+  ansible.builtin.unarchive:
+    src: "{{ homelab_runtime_root }}/go{{ homelab_runtime_go_version }}.linux-arm64.tar.gz"
+    dest: "{{ homelab_runtime_root }}/toolchains/{{ homelab_runtime_go_version }}"
+    remote_src: true
+    creates: "{{ homelab_runtime_root }}/toolchains/{{ homelab_runtime_go_version }}/go/bin/go"
+  when: not ansible_check_mode
+
+- name: Copy source into its immutable release directory
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../runtime/"
+    dest: "{{ homelab_runtime_root }}/releases/{{ homelab_runtime_release_id }}/source/"
+    owner: root
+    group: root
+    mode: "0644"
+    directory_mode: "0755"
+
+- name: Build static runtime with bounded compiler concurrency
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/nice
+      - "-n"
+      - "15"
+      - "{{ homelab_runtime_root }}/toolchains/{{ homelab_runtime_go_version }}/go/bin/go"
+      - build
+      - -p=1
+      - -trimpath
+      - -buildvcs=false
+      - "-ldflags=-s -w -X main.version={{ homelab_runtime_release_id }}"
+      - -o
+      - ../homelab-agent
+      - ./cmd/homelab-agent
+    chdir: "{{ homelab_runtime_root }}/releases/{{ homelab_runtime_release_id }}/source"
+    creates: "{{ homelab_runtime_root }}/releases/{{ homelab_runtime_release_id }}/homelab-agent"
+  environment:
+    CGO_ENABLED: "0"
+    GOMAXPROCS: "2"
+    GOCACHE: "{{ homelab_runtime_root }}/build-cache"
+    GOTOOLCHAIN: local
+    GOPROXY: "off"
+  when: not ansible_check_mode

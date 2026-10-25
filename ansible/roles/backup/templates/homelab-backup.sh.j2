@@ -1,0 +1,262 @@
+#!/bin/bash
+# homelab-backup.sh — weekly orchestrator. Iterates backup_services
+# from the Ansible defaults, invokes the per-method script, captures the
+# JSON status line, writes an atomic state file, retention-prunes old
+# snapshots, and sends an ntfy summary.
+#
+# Triggered by:
+#   - cron (Sunday 03:00) — root
+#   - homelab-control POST /backup endpoint — root via systemd service
+#   - operator: sudo /usr/local/bin/homelab-backup.sh (manual)
+#
+# Reference shape (matches disk-alert.sh.j2): structured stderr/stdout,
+# atomic state writes, single ntfy on completion. See
+# docs/archive/sprints/010-automated-backups.md §3.
+set -uo pipefail
+
+BACKUP_ROOT="{{ backup_root }}"
+LOG_FILE="{{ backup_log }}"
+STATE_FILE="{{ backup_state_file }}"
+NTFY_URL="{{ backup_ntfy_url }}"
+CONTROL_EXTERNAL_URL="{{ homelab_control_external_url | default('https://' ~ control_hostname) }}"
+CONTROL_TOKEN="{{ backup_control_token }}"
+
+MIN_FREE_GB={{ backup_min_free_gb }}
+WARN_FREE_GB={{ backup_warn_free_gb }}
+RETENTION_DAYS={{ backup_retention_days }}
+
+mkdir -p "$BACKUP_ROOT" "$(dirname "$STATE_FILE")"
+
+# --- Metrics on EVERY exit path -----------------------------------------
+# CLAUDE.md hard rule #1. This script is the only FAST restore path on the
+# box, and until 2026-08-03 it emitted nothing a machine could evaluate: a
+# total failure was detectable only by a human noticing the weekly ntfy
+# never arrived, or 30 days later via the indirect GdriveBackupNoData
+# ceiling. Data loss is the one unrecoverable failure class, which makes
+# this the highest-blast-radius instance of the silent-cron shape.
+#
+# The ABORT paths matter most — "refused because the backup disk was not
+# mounted" must be visible, or the box looks healthy while producing no
+# backups at all.
+TF_DIR="{{ backup_textfile_dir }}"
+backup_success=0
+backup_started_epoch=$(date +%s)
+backup_ok_count=0
+backup_fail_count=0
+backup_total_bytes=0
+
+emit() {
+    [ -d "$TF_DIR" ] || return 0
+    local tf="$TF_DIR/backup.prom" tmp
+    tmp="$TF_DIR/backup.prom.$$"
+    if {
+        echo "# HELP backup_last_run_unix_seconds Unix time of the last backup attempt."
+        echo "# TYPE backup_last_run_unix_seconds gauge"
+        echo "backup_last_run_unix_seconds $(date +%s)"
+        echo "# HELP backup_success 1 if the last backup completed with no failed service."
+        echo "# TYPE backup_success gauge"
+        echo "backup_success ${backup_success}"
+        echo "# HELP backup_duration_seconds Wall-clock duration of the last backup."
+        echo "# TYPE backup_duration_seconds gauge"
+        echo "backup_duration_seconds $(( $(date +%s) - backup_started_epoch ))"
+        echo "# HELP backup_services_total Services attempted by the last backup."
+        echo "# TYPE backup_services_total gauge"
+        echo "backup_services_total $(( backup_ok_count + backup_fail_count ))"
+        echo "# HELP backup_services_failed Services that failed in the last backup."
+        echo "# TYPE backup_services_failed gauge"
+        echo "backup_services_failed ${backup_fail_count}"
+        echo "# HELP backup_bytes Bytes written by the last backup."
+        echo "# TYPE backup_bytes gauge"
+        echo "backup_bytes ${backup_total_bytes}"
+    } > "$tmp"; then
+        [ -s "$tmp" ] && mv "$tmp" "$tf" || rm -f "$tmp"
+    else
+        rm -f "$tmp"
+    fi
+}
+trap emit EXIT
+
+log() {
+    # Structured JSONL append. Matches docs/runbooks/020-known-log-noise.md
+    # ingestion contract (one event per line, top-level "ts" key).
+    local payload="$1"
+    printf '{"ts":"%s",%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${payload#\{}" >> "$LOG_FILE"
+}
+
+ntfy_send() {
+    local title="$1" priority="$2" tags="$3" body="$4"
+    [ -z "$NTFY_URL" ] && return 0
+    curl -sf \
+        -H "Title: $title" \
+        -H "Priority: $priority" \
+        -H "Tags: $tags" \
+        -H "Actions: view, Open Backups, ${CONTROL_EXTERNAL_URL}/?token=${CONTROL_TOKEN}#backup-section, clear=true" \
+        -d "$body" \
+        "$NTFY_URL" >/dev/null 2>&1 || true
+}
+
+# ── Pre-flight ──────────────────────────────────────────────────────────
+{% if backup_require_mountpoint | default(false) %}
+# BACKUP_ROOT is a bind mount from the second SSD (design 042). That drive runs
+# on a marginal USB power budget and HAS dropped off the bus
+# (docs/conventions/pi4-usb-power-budget.md). If the bind is not up, the path
+# above still exists — as an empty directory on the ROOT filesystem — and a
+# backup would silently write 5+ GiB onto the very disk it is meant to protect,
+# on a filesystem already at 97%. Refuse, loudly.
+if ! mountpoint -q "$BACKUP_ROOT"; then
+    ntfy_send "Backup ABORTED — backup disk not mounted" urgent "rotating_light,floppy_disk" \
+        "${BACKUP_ROOT} is not a mountpoint. The second SSD has most likely dropped off the USB bus. Backups did NOT run — writing here would fill the root filesystem instead. Check: lsblk, blkid, dmesg -T | grep -i usb."
+    log "\"event\":\"abort\",\"reason\":\"backup_root_not_mounted\",\"path\":\"$BACKUP_ROOT\"}"
+    exit 2
+fi
+{% endif %}
+free_kb=$(df --output=avail "$BACKUP_ROOT" | tail -1 | tr -d ' ')
+free_gb=$(( free_kb / 1024 / 1024 ))
+log "\"event\":\"preflight\",\"free_gb\":$free_gb,\"min\":$MIN_FREE_GB,\"warn\":$WARN_FREE_GB}"
+
+if [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
+    ntfy_send "Backup ABORTED — disk low" urgent "rotating_light,floppy_disk" \
+        "Free space on ${BACKUP_ROOT}: ${free_gb} GiB (< ${MIN_FREE_GB} GiB threshold). Backup did not run."
+    log "\"event\":\"abort\",\"reason\":\"disk_below_min\",\"free_gb\":$free_gb}"
+    exit 2
+fi
+
+low_disk_warn=0
+[ "$free_gb" -lt "$WARN_FREE_GB" ] && low_disk_warn=1
+
+# ── Service loop ────────────────────────────────────────────────────────
+run_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+run_start_ms=$(date +%s%3N)
+
+ok_count=0
+fail_count=0
+total_bytes=0
+declare -a service_lines=()
+
+run_service() {
+    local name="$1" method="$2"
+    shift 2
+    local args=("$@")
+    local script="/usr/local/bin/backup-${method}.sh"
+
+    if [ ! -x "$script" ]; then
+        printf '{"service":"%s","method":"%s","status":"fail","bytes":0,"duration_ms":0,"error":"recipe %s missing"}' \
+            "$name" "$method" "$script"
+        return 1
+    fi
+
+    "$script" "$name" "${args[@]}"
+}
+
+{% for svc in backup_services %}
+# {{ svc.name }} ({{ svc.method }})
+{% if svc.method == 'sqlite' %}
+result=$(run_service "{{ svc.name }}" "sqlite" "{{ svc.db_host_path }}")
+{% elif svc.method == 'stop_tar' %}
+result=$(run_service "{{ svc.name }}" "stop_tar" "{{ svc.container }}" {% for p in svc.paths %}"{{ p }}" {% endfor %})
+{% elif svc.method == 'pg_dump' %}
+result=$(run_service "{{ svc.name }}" "pg_dump" "{{ svc.container }}" "{{ svc.db_name }}")
+{% elif svc.method == 'pg_globals' %}
+result=$(run_service "{{ svc.name }}" "pg_globals" "{{ svc.container }}")
+{% else %}
+result=$(run_service "{{ svc.name }}" "tar" {% for p in svc.paths %}"{{ p }}" {% endfor %})
+{% endif %}
+log "\"event\":\"service\",${result#\{}"
+service_lines+=("$result")
+case "$result" in
+    *'"status":"ok"'*)
+        ok_count=$((ok_count + 1))
+        b=$(printf '%s' "$result" | sed -nE 's/.*"bytes":([0-9]+).*/\1/p')
+        total_bytes=$((total_bytes + ${b:-0}))
+        ;;
+    *)
+        fail_count=$((fail_count + 1))
+        ;;
+esac
+{% endfor %}
+
+# ── Retention prune ─────────────────────────────────────────────────────
+# -mindepth 2 stops us from deleting service-name dirs even if a service
+# name went missing. Each YYYY-MM-DD dir lives at depth 2 from
+# BACKUP_ROOT.
+prune_count=0
+while IFS= read -r -d '' dir; do
+    rm -rf "$dir" && prune_count=$((prune_count + 1))
+done < <(find "$BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type d -mtime "+${RETENTION_DAYS}" -print0 2>/dev/null)
+log "\"event\":\"prune\",\"days\":$RETENTION_DAYS,\"removed_dirs\":$prune_count}"
+
+# ── Atomic state write ──────────────────────────────────────────────────
+run_ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+run_duration_ms=$(( $(date +%s%3N) - run_start_ms ))
+run_status="ok"
+[ "$fail_count" -gt 0 ] && run_status="fail"
+
+# Mirror the real counters into the metric vars the EXIT trap emits.
+backup_ok_count=$ok_count
+backup_fail_count=$fail_count
+backup_total_bytes=$total_bytes
+[ "$fail_count" -eq 0 ] && backup_success=1
+
+# Build per-service JSON map.
+per_service_json="{"
+sep=""
+for line in "${service_lines[@]}"; do
+    name=$(printf '%s' "$line" | sed -nE 's/.*"service":"([^"]+)".*/\1/p')
+    per_service_json="${per_service_json}${sep}\"${name}\":${line}"
+    sep=","
+done
+per_service_json="${per_service_json}}"
+
+tmp_state=$(mktemp -p "$(dirname "$STATE_FILE")" .backup.state.XXXXXX)
+cat > "$tmp_state" <<EOF
+{
+  "last_run_ts": "${run_ended}",
+  "started": "${run_started}",
+  "status": "${run_status}",
+  "ok": ${ok_count},
+  "failed": ${fail_count},
+  "total_bytes": ${total_bytes},
+  "duration_ms": ${run_duration_ms},
+  "free_gb_at_start": ${free_gb},
+  "prune_removed": ${prune_count},
+  "per_service": ${per_service_json}
+}
+EOF
+mv -f "$tmp_state" "$STATE_FILE"
+chmod 0644 "$STATE_FILE"
+
+# ── ntfy summary ────────────────────────────────────────────────────────
+total_mib=$(( total_bytes / 1024 / 1024 ))
+duration_s=$(( run_duration_ms / 1000 ))
+
+body="$(printf 'ok=%d fail=%d total=%d MiB duration=%d s\n' \
+    "$ok_count" "$fail_count" "$total_mib" "$duration_s")"
+for line in "${service_lines[@]}"; do
+    name=$(printf '%s' "$line" | sed -nE 's/.*"service":"([^"]+)".*/\1/p')
+    status=$(printf '%s' "$line" | sed -nE 's/.*"status":"([^"]+)".*/\1/p')
+    b=$(printf '%s' "$line" | sed -nE 's/.*"bytes":([0-9]+).*/\1/p')
+    mib=$(( ${b:-0} / 1024 / 1024 ))
+    if [ "$status" = "ok" ]; then
+        body+=$(printf '\n✓ %s — %d MiB' "$name" "$mib")
+    else
+        err=$(printf '%s' "$line" | sed -nE 's/.*"error":"([^"]+)".*/\1/p')
+        body+=$(printf '\n✗ %s — %s' "$name" "${err:-failed}")
+    fi
+done
+[ "$low_disk_warn" -eq 1 ] && body+="$(printf '\n⚠ /srv/backups free %d GiB (warn threshold %d GiB)' "$free_gb" "$WARN_FREE_GB")"
+
+if [ "$run_status" = "ok" ]; then
+    priority="default"
+    tag="white_check_mark,floppy_disk"
+    title="Backup OK ($ok_count services, $total_mib MiB)"
+else
+    priority="urgent"
+    tag="rotating_light,floppy_disk"
+    title="Backup FAILED ($fail_count of $((ok_count + fail_count)))"
+fi
+ntfy_send "$title" "$priority" "$tag" "$body"
+
+log "\"event\":\"summary\",\"ok\":$ok_count,\"fail\":$fail_count,\"bytes\":$total_bytes,\"duration_ms\":$run_duration_ms}"
+
+[ "$fail_count" -gt 0 ] && exit 1
+exit 0

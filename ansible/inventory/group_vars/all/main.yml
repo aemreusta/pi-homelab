@@ -1,0 +1,258 @@
+---
+timezone: Europe/Istanbul
+
+# ── Network ──────────────────────────────────────────────
+lan_subnet: "192.0.2.0/24"
+tailscale_subnet: "100.64.0.0/10"
+# Docker's default bridge pool. Needed ONLY for host-network services whose
+# port is reached by other containers: a container talking to a
+# docker-PUBLISHED port (docker-proxy/DNAT) is governed by the DOCKER-USER
+# chain and never reaches UFW's INPUT, but a container talking to a port owned
+# by a HOST-network process hits INPUT like any external client — and its
+# source is a bridge address, not lan_subnet, so a LAN-scoped rule drops it.
+# That asymmetry is invisible in `ufw status`: the AdGuard (:8080, published)
+# and Traefik (:8180, host-network) rules are textually IDENTICAL, yet only
+# the second one blocks containers. Found 2026-09-03 via homepage's Traefik
+# widget timing out. Scope this to specific ports; do not blanket-allow it.
+docker_bridge_subnet: "172.16.0.0/12"
+# Pi's stable Tailscale IP — used in DNS plumbing (dnsmasq tailnet view) and
+# as the /etc/hosts target for ntfy.example when AdGuard is unreachable.
+tailscale_ip: "100.64.0.10"
+# Pi's stable LAN IP — pinned in /etc/hosts so local scripts can resolve
+# ntfy.example even when AdGuard is down (see roles/common/tasks/hosts.yml).
+# Kept in sync with the router's static DHCP reservation for the Pi.
+lan_ip: "192.0.2.100"
+
+# ── Service account ──────────────────────────────────────
+# The unprivileged user every container runs as (PUID/PGID 1000) and that owns
+# everything under /srv and /home/pi/docker. 36 roles interpolate this into
+# compose files, file ownership and cron lines.
+#
+# It lives HERE, not in roles/docker/defaults, because it is a property of the
+# host rather than of the Docker installation. Keeping it in the docker role
+# forced every service role to declare `dependencies: [docker]` in meta just to
+# inherit one string — and a meta dependency does not merely import variables,
+# it RUNS the role. That is how the CD came to execute host provisioning on
+# every service deploy while its own deny-list correctly excluded `base`
+# (observed on deploy-v2026.09.05.1: plan was "homepage media vmalert", and the
+# docker role still reported changed on "Add Docker GPG key").
+# A shared value belongs in shared scope; it should not drag an installation
+# role along behind it.
+docker_user: pi
+
+# ── ntfy external URL ────────────────────────────────────
+# Single source of truth for every host-side script / shoutrrr config that
+# talks to ntfy from "outside" the container. Container-to-container traffic
+# uses http://ntfy:80 via the media_net Docker network and is unaffected.
+#
+# Split-DNS handles the IP resolution:
+#   • LAN  : AdGuard wildcard *.example          → 192.0.2.100
+#   • VPN  : dnsmasq    address=/homelab/…       → 100.64.0.10
+#   • Pi   : /etc/hosts pin (common/hosts.yml)   → 192.0.2.100
+#            (survives AdGuard outage — critical for memory/disk alerts that
+#             fire precisely when AdGuard might be OOM-killed)
+#
+# Phase 2 (docs/archive/design/025-ntfy-dns-name.md): replace with https://ntfy.example once ntfy is moved
+# behind Traefik. Touching this one line is the whole migration.
+ntfy_port: 2586
+ntfy_topic: homelab
+ntfy_hostname: "ntfy.{{ homelab_internal_domains[0] }}"
+# DECOUPLED URLs (doc 025 Phase 2):
+#  - ntfy_public_url  → PUBLIC https via Traefik. Used ONLY for NTFY_BASE_URL
+#    (action-button/web/mobile links) + the phone app subscription. Works on LAN
+#    and Tailscale (both resolve *.example to the Pi; trusted internal-CA cert).
+#  - ntfy_external_*  → INTERNAL http :2586 path. The ~30 senders (host scripts,
+#    shoutrrr, ntfy-bridge) keep using these unchanged — no per-sender CA trust.
+ntfy_public_url: "https://{{ ntfy_hostname }}"
+ntfy_external_base_url: "http://{{ ntfy_hostname }}:{{ ntfy_port }}"
+ntfy_external_topic_url: "{{ ntfy_external_base_url }}/{{ ntfy_topic }}"
+# Shoutrrr scheme variant — same target, different URL grammar (used by
+# watchtower + beszel notification libraries).
+ntfy_shoutrrr_url: "ntfy://{{ ntfy_hostname }}:{{ ntfy_port }}/{{ ntfy_topic }}?scheme=http"
+
+# ── Internal split-horizon domain (single source of truth) ─────────────
+# `.example.internal` — ICANN-reserved (2024): it NEVER resolves publicly
+# (public/NextDNS → NXDOMAIN, never a wrong IP) and is 2-label, so it CAN hold
+# the Authelia SSO cookie. Consumed by adguard (DNS rewrites), traefik (cert SAN
+# + router Host rules), tailscale_dns (dnsmasq), authelia (cookie + ACL rules),
+# homepage links, and every `*_hostname` / `*_url` var in this file. First entry
+# = primary; keep this list the ONLY place a domain is written.
+#
+# 2026-07-15 CLEAN CUT — dropped `example.org` and `example`:
+#   • example.org is a REAL registered public domain (parked at 13.248.x). A
+#     device whose NextDNS/public resolver answered before AdGuard resolved
+#     *.example.org to the PARKED IP instead of the Pi ("internal yerine
+#     external"). Unfixable while the name is publicly owned by someone else.
+#   • bare `example` is single-label → cannot hold a session cookie, so Authelia
+#     forward-auth 400'd every gated request on it (2026-07-15).
+# Mac workers are UNAFFECTED: they reach the Pi via mDNS (raspberrypi.local) or the
+# raw LAN IP, never these names (see mac-worker/Tdarr_Node_Config.example.json,
+# which documents macOS accepting NextDNS's NXDOMAIN and poisoning .example).
+# macOS clients need a scoped resolver for the same reason:
+#   /etc/resolver/example.internal  →  nameserver 192.0.2.100
+homelab_internal_domains:
+  - example.internal
+
+# ── External hostnames for ntfy action URLs (mobile reachability) ──────
+# Sprint 016 Story 1. Same split-DNS pattern as ntfy:
+#   • LAN  : AdGuard wildcard *.example → 192.0.2.100
+#   • VPN  : dnsmasq    address=/homelab/ → 100.64.0.10
+#   • Pi   : /etc/hosts pin (roles/common/tasks/hosts.yml)
+#
+# Before this sprint, alert action URLs hard-coded ansible_default_ipv4 →
+# 192.0.2.100, which is unreachable from cellular even with Tailscale up
+# (the phone resolves the LAN IP but cannot route to it). Operator
+# reported "ntfy notification errors" on every action click; root cause
+# was the LAN-IP-only URL embedded in the action button.
+#
+# Each `*_external_url` is the URL embedded in ntfy action buttons.
+# The host-side script that sends the notification doesn't open this URL
+# itself — the operator's phone does. DNS resolution is whichever path
+# the phone happens to be on at click time.
+control_hostname: "control.{{ homelab_internal_domains[0] }}"
+beszel_hostname: "beszel.{{ homelab_internal_domains[0] }}"
+tdarr_hostname: "tdarr.{{ homelab_internal_domains[0] }}"
+homepage_hostname: "homepage.{{ homelab_internal_domains[0] }}"
+
+# Homelab GitOps CD (design 039) — ENABLED 2026-06-26 after the full A/B/C +
+# recovery test passed. The Pi (root cron */5, --connection=local) auto-deploys
+# the roles changed by each new master commit and rolls back to last-good on a
+# failed deploy. Prereqs live on the Pi (deploy-key checkout at /opt/homelab,
+# root ansible via uv, vault password) — see roles/homelab_autodeploy/defaults.
+homelab_autodeploy_enabled: true
+
+# SMART transport override — this Pi's SSD is on a SanDisk USB3→SATA bridge
+# (0x0781:0x55bb) that doesn't answer to -d auto / sat / usbjmicron etc.
+# Only -d scsi probes it successfully (returns "SMART Health Status: OK";
+# no SATA attribute table, just overall health). Swap or remove this line if
+# the enclosure changes — defaults/main.yml in `common` falls back to `auto`.
+common_smart_device_type: scsi
+# Mac native marker-generator (future) — same split-DNS pattern as tdarr.
+# AdGuard wildcard `*.example` already resolves; this var exists so the
+# /etc/hosts safety net + future Traefik labels can reference it.
+marker_hostname: "marker.{{ homelab_internal_domains[0] }}"
+
+base_packages:
+  - git
+  - curl
+  - htop
+  - vim
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - smartmontools
+  - acl  # setfacl/getfacl — required by ansible.posix.acl tasks (NFS-squashed shared dirs)
+
+# ── Monitoring / alerting ────────────────────────────────
+# vmalert + Alertmanager are now the authoritative alert path. Flipping
+# this toggle removes the legacy cron alert scripts (disk-alert,
+# memory-alert, cpu-load-alert, pid-budget-alert). unhealthy-watchdog
+# stays — it's both monitor + action-side automation. See runbook 030.
+#
+# Flipped 2026-05-26 (3 days early per runbook's 2026-05-29 earliest
+# decom date). Decision: the vmalert disk rule had been silently broken
+# the entire soak window (queried mountpoint="/srv" which doesn't exist
+# on this single-FS host), so the soak signal was partially invalid
+# for that signal anyway. disk-alert.sh kept the safety net throughout.
+common_use_vmalert: true
+
+sysctl_settings:
+  # Docker networking — required for container traffic forwarding
+  net.ipv4.ip_forward: 1
+  # network hardening
+  net.ipv4.tcp_syncookies: 1
+  net.ipv4.conf.all.rp_filter: 1
+  net.ipv4.conf.default.rp_filter: 1
+  net.ipv4.icmp_echo_ignore_broadcasts: 1
+  # memory / IO tuning (SSD + Docker friendly)
+  vm.swappiness: 10
+  vm.dirty_background_ratio: 5
+  vm.dirty_ratio: 20
+  # Discard core dumps host-wide (defense-in-depth).
+  # core_pattern is a KERNEL-GLOBAL setting — containers do NOT have their
+  # own, they inherit the host's. The default on Raspberry Pi OS / Debian
+  # Trixie is the literal "core", which writes the dump to the crashing
+  # process's CWD. For a container with no bind mount over that CWD, the dump
+  # lands in the overlay writable layer — invisible to `du /srv`, counted
+  # against the SSD. byparr's Camoufox crash-loop did exactly this: 2,101
+  # dumps = 132G (9% of the disk, found at 91% full) accumulated unseen
+  # May 21–29 2026. Piping to /bin/false makes the kernel hand the dump to a
+  # program that immediately exits, so nothing is ever written to disk. This
+  # guards EVERY container; byparr also carries a per-container `ulimits:
+  # core: 0` belt-and-braces (media role compose). We never debug container
+  # cores here, so discarding is the correct policy.
+  # Incident: docs/incidents/2026-05-29-byparr-coredump-disk-fill.md
+  kernel.core_pattern: "|/bin/false"
+
+# ── Root-disk alert thresholds (single source of truth) ───────────────────
+# Hoisted here 2026-08-02. These are consumed by TWO independent alert paths
+# that had silently drifted apart:
+#   • roles/common  — the cron disk-alert.sh script (role default was 93)
+#   • roles/vmalert — the SrvDiskHigh / SrvDiskCritical PromQL rules
+# A role default is visible only to its OWN role, so vmalert never saw the
+# common role's 93 and quietly fell back to its own hardcoded default. Two
+# numbers for one operator decision is how a threshold stops meaning anything.
+#
+# 90 is the operator's actionable line (directive 2026-08-02): above it, act.
+# The disk sits at ~96% today and the sanctioned reclaim path is moving cold
+# media off the SSD — NOT a prune. The no-data-removal rule (2026-05-23)
+# still holds, so this alert is expected to stay lit until that reclaim work
+# lands. That is a TRUE positive with a plan, which is the whole
+# reason DataDiskMissing (a false positive with no plan) was gated off the
+# same day: `crit` only carries information if everything wearing it is real.
+common_disk_alert_threshold: 85        # warn
+common_disk_alert_crit_threshold: 90   # crit — act at this line
+
+# ── Second SSD (Kingston XS1000) ──────────────────────────────────────────
+# Hoisted here 2026-08-02 for the same reason as the disk thresholds above:
+# roles/storage created the mount and roles/vmalert monitors it, but a role
+# default is invisible across roles, so the alert rules could not follow the
+# mount's own flag. When the drive was pulled, DataDiskMissing kept firing
+# crit forever — absent() on a filesystem that no longer exists is true by
+# definition — and both of this host's crit alerts were permanently on.
+#
+# Still FALSE, not abandoned: the drive is fine, the Pi 4B just cannot power
+# two bus-powered SSDs off its own ports (four dropouts — see
+# docs/conventions/pi4-usb-power-budget.md). A powered USB3 hub is on the
+# shopping list. Flipping this ONE line back to true re-enables the mount,
+# the binds, AND the DataDisk* alert family together, which is the point.
+storage_ssd2_enabled: false
+
+# ── Five-minutely cron stagger slots ────────────────────────────────────
+# Eleven jobs were scheduled `*/5` and therefore all fired on the same tick.
+# Measured 2026-09-14: beszel's Docker CPU/Memory charts were missing data at
+# exactly :00 :05 :10 :15 :20 … while the system CPU/Memory charts (read from
+# /proc) had a row every minute. Confirmed in beszel's own store — for those
+# minutes `system_stats` had 1 row and `container_stats` had 0, i.e. the whole
+# container payload was dropped, not individual containers.
+#
+# The cause is contention, not beszel. A full `docker stats` sweep of the 40
+# containers on this Pi takes 2.3–3.7 s (a single container's
+# `/containers/{id}/stats?stream=false` alone takes 2.0 s), and beszel-agent
+# gives its Docker collection a short deadline. When unhealthy-watchdog's ~40
+# `docker inspect` calls, two autodeploy controllers and three `docker exec`
+# emitters all start on the same second, the agent loses the race and emits a
+# system sample with no containers attached.
+#
+# So: spread them. Slot 0 keeps the jobs that must act promptly or that never
+# touch the Docker API; slots 1–4 take the rest. Offsets are expressed as
+# `N-(N+55)/5` because cron has no `*/5+N` form.
+#
+#   slot 0  */5      unhealthy-watchdog, deadman-heartbeat, kernel-io-scan
+#                    unhealthy-watchdog is the single heaviest Docker-API job
+#                    (~40 `docker inspect`) and it KEEPS slot 0 on purpose: it
+#                    restarts unhealthy containers, so it gets the uncontended
+#                    slot rather than queueing behind four other jobs. The two
+#                    sharing it read /proc and dmesg and never open the socket.
+#   slot 1  1-56/5   tdarr-watcher, vmalert-liveness
+#   slot 2  2-57/5   pipeline metrics, gh-runner-metrics
+#   slot 3  3-58/5   homelab-autodeploy, media health probe
+#   slot 4  4-59/5   image CD controller, speedtest-result-liveness
+#
+# Every consumer of these metrics averages over [24h]/[7d] windows, so a job
+# moving up to 4 minutes changes no alert threshold. Do NOT collapse a slot
+# back to `*/5` to "keep things tidy" — the tidiness is what broke the charts.
+homelab_cron_stagger_slot_1: "1-56/5"
+homelab_cron_stagger_slot_2: "2-57/5"
+homelab_cron_stagger_slot_3: "3-58/5"
+homelab_cron_stagger_slot_4: "4-59/5"

@@ -1,0 +1,7 @@
+---
+- name: Restart node_exporter
+  community.docker.docker_compose_v2:
+    project_src: "{{ node_exporter_compose_dir }}"
+    state: restarted
+  become: true
+  become_user: "{{ docker_user }}"

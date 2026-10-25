@@ -1,0 +1,74 @@
+# Local backup — Sprint 10 role, metrics added 2026-08-03.
+#
+# WHY THIS EXISTS: the local backup is the only FAST restore path on this
+# box, and until 2026-08-03 it emitted nothing a machine could evaluate.
+# A total failure was detectable only by a human noticing the weekly ntfy
+# never arrived, or ~30 days later via the indirect GdriveBackupNoData
+# ceiling on the OFF-SITE copy. Data loss is the one unrecoverable failure
+# class, so this was the highest-blast-radius instance of the silent-cron
+# shape CLAUDE.md hard rule #1 exists to prevent — and the rule was being
+# violated by the very job it matters most for.
+#
+# Deliberately mirrors gdrive-backup.yml.j2: same shape, same thresholds
+# style, so the two backup tiers are read the same way.
+
+groups:
+  - name: backup
+    interval: 5m
+    rules:
+
+      # Weekly job. Alert after two missed runs rather than one, so a single
+      # skipped week during maintenance is not a page — but never so late
+      # that the restore path silently rots for a month.
+      - alert: BackupStale
+        expr: |
+          time() - max(backup_last_run_unix_seconds)
+            > {{ vmalert_backup_stale_seconds | default(1209600) }}
+        for: 1h
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'local backup has not run in {{ '{{ $value | printf "%.0f" }}' }}s'
+          description: 'homelab-backup.sh has not reported a run in over two weeks. This is the FAST restore path — the off-site Drive copy is a mirror of it, so if this stopped producing files the off-site copy is stale too and GdriveBackupNoData will not notice for 30 days. Check `systemctl status cron`, /var/log/homelab-backup.log, and free space under backup_root.'
+
+      # crit, not warn: unlike the off-site tier, a failure here means the
+      # copy an operator would actually reach for during an incident does
+      # not exist.
+      - alert: BackupFailing
+        expr: max(backup_success) == 0
+        for: 15m
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'local backup FAILED ({{ '{{ $value }}' }})'
+          description: 'The last backup run finished with at least one failed service, or aborted before starting (backup disk not mounted / low free space — both set success=0 via the EXIT trap). Check backup_services_failed and /var/log/homelab-backup.log.'
+
+      - alert: BackupPartialFailure
+        # Distinguishes "one sqlite dump failed" from "nothing ran at all".
+        # Without this, a single persistently-failing service hides behind
+        # a green overall run for weeks.
+        expr: max(backup_services_failed) > 0
+        for: 1h
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: '{{ '{{ $value | printf "%.0f" }}' }} service(s) failed in the last backup'
+          description: 'The backup completed but some services did not. Their data is NOT in the latest snapshot even though the run looks recent. Check the per-service block in /var/log/homelab-backup.log.'
+
+      # A backup that "succeeds" while writing nothing is the silent-zero
+      # class — the same shape as GdriveBackupNoData, and the reason that
+      # rule exists on the off-site tier.
+      - alert: BackupWroteNothing
+        expr: |
+          (max(backup_success) == 1)
+          and (max_over_time(backup_bytes[{{ vmalert_backup_nodata_window | default('14d') }}]) == 0)
+        for: 2h
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'local backup reports success but has written 0 bytes for {{ vmalert_backup_nodata_window | default('14d') }}'
+          description: 'Every run reports success and nothing has been written. Either every service is being skipped or backup_root is wrong. A green backup that copies nothing is worse than a failing one, because it is believed.'

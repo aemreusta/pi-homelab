@@ -1,0 +1,8 @@
+---
+- name: Allow node_exporter from LAN
+  community.general.ufw:
+    rule: allow
+    port: "{{ node_exporter_port }}"
+    proto: tcp
+    src: 192.168.0.0/16
+    comment: node_exporter (vmagent scrape target)

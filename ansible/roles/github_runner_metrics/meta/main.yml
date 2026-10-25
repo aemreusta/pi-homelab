@@ -1,0 +1,15 @@
+---
+galaxy_info:
+  role_name: github_runner_metrics
+  namespace: homelab
+  author: operator
+  description: Pi-side textfile emitter for the Mac GitHub Actions runner (design 039)
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+        - trixie
+# Pull docker_user (owner of the shared Mac-worker dir + the cron user) from the
+# docker role — same pattern as vmalert/alertmanager/etc.

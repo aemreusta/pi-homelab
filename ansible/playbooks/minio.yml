@@ -1,0 +1,6 @@
+---
+- name: Deploy MinIO S3-compatible object storage
+  hosts: pi
+  become: true
+  roles:
+    - minio

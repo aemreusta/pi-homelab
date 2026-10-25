@@ -1,0 +1,7 @@
+---
+- name: Restart label-studio
+  community.docker.docker_compose_v2:
+    project_src: "{{ label_studio_compose_dir }}"
+    state: restarted
+  become: true
+  become_user: "{{ docker_user }}"

@@ -1,0 +1,18 @@
+# MANAGED BY ANSIBLE (roles/gdrive_backup) — do not edit on the host.
+# Holds a Google OAuth refresh token. Mode 0600, root-only.
+#
+# NO crypt remote: the operator decided 2026-08-02 that this Drive account is
+# single-owner and private, and wants the tree browsable from the Drive UI so
+# it can serve as a general storage channel (homelab/{backups,movies,...}),
+# not just an opaque backup sink. Trade-off recorded in design 043 —
+# anything that reaches this account is readable by anything that gets the
+# account, including the credentials inside the backup set.
+{# Docs: docs/design/043-offsite-backup-google-drive.md #}
+[gdrive]
+type = drive
+scope = drive
+token = {{ vault_rclone_gdrive_token }}
+{% if vault_rclone_gdrive_client_id | default('') | length > 0 %}
+client_id = {{ vault_rclone_gdrive_client_id }}
+client_secret = {{ vault_rclone_gdrive_client_secret }}
+{% endif %}

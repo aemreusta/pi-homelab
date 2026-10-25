@@ -1,0 +1,40 @@
+---
+# Weekly speedtest summary report — queries VictoriaMetrics + pushes ntfy.
+# Pattern mirrors tdarr-summary / retention-cleanup. See templates/.
+
+- name: Deploy weekly speedtest report script
+  ansible.builtin.template:
+    src: speedtest-weekly-report.sh.j2
+    dest: /usr/local/bin/speedtest-weekly-report.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule weekly speedtest report
+  ansible.builtin.cron:
+    name: "speedtest-weekly-report"
+    minute: "{{ speedtest_tracker_report_cron.minute }}"
+    hour: "{{ speedtest_tracker_report_cron.hour }}"
+    weekday: "{{ speedtest_tracker_report_cron.weekday }}"
+    job: "/usr/local/bin/speedtest-weekly-report.sh"
+    user: "{{ docker_user }}"
+
+- name: Deploy speedtest result liveness check script
+  ansible.builtin.template:
+    src: speedtest-result-liveness.sh.j2
+    dest: /usr/local/bin/speedtest-result-liveness.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule speedtest result liveness check
+  ansible.builtin.cron:
+    name: "speedtest-result-liveness"
+    # Stagger slot 4 — see homelab_cron_stagger_* in group_vars/all.
+    minute: "{{ homelab_cron_stagger_slot_4 }}"
+    hour: "*"
+    day: "*"
+    month: "*"
+    weekday: "*"
+    job: "/usr/local/bin/speedtest-result-liveness.sh"
+    user: "{{ docker_user }}"

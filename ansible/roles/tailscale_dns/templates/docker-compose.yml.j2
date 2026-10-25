@@ -1,0 +1,50 @@
+---
+# dnsmasq — DNS resolver for Tailscale clients
+# Resolves *.example to the Pi's Tailscale IP so remote
+# clients don't get the LAN IP from AdGuard.
+
+services:
+  dnsmasq:
+    image: 4km3/dnsmasq:latest
+    container_name: {{ tailscale_dns_container_name }}
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ tailscale_dns_mem_limit }}
+    pids_limit: {{ tailscale_dns_pids_limit }}
+    # read_only intentionally NOT applied — the 4km3/dnsmasq image writes to multiple
+    # paths during startup (/run/dnsmasq.pid + others) and tmpfs-mapping them all
+    # was fragile across image rebuilds. Container is still hardened with cap_drop
+    # ALL + only NET_BIND_SERVICE + pids_limit + no-new-privileges + non-root user.
+    read_only: false
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in tailscale_dns_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+    cap_add:
+{% for cap in tailscale_dns_cap_add %}
+      - {{ cap }}
+{% endfor %}
+    labels:
+{% for k, v in tailscale_dns_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - TZ={{ tailscale_dns_tz }}
+    ports:
+      - "{{ tailscale_dns_ip }}:53:53/tcp"
+      - "{{ tailscale_dns_ip }}:53:53/udp"
+    volumes:
+      - {{ tailscale_dns_config_dir }}/dnsmasq.conf:/etc/dnsmasq.conf:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "nslookup", "-timeout=2", "google.com", "127.0.0.1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

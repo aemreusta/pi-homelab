@@ -1,0 +1,6 @@
+---
+- name: Deploy Jellyseerr media requests
+  hosts: pi
+  become: true
+  roles:
+    - jellyseerr

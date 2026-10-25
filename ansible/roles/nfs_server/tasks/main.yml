@@ -1,0 +1,12 @@
+---
+- name: Include NFS server deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [nfs_server]
+
+- name: Include NFS server firewall tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [nfs_server, firewall]
+
+- name: Include NFS client health tasks
+  ansible.builtin.include_tasks: client_health.yml
+  tags: [nfs_server]

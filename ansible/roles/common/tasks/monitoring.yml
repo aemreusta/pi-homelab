@@ -1,0 +1,473 @@
+---
+# Shared alert audit library — provides ntfy_send() with structured logging
+# so every notification is recorded in /var/log/alert-audit.log.
+- name: Create alert lib directory
+  ansible.builtin.file:
+    path: /usr/local/lib/homelab
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create alert audit log file
+  ansible.builtin.file:
+    path: /var/log/alert-audit.log
+    state: touch
+    owner: root
+    group: root
+    # DEFERS to alertmanager/tasks/deploy.yml, which is the AUTHORITATIVE
+    # owner of this file's mode (it runs the producing ntfy-bridge container).
+    # This task exists only so host-side crons that run as {{ docker_user }}
+    # (daily-report.sh, junk-scan.sh via alert-lib.sh) have a writable log
+    # during base provisioning, BEFORE alertmanager is ever deployed. The
+    # mode MUST stay identical to alertmanager's (0666) — common runs AFTER
+    # alertmanager on a full provision and historically clobbered 0666→0640,
+    # silently breaking every non-root writer (incident 2026-05-29,
+    # docs/incidents/). If you change the mode, change it in alertmanager
+    # first, then mirror it here and in the logrotate `create` below. Rationale
+    # for 0666 vs shared-group 0664: docs/operations/ops-discipline.md.
+    mode: "0666"
+    modification_time: preserve
+    access_time: preserve
+  # Idempotent-report hygiene: with times preserved + mode already correct,
+  # `touch` is a no-op on re-provision; pin changed_when so a re-run never
+  # shows spurious "changed" against the authoritative alertmanager task.
+  changed_when: false
+
+- name: Deploy shared alert library
+  ansible.builtin.template:
+    src: alert-lib.sh.j2
+    dest: /usr/local/lib/homelab/alert-lib.sh
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Deploy logrotate config for alert audit log
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/alert-audit
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      /var/log/alert-audit.log {
+          weekly
+          rotate 4
+          compress
+          missingok
+          notifempty
+          # 0666: post-rotation file must stay writable by the ntfy-bridge
+          # container (nobody/65534) and {{ docker_user }} crons, else the
+          # first write after each weekly rotation fails. This is the
+          # post-rotation authority — it must mirror alertmanager's mode
+          # (the touch-task owner). Matches the touch task above and
+          # alertmanager/tasks/deploy.yml. See docs/operations/ops-discipline.md.
+          create 0666 root root
+      }
+
+# Retention cleanup — reclaim DISPOSABLE artifacts older than
+# common_retention_days (default 30): Docker images/build-cache/stopped-
+# containers/networks past the window + Tdarr transcode-cache scratch. This
+# SUPERSEDES the old unbounded `docker system prune -af --volumes` weekly job,
+# which removed ALL unused images immediately and could drop named volumes
+# holding data. The new job is age-gated and volume-safe and NEVER touches
+# /srv library/downloads or backups. See docs/runbooks/038-2026-05-29-retention-cleanup.md + the
+# no-data-removal hard rule. Emits a node_exporter textfile metric.
+- name: Create retention-cleanup log file
+  ansible.builtin.file:
+    path: "{{ common_retention_log | default('/var/log/retention-cleanup.log') }}"
+    state: touch
+    owner: root
+    group: root
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Deploy retention-cleanup script
+  ansible.builtin.template:
+    src: retention-cleanup.sh.j2
+    dest: /usr/local/bin/retention-cleanup.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy logrotate config for retention-cleanup log
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/retention-cleanup
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {{ common_retention_log | default('/var/log/retention-cleanup.log') }} {
+          weekly
+          rotate 8
+          compress
+          missingok
+          notifempty
+          create 0640 root root
+      }
+
+- name: Schedule weekly retention cleanup (Sun 04:00)
+  ansible.builtin.cron:
+    name: "retention cleanup"
+    user: root
+    weekday: "0"
+    hour: "4"
+    minute: "0"
+    job: "/usr/local/bin/retention-cleanup.sh"
+
+# Supersede the old unbounded docker-prune job cleanly (remove cron + script +
+# its logrotate stanza). The old /var/log/docker-prune.log is left in place so
+# its history survives; logrotate will age it out under its existing rule until
+# the file naturally rotates away.
+- name: Remove superseded docker system prune cron
+  ansible.builtin.cron:
+    name: "docker system prune"
+    user: "{{ item }}"
+    state: absent
+  loop:
+    - root
+    - "{{ docker_user }}"
+
+- name: Remove superseded docker-prune script + logrotate config
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /usr/local/bin/docker-prune.sh
+    - /etc/logrotate.d/docker-prune
+
+# Disk usage alert — runs every 6 hours, sends ntfy alert if threshold exceeded.
+# Owned by docker_user, matching another role's task for the same path: its
+# emitter/reconciler crons write state here as that user, while the root-run
+# alert scripts can write regardless. With owner root, every `make base`
+# flipped the directory to root and broke those writes until the next
+# deploy of that role flipped it back.
+- name: Ensure homelab state directory for alert cooldowns
+  ansible.builtin.file:
+    path: "{{ common_disk_alert_state_dir | default('/var/lib/homelab') }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Deploy disk usage alert script
+  ansible.builtin.template:
+    src: disk-alert.sh.j2
+    dest: /usr/local/bin/disk-alert.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule disk usage alert every 6 hours
+  ansible.builtin.cron:
+    name: "disk usage alert"
+    user: root
+    hour: "*/6"
+    minute: "15"
+    job: "/usr/local/bin/disk-alert.sh"
+    state: "{{ 'absent' if common_use_vmalert | default(false) else 'present' }}"
+
+# Memory monitoring — alerts on high swap, logs container memory usage
+- name: Create memory monitor log file
+  ansible.builtin.file:
+    path: /var/log/memory-monitor.log
+    state: touch
+    owner: root
+    group: root
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Deploy logrotate config for memory monitor log
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/memory-monitor
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      /var/log/memory-monitor.log {
+          weekly
+          rotate 4
+          compress
+          missingok
+          notifempty
+          create 0640 root root
+      }
+
+- name: Deploy memory monitoring script
+  ansible.builtin.template:
+    src: memory-alert.sh.j2
+    dest: /usr/local/bin/memory-alert.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule hourly memory monitoring
+  ansible.builtin.cron:
+    name: "memory monitor"
+    user: root
+    hour: "*"
+    minute: "30"
+    job: "/usr/local/bin/memory-alert.sh"
+    state: "{{ 'absent' if common_use_vmalert | default(false) else 'present' }}"
+
+# Unhealthy-watchdog — Sprint 016 Item A. Closes the gap where a container
+# is reporting health=unhealthy but its parent service (docker, systemd) is
+# perfectly happy to leave it that way. Same state-file + ntfy pattern as
+# disk-alert + memory-alert; budget cap of 5 restarts / 24 h prevents
+# restart-loop noise if a container is genuinely broken.
+- name: Create unhealthy-watchdog log file
+  ansible.builtin.file:
+    path: /var/log/unhealthy-watchdog.log
+    state: touch
+    owner: root
+    group: root
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Validate watchdog engine
+  ansible.builtin.assert:
+    that:
+      - common_watchdog_engine in ['go', 'legacy']
+
+- name: Probe installed watchdog command before selecting Go
+  ansible.builtin.command:
+    argv:
+      - "{{ homelab_runtime_binary | default('/usr/local/bin/homelab-agent') }}"
+      - unhealthy-watchdog
+      - --probe
+  changed_when: false
+  check_mode: false
+  when: common_watchdog_engine == 'go'
+
+- name: Create private watchdog ledger directory
+  ansible.builtin.file:
+    path: "{{ common_watchdog_ledger | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Deploy retained legacy watchdog
+  ansible.builtin.template:
+    src: unhealthy-watchdog-legacy.sh.j2
+    dest: /usr/local/bin/unhealthy-watchdog-legacy.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy watchdog notification helper
+  ansible.builtin.template:
+    src: watchdog-notify.sh.j2
+    dest: /usr/local/bin/watchdog-notify.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy unhealthy-watchdog script
+  ansible.builtin.template:
+    src: unhealthy-watchdog.sh.j2
+    dest: /usr/local/bin/unhealthy-watchdog.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule unhealthy-watchdog every 5 minutes
+  # NOTE: unhealthy-watchdog is NOT gated on common_use_vmalert — it both
+  # alerts AND restarts. vmalert has no equivalent action-side automation;
+  # this stays as cron under all configurations. Sprint 18 decom plan.
+  ansible.builtin.cron:
+    name: "unhealthy-watchdog"
+    user: root
+    minute: "*/5"
+    job: "/usr/local/bin/unhealthy-watchdog.sh"
+
+- name: Deploy logrotate config for unhealthy-watchdog log
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/unhealthy-watchdog
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      /var/log/unhealthy-watchdog.log {
+          weekly
+          rotate 4
+          compress
+          missingok
+          notifempty
+          create 0640 root root
+      }
+
+# PID-budget alert — Sprint 016 Item B. cgroup-v2 pids.current vs pids.max
+# per container; warn ≥70%, crit ≥90%; 24 h cooldown with hysteresis +
+# clear-event. Sister script to memory-alert.sh.
+- name: Create pid-budget-alert log file
+  ansible.builtin.file:
+    path: /var/log/pid-budget-alert.log
+    state: touch
+    owner: root
+    group: root
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Deploy pid-budget-alert script
+  ansible.builtin.template:
+    src: pid-budget-alert.sh.j2
+    dest: /usr/local/bin/pid-budget-alert.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule pid-budget-alert every 15 minutes
+  ansible.builtin.cron:
+    name: "pid-budget-alert"
+    user: root
+    minute: "10,25,40,55"
+    job: "/usr/local/bin/pid-budget-alert.sh"
+    state: "{{ 'absent' if common_use_vmalert | default(false) else 'present' }}"
+
+- name: Deploy logrotate config for pid-budget-alert log
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/pid-budget-alert
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      /var/log/pid-budget-alert.log {
+          weekly
+          rotate 4
+          compress
+          missingok
+          notifempty
+          create 0640 root root
+      }
+
+# CPU saturation alert — Sprint 017 Story 1. 5-min loadavg vs nproc with
+# hysteresis. Closes the outage shape PID/RAM/swap/disk/SMART don't catch.
+- name: Create cpu-load-alert log file
+  ansible.builtin.file:
+    path: /var/log/cpu-load-alert.log
+    state: touch
+    owner: root
+    group: root
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Deploy cpu-load-alert script
+  ansible.builtin.template:
+    src: cpu-load-alert.sh.j2
+    dest: /usr/local/bin/cpu-load-alert.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule cpu-load-alert every 5 minutes
+  ansible.builtin.cron:
+    name: "cpu-load-alert"
+    user: root
+    minute: "*/5"
+    job: "/usr/local/bin/cpu-load-alert.sh"
+    state: "{{ 'absent' if common_use_vmalert | default(false) else 'present' }}"
+
+- name: Deploy logrotate config for cpu-load-alert log
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/cpu-load-alert
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      /var/log/cpu-load-alert.log {
+          weekly
+          rotate 4
+          compress
+          missingok
+          notifempty
+          create 0640 root root
+      }
+
+# Dead-man's switch — heartbeat every 24h. If the operator stops seeing
+# these, ntfy is down, cron is broken, or the Pi is unreachable.
+- name: Deploy heartbeat script
+  ansible.builtin.template:
+    src: heartbeat.sh.j2
+    dest: /usr/local/bin/heartbeat.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule daily heartbeat (dead-man's switch)
+  ansible.builtin.cron:
+    name: "homelab heartbeat"
+    user: root
+    hour: "9"
+    minute: "0"
+    job: "/usr/local/bin/heartbeat.sh"
+
+# Restore-drill nudge — Sprint 017 Story 6. Quarterly ntfy reminder to run
+# the next backup-restore drill (cron fires on 1st Monday of Jan/Apr/Jul/Oct
+# at 10:00). The script's date guard handles the "1st Monday" constraint
+# that cron can't express directly.
+- name: Deploy restore-drill nudge script
+  ansible.builtin.template:
+    src: restore-drill-nudge.sh.j2
+    dest: /usr/local/bin/restore-drill-nudge.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule quarterly restore-drill nudge (1st Monday Jan/Apr/Jul/Oct 10:00)
+  ansible.builtin.cron:
+    name: "restore-drill nudge"
+    user: root
+    minute: "0"
+    hour: "10"
+    day: "1-7"
+    month: "1,4,7,10"
+    weekday: "1"
+    job: "/usr/local/bin/restore-drill-nudge.sh"
+
+# External dead-man's-switch — composite-liveness beat to healthchecks.io every
+# 5 min. The only alert path that survives the Pi itself dying. No-ops until
+# vault_healthchecks_ping_url is set. See templates/deadman-heartbeat.sh.j2.
+- name: Deploy dead-man's-switch heartbeat script
+  ansible.builtin.template:
+    src: deadman-heartbeat.sh.j2
+    dest: /usr/local/bin/deadman-heartbeat.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule dead-man's-switch heartbeat (every 5 min)
+  ansible.builtin.cron:
+    name: "deadman heartbeat"
+    user: root
+    minute: "*/5"
+    job: "/usr/local/bin/deadman-heartbeat.sh"
+
+# SMART disk health check — daily. Alerts on SMART failure or reallocated
+# sector growth. Requires smartmontools package (common/packages.yml).
+- name: Include SMART collector tasks
+  ansible.builtin.include_tasks: smart.yml
+
+# The Debian smartmontools package ships an auto-enabled smartd daemon
+# that scans devices at boot and exits with status 17 ("No devices to
+# monitor") because the USB-SATA bridge on this Pi doesn't expose SMART
+# through smartd's default probe. The custom smart-check.sh above uses
+# the `-d scsi` override from inventory and replaces smartd entirely.
+# Masked (not just disabled) so package upgrades can't silently
+# re-enable via `systemctl preset`.
+- name: Mask redundant smartmontools.service (replaced by smart-check.sh cron)
+  ansible.builtin.systemd:
+    # Canonical unit name on Debian is `smartmontools.service`; `smartd.service`
+    # is an Alias=. Masking the alias fails because /etc/systemd/system/smartd.service
+    # already symlinks into /usr/lib/systemd/system/smartmontools.service — mask
+    # the real unit instead.
+    name: smartmontools.service
+    masked: true
+    enabled: false
+    state: stopped
+  become: true
+  notify: Reset failed state for smartmontools.service

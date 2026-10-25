@@ -1,0 +1,7 @@
+---
+my-docker:
+  socket: /var/run/docker.sock
+  # showStats off: pulling live CPU/mem for ~25 containers every refresh was a
+  # real Pi-CPU + render cost. Container status dot still shows; just no live
+  # stat polling. (Homepage dashboard restructure 2026-06-07.)
+  showStats: false

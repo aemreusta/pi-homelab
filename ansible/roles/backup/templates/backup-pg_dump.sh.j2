@@ -1,0 +1,76 @@
+#!/bin/bash
+# backup-pg_dump.sh — online pg_dump via docker exec against a live PostgreSQL
+# container. Produces a gzip-compressed SQL dump; no downtime required.
+#
+# Invoked by homelab-backup.sh with:
+#   $1=service_name  $2=container_name  $3=database_name
+#
+# The dump is written atomically (partial → mv) so a same-day re-run or
+# mid-write kill never corrupts the previous snapshot.
+set -uo pipefail
+
+BACKUP_ROOT="{{ backup_root }}"
+SERVICE="$1"
+CONTAINER="$2"
+DB_NAME="$3"
+
+DATE="$(date -u +%Y-%m-%d)"
+DEST_DIR="${BACKUP_ROOT}/${SERVICE}/${DATE}"
+PARTIAL="${DEST_DIR}/${SERVICE}.sql.gz.partial.$$"
+FINAL="${DEST_DIR}/${SERVICE}.sql.gz"
+
+mkdir -p "$DEST_DIR"
+
+cleanup_partial() {
+    rm -f "$PARTIAL"
+}
+trap cleanup_partial EXIT INT TERM
+
+# Verify the container is healthy before attempting a dump.
+if ! docker exec "$CONTAINER" pg_isready -U postgres -d "$DB_NAME" >/dev/null 2>&1; then
+    printf '{"service":"%s","method":"pg_dump","status":"fail","bytes":0,"duration_ms":0,"error":"pg_isready failed for %s/%s"}\n' \
+        "$SERVICE" "$CONTAINER" "$DB_NAME"
+    exit 1
+fi
+
+start_ms=$(date +%s%3N)
+
+# pg_dump writes to stdout; pipe directly into gzip → partial file.
+# -Fp = plain SQL format (portable, human-readable, easy restore: psql < dump.sql)
+# --no-password: auth via trust or PGPASSWORD (container is loopback-only anyway)
+docker exec "$CONTAINER" pg_dump -U postgres -Fp "$DB_NAME" \
+    2>/tmp/backup-${SERVICE}.err \
+    | gzip -c > "$PARTIAL"
+
+# Check both sides of the pipe. pg_dump exit code comes from docker exec exit code;
+# gzip exit code would be masked by the pipe — use explicit rc tracking.
+rc=$?
+
+if [ "$rc" -ne 0 ]; then
+    err=$(head -c 200 /tmp/backup-${SERVICE}.err 2>/dev/null | tr '\n' ' ')
+    rm -f "$PARTIAL" /tmp/backup-${SERVICE}.err
+    duration_ms=$(( $(date +%s%3N) - start_ms ))
+    printf '{"service":"%s","method":"pg_dump","status":"fail","bytes":0,"duration_ms":%d,"error":"%s"}\n' \
+        "$SERVICE" "$duration_ms" "$err"
+    exit 1
+fi
+
+# Sanity: a valid gzip SQL dump must be non-empty and decompressible.
+if [ ! -s "$PARTIAL" ] || ! gzip -t "$PARTIAL" 2>/dev/null; then
+    rm -f "$PARTIAL" /tmp/backup-${SERVICE}.err
+    duration_ms=$(( $(date +%s%3N) - start_ms ))
+    printf '{"service":"%s","method":"pg_dump","status":"fail","bytes":0,"duration_ms":%d,"error":"dump empty or corrupt"}\n' \
+        "$SERVICE" "$duration_ms"
+    exit 1
+fi
+
+# Atomic rename — previous snapshot stays intact until this succeeds.
+mv -f "$PARTIAL" "$FINAL"
+trap - EXIT INT TERM
+
+duration_ms=$(( $(date +%s%3N) - start_ms ))
+bytes=$(stat -c '%s' "$FINAL")
+rm -f /tmp/backup-${SERVICE}.err
+
+printf '{"service":"%s","method":"pg_dump","status":"ok","bytes":%d,"duration_ms":%d}\n' \
+    "$SERVICE" "$bytes" "$duration_ms"

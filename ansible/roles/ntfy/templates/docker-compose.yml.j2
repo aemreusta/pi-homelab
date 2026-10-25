@@ -1,0 +1,73 @@
+---
+# ntfy — self-hosted push notification service
+# https://docs.ntfy.sh/install/#docker
+
+services:
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: ntfy
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ ntfy_mem_limit }}
+    pids_limit: {{ ntfy_pids_limit }}
+    read_only: {{ ntfy_read_only | lower }}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size={{ ntfy_tmpfs_size }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in ntfy_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+    cap_add:
+{% for cap in ntfy_cap_add %}
+      - {{ cap }}
+{% endfor %}
+    labels:
+{% for k, v in ntfy_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    command: serve
+    ports:
+      - "{{ ntfy_port }}:80"
+    volumes:
+      - {{ ntfy_data_dir }}:/var/lib/ntfy
+    environment:
+      - TZ={{ ntfy_tz }}
+      # NTFY_BASE_URL governs action-button + attachment URLs in delivered
+      # notifications + the web app. It is the PUBLIC (https, via Traefik) URL so
+      # links work on phones over LAN and Tailscale (doc 025 Phase 2). Internal
+      # senders keep POSTing to the http :2586 path (ntfy_external_* vars) — those
+      # are decoupled from this public URL on purpose.
+      - NTFY_BASE_URL={{ ntfy_public_url }}
+      - NTFY_CACHE_FILE=/var/lib/ntfy/cache.db
+      # Behind Traefik now: trust X-Forwarded-* for visitor/rate-limit accounting
+      # and the https scheme. The :2586 host port stays published for internal
+      # senders + the Traefik backend (http://127.0.0.1:2586).
+      - NTFY_BEHIND_PROXY=true
+      # Expose Prometheus metrics at /metrics for vmagent scraping.
+      - NTFY_ENABLE_METRICS=true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --tries=1 http://localhost:80/v1/health -O - | grep -Eo '\"healthy\"\\s*:\\s*true' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - default
+      # media_net joined so pipeline scripts inside the media containers can
+      # reach ntfy via its service hostname (http://ntfy:80) instead of
+      # bouncing through host LAN IP + hairpin NAT.
+      - media_net
+
+networks:
+  default:
+    name: ntfy_default
+  media_net:
+    external: true
+    name: "{{ ntfy_media_network_name | default('media_media_net') }}"

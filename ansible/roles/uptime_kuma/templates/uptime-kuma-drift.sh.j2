@@ -1,0 +1,115 @@
+#!/bin/bash
+# Uptime Kuma config drift check — managed by Ansible, do not edit.
+#
+# The committed backup JSON (roles/uptime_kuma/files/uptime-kuma-backup.json) is
+# the "source of truth", but a UI edit silently diverges from it with nothing to
+# catch it — so the reproducibility claim decays the first time someone clicks
+# "add monitor". This weekly cron compares the LIVE monitor set (UK /metrics,
+# which labels every series with monitor_name) against the committed JSON
+# deployed alongside it, emits a textfile metric (silent-cron hard rule), and the
+# UptimeKumaConfigDrift vmalert fires on mismatch.
+#
+# Scope: detects add / remove / rename (the common drift). Field-level edits
+# (e.g. a URL change on an existing monitor) are NOT caught — that needs the
+# socket API; documented limitation, the name-set check covers the usual case.
+#
+# Pass -v to print the diff (used by `make uptime-kuma-drift`).
+
+set -uo pipefail
+
+KEY="{{ vault_uptime_kuma_metrics_key | default('') }}"
+UK_URL="{{ uptime_kuma_metrics_url | default('http://127.0.0.1:3011') }}"
+JSON="{{ uptime_kuma_compose_dir }}/uptime-kuma-backup.json"
+TEXTFILE_DIR="{{ common_node_exporter_textfile_dir | default('/var/lib/node_exporter/textfile') }}"
+TEXTFILE="${TEXTFILE_DIR}/uptime_kuma_drift.prom"
+VERBOSE=0; [ "${1:-}" = "-v" ] && VERBOSE=1
+
+emit() {  # $1=drift(0/1/-1 error) $2=live_count $3=committed_count
+    [ -d "$TEXTFILE_DIR" ] || return 0
+    local tmp="${TEXTFILE}.$$"
+    if {
+        echo "# HELP uptime_kuma_config_drift 1 if live monitor set differs from the committed JSON, 0 if matched, -1 on check error."
+        echo "# TYPE uptime_kuma_config_drift gauge"
+        echo "uptime_kuma_config_drift ${1}"
+        echo "# HELP uptime_kuma_config_drift_last_run_unix_seconds Unix time of the last drift check."
+        echo "# TYPE uptime_kuma_config_drift_last_run_unix_seconds gauge"
+        echo "uptime_kuma_config_drift_last_run_unix_seconds $(date +%s)"
+        echo "# HELP uptime_kuma_monitors_live Monitor count seen live via /metrics."
+        echo "# TYPE uptime_kuma_monitors_live gauge"
+        echo "uptime_kuma_monitors_live ${2}"
+        echo "# HELP uptime_kuma_monitors_committed Monitor count in the committed backup JSON."
+        echo "# TYPE uptime_kuma_monitors_committed gauge"
+        echo "uptime_kuma_monitors_committed ${3}"
+        echo "# HELP uptime_kuma_notify_target_up 1 if the notification target each live notification row points at actually answers, 0 if it does not resolve/connect, -1 if unknown."
+        echo "# TYPE uptime_kuma_notify_target_up gauge"
+        printf '%s' "${NOTIFY_METRICS:-}"
+    } > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$TEXTFILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+}
+
+# --- Notification-target liveness ----------------------------------------
+# The name-set diff above compares config against config, so it is blind to the
+# failure that actually happened: BOTH sides named `http://ntfy.example:2586`,
+# which stopped resolving at the 2026-07-15 .example -> .example.internal cut.
+# 23 monitors could not notify for three weeks and drift still reported 0.
+#
+# A comparison cannot catch a value that is wrong on both sides — only a probe
+# of the real target can. So resolve + connect to whatever the LIVE rows point
+# at and emit per-notification up/down. Populates $NOTIFY_METRICS for emit().
+probe_notify_targets() {
+    NOTIFY_METRICS=""
+    local rows
+    rows=$(docker exec uptime-kuma sqlite3 /app/data/kuma.db \
+        "SELECT name || '|' || COALESCE(json_extract(config,'\$.ntfyserverurl'),'') FROM notification WHERE active=1;" \
+        2>/dev/null) || return 0
+    [ -n "$rows" ] || return 0
+    local name url code up
+    while IFS='|' read -r name url; do
+        [ -n "${url:-}" ] || continue
+        # /v1/health is ntfy's own liveness endpoint; any HTTP answer proves the
+        # name resolved and the port is open, which is the whole question here.
+        code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "${url%/}/v1/health" 2>/dev/null || echo 000)
+        if [ "$code" = "000" ]; then up=0; else up=1; fi
+        NOTIFY_METRICS="${NOTIFY_METRICS}uptime_kuma_notify_target_up{notification=\"${name//\"/}\",url=\"${url//\"/}\"} ${up}
+"
+        [ "$VERBOSE" -eq 1 ] && echo "notify target ${name} -> ${url} : http=${code} up=${up}"
+    done <<< "$rows"
+}
+probe_notify_targets
+
+if [ -z "$KEY" ] || [ ! -f "$JSON" ]; then
+    [ "$VERBOSE" -eq 1 ] && echo "drift-check skipped: metrics key unset or backup JSON missing ($JSON)"
+    emit -1 0 0
+    exit 0
+fi
+
+# Live monitor names from /metrics (basic-auth: any user, API key as password).
+live=$(curl -sf -u "drift:${KEY}" -m 15 "${UK_URL%/}/metrics" 2>/dev/null \
+    | grep -oE 'monitor_name="[^"]*"' | sed -E 's/monitor_name="(.*)"/\1/' | sort -u)
+if [ -z "$live" ]; then
+    [ "$VERBOSE" -eq 1 ] && echo "drift-check error: no monitors from /metrics (UK down or key wrong)"
+    emit -1 0 0
+    exit 0
+fi
+
+# Committed monitor names from the deployed backup JSON.
+committed=$(python3 -c "import json,sys; print('\n'.join(sorted(m['name'] for m in json.load(open('$JSON'))['monitorList'])))" 2>/dev/null | sort -u)
+
+live_n=$(printf '%s\n' "$live" | grep -c .)
+committed_n=$(printf '%s\n' "$committed" | grep -c .)
+
+if [ "$live" = "$committed" ]; then
+    [ "$VERBOSE" -eq 1 ] && echo "no drift: ${live_n} monitors match the committed JSON"
+    emit 0 "$live_n" "$committed_n"
+else
+    if [ "$VERBOSE" -eq 1 ]; then
+        echo "DRIFT detected (live=${live_n} committed=${committed_n}):"
+        echo "  only live (added in UI, not committed):"; comm -23 <(printf '%s\n' "$live") <(printf '%s\n' "$committed") | sed 's/^/    + /'
+        echo "  only committed (removed in UI / not yet seeded):"; comm -13 <(printf '%s\n' "$live") <(printf '%s\n' "$committed") | sed 's/^/    - /'
+    fi
+    emit 1 "$live_n" "$committed_n"
+fi
+exit 0

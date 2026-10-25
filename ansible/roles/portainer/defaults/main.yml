@@ -1,0 +1,31 @@
+---
+portainer_compose_dir: /home/{{ docker_user }}/docker/core/portainer
+portainer_data_dir: /home/{{ docker_user }}/docker/core/portainer/data
+portainer_tz: "{{ timezone }}"
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+portainer_mem_limit: 256M
+
+# --- Container security hardening ---
+
+# PID limit — Portainer is a Go binary plus a handful of exec workers.
+portainer_pids_limit: 200
+
+# Read-only root filesystem; /tmp via tmpfs. /data is the bind mount and stays writable.
+portainer_read_only: true
+portainer_tmpfs_size: 64m
+
+# Linux capabilities. Drop all — Portainer binds port 9000/9443 (non-privileged) and
+# accesses docker.sock as the file's owner (root), so no caps needed.
+portainer_cap_drop:
+  - ALL
+portainer_cap_add: []
+
+# OCI image labels (applied to the container).
+portainer_oci_labels:
+  org.opencontainers.image.title: portainer
+  org.opencontainers.image.description: "Portainer CE — Docker container management UI"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/portainer/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://www.portainer.io"

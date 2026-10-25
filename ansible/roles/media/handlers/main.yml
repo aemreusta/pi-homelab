@@ -1,0 +1,16 @@
+---
+- name: Restart media stack
+  community.docker.docker_compose_v2:
+    project_src: "{{ media_compose_dir }}"
+    state: restarted
+  become: true
+  become_user: "{{ docker_user }}"
+
+- name: Restart qbittorrent
+  community.docker.docker_compose_v2:
+    project_src: "{{ media_compose_dir }}"
+    services:
+      - qbittorrent
+    state: restarted
+  become: true
+  become_user: "{{ docker_user }}"

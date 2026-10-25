@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Off-site backup push: {{ gdrive_backup_source }} -> {{ gdrive_backup_remote }}
+# MANAGED BY ANSIBLE (roles/gdrive_backup) — do not edit on the host.
+#
+# Runs after the weekly local backup. The local set is the fast restore path;
+# this is the copy that survives the Pi losing its disk — which, on this box,
+# is not hypothetical (five USB outages 2026-08-01/02).
+set -uo pipefail
+
+RCLONE="{{ gdrive_backup_rclone_bin }}"
+SRC="{{ gdrive_backup_source }}"
+DST="{{ gdrive_backup_remote }}"
+LOG="{{ gdrive_backup_log }}"
+NTFY_URL="{{ gdrive_backup_ntfy_url }}"
+TF_DIR="{{ gdrive_backup_textfile_dir }}"
+LOCK="{{ gdrive_backup_lock_file | default('/var/lock/homelab-gdrive-sync.lock') }}"
+AGENT="{{ gdrive_backup_go_binary | default('/usr/local/bin/homelab-agent') }}"
+DETAIL_LOG="{{ gdrive_backup_detail_log | default('/var/log/homelab-gdrive-rclone.log') }}"
+LAST_SUCCESS="{{ gdrive_backup_last_success_file | default('/var/lib/homelab/gdrive-backup/last-success') }}"
+SUMMARY=""
+
+log() { printf '{"ts":"%s",%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${1#\{}" >> "$LOG"; }
+
+ntfy_send() {
+    [ -z "$NTFY_URL" ] && return 0
+    curl -sf -H "Title: $1" -H "Priority: $2" -H "Tags: $3" -d "$4" "$NTFY_URL" >/dev/null 2>&1 || true
+}
+
+# Emit metrics on EVERY exit path, including the failure ones. A sync that
+# dies silently and leaves yesterday's gauge behind is the silent-cron class
+# this repo has been bitten by four times (CLAUDE.md hard rule #1).
+success=0; bytes=0; errors=0; started=$(date +%s); rc=2
+last_success=0
+if [ -r "$LAST_SUCCESS" ]; then read -r last_success < "$LAST_SUCCESS"; fi
+case "$last_success" in ''|*[!0-9]*) last_success=0 ;; esac
+quota_total=0; quota_used=0; quota_free=0; remote_bytes=0; remote_objects=0
+emit() {
+    [ -d "$TF_DIR" ] || return 0
+    local tf="$TF_DIR/gdrive_backup.prom" tmp
+    tmp="$TF_DIR/gdrive_backup.prom.$$"
+    if {
+        echo "# HELP gdrive_backup_last_run_unix_seconds Unix time of the last sync attempt."
+        echo "# TYPE gdrive_backup_last_run_unix_seconds gauge"
+        echo "gdrive_backup_last_run_unix_seconds $(date +%s)"
+        echo "# HELP gdrive_backup_success 1 if the last sync completed cleanly, else 0."
+        echo "# TYPE gdrive_backup_success gauge"
+        echo "gdrive_backup_success ${success}"
+        echo "# HELP gdrive_backup_duration_seconds Wall-clock duration of the last sync."
+        echo "# TYPE gdrive_backup_duration_seconds gauge"
+        echo "gdrive_backup_duration_seconds $(( $(date +%s) - started ))"
+        echo "# HELP gdrive_backup_transferred_bytes Bytes transferred by the last sync."
+        echo "# TYPE gdrive_backup_transferred_bytes gauge"
+        echo "gdrive_backup_transferred_bytes ${bytes}"
+        echo "# HELP gdrive_backup_errors Errors reported by rclone on the last sync."
+        echo "# TYPE gdrive_backup_errors gauge"
+        echo "gdrive_backup_errors ${errors}"
+        echo "# HELP gdrive_backup_last_success_unix_seconds Last completed successful sync (0 if unknown)."
+        echo "# TYPE gdrive_backup_last_success_unix_seconds gauge"
+        echo "gdrive_backup_last_success_unix_seconds ${last_success}"
+        echo "# HELP gdrive_backup_exit_code Last sync or observer exit code."
+        echo "# TYPE gdrive_backup_exit_code gauge"
+        echo "gdrive_backup_exit_code ${rc}"
+        echo "# HELP gdrive_quota_bytes Google Drive account quota."
+        echo "# TYPE gdrive_quota_bytes gauge"
+        echo "gdrive_quota_bytes{state=\"total\"} ${quota_total}"
+        echo "gdrive_quota_bytes{state=\"used\"} ${quota_used}"
+        echo "gdrive_quota_bytes{state=\"free\"} ${quota_free}"
+        echo "# HELP gdrive_remote_bytes Size of the homelab tree on Drive."
+        echo "# TYPE gdrive_remote_bytes gauge"
+        echo "gdrive_remote_bytes ${remote_bytes}"
+        echo "# HELP gdrive_remote_objects Object count of the homelab tree on Drive."
+        echo "# TYPE gdrive_remote_objects gauge"
+        echo "gdrive_remote_objects ${remote_objects}"
+    } > "$tmp"; then
+        [ -s "$tmp" ] && mv "$tmp" "$tf" || rm -f "$tmp"
+    else
+        rm -f "$tmp"
+    fi
+}
+exec 9>"$LOCK" || exit 1
+flock -n 9 || { log '"event":"skip","reason":"already_running"}'; exit 0; }
+# Only the lock owner may publish; a skipped run cannot overwrite its state.
+trap '[ -z "$SUMMARY" ] || rm -f "$SUMMARY"; emit' EXIT
+if [ ! -x "$AGENT" ]; then
+    log '"event":"abort","reason":"observer_missing"}'
+    exit 2
+fi
+SUMMARY=$(mktemp) || exit 2
+
+if [ ! -x "$RCLONE" ]; then
+    log '"event":"abort","reason":"rclone_missing"}'
+    ntfy_send "Drive backup ABORTED" high "rotating_light,cloud" "rclone binary missing at $RCLONE."
+    exit 2
+fi
+
+# Refuse to sync an empty source. `rclone sync` mirrors deletions, so an empty
+# or unmounted SRC would DELETE the entire off-site copy — turning a local
+# problem into the loss of the last surviving backup.
+file_count=$(find "$SRC" -type f 2>/dev/null | wc -l)
+if [ "$file_count" -eq 0 ]; then
+    log '"event":"abort","reason":"source_empty"}'
+    ntfy_send "Drive backup ABORTED — source empty" urgent "rotating_light,cloud" \
+        "${SRC} contains no files. Refusing to sync, because rclone sync would delete the off-site copy. Check that the weekly backup ran."
+    exit 2
+fi
+
+log "\"event\":\"start\",\"src\":\"$SRC\",\"files\":$file_count}"
+
+# Flag notes, because each of these is load-bearing rather than tuning:
+#   --drive-use-trash=false  deletions actually free quota. By default Drive
+#                            trashes them and they keep consuming the 5 TB for
+#                            30 more days — with `sync` mirroring retention
+#                            prunes weekly, that silently accumulates.
+#   --fast-list              one recursive listing instead of per-directory
+#                            calls. Fewer API hits = less rate-limiting on the
+#                            shared client ID.
+#   --drive-chunk-size 64M   bigger upload chunks; the default 8M costs extra
+#                            round-trips on multi-hundred-MB dumps.
+#   --drive-stop-on-upload-limit  abort cleanly at Drive's 750 GB/day cap
+#                            instead of grinding through doomed retries.
+#   --tpslimit               keep well under Drive's per-second quota.
+"$RCLONE" sync "$SRC" "$DST" \
+    --config "{{ gdrive_backup_config_path }}" \
+    --transfers {{ gdrive_backup_transfers }} \
+    --checkers {{ gdrive_backup_checkers }} \
+    --drive-use-trash=false \
+    --fast-list \
+    --drive-chunk-size {{ gdrive_backup_chunk_size }} \
+    --drive-stop-on-upload-limit \
+    --tpslimit {{ gdrive_backup_tpslimit }} \
+{% if gdrive_backup_bwlimit | length > 0 %}
+    --bwlimit {{ gdrive_backup_bwlimit }} \
+{% endif %}
+    --retries 3 \
+    --stats 1m --stats-log-level INFO \
+    --use-json-log --log-level INFO 2>&1 | \
+    "$AGENT" backup-observe "$DETAIL_LOG" "$TF_DIR/gdrive_backup_progress.prom" > "$SUMMARY"
+pipe_status=("${PIPESTATUS[@]}")
+rc=${pipe_status[0]}
+if [ "${pipe_status[1]}" -ne 0 ]; then
+    log "\"event\":\"observer_failed\",\"rc\":${pipe_status[1]}}"
+    [ "$rc" -ne 0 ] || rc=${pipe_status[1]}
+fi
+
+bytes=$(grep -oE '"bytes":[0-9]+' "$SUMMARY" | tail -1 | cut -d: -f2)
+case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
+errors=$(grep -oE '"errors":[0-9]+' "$SUMMARY" | tail -1 | cut -d: -f2)
+case "$errors" in ''|*[!0-9]*) errors=0 ;; esac
+
+# Quota and tree size, for the size-tracking gauges. Best-effort: a failure
+# here must never mask the sync's own result, so parse defensively and leave
+# the gauges at 0 rather than aborting.
+# NOTE the whitespace tolerance. `rclone about --json` PRETTY-PRINTS
+# ("used": 123), while `rclone size --json` is compact ({"bytes":123}). A
+# pattern written for one silently returns nothing for the other — which is how
+# the quota gauges shipped as permanent zeros on the first run, leaving
+# GdriveQuotaHigh computing 0/0 and therefore never able to fire.
+json_num() { printf '%s' "$2" | grep -oE "\"$1\"[[:space:]]*:[[:space:]]*[0-9]+" | head -1 | grep -oE '[0-9]+$'; }
+
+about=$("$RCLONE" about "gdrive:" --config "{{ gdrive_backup_config_path }}" --json 2>/dev/null)
+for k in total used free; do
+    v=$(json_num "$k" "$about")
+    case "$v" in ''|*[!0-9]*) v=0 ;; esac
+    case "$k" in total) quota_total=$v ;; used) quota_used=$v ;; free) quota_free=$v ;; esac
+done
+sz=$("$RCLONE" size "gdrive:{{ gdrive_backup_root_folder }}" --config "{{ gdrive_backup_config_path }}" --json 2>/dev/null)
+remote_bytes=$(json_num bytes "$sz")
+remote_objects=$(json_num count "$sz")
+case "$remote_bytes" in ''|*[!0-9]*) remote_bytes=0 ;; esac
+case "$remote_objects" in ''|*[!0-9]*) remote_objects=0 ;; esac
+
+if [ "$rc" -eq 0 ]; then
+    last_success=$(date +%s)
+    if ! { printf '%s\n' "$last_success" > "$LAST_SUCCESS.tmp" && mv "$LAST_SUCCESS.tmp" "$LAST_SUCCESS"; }; then
+        rc=1
+        log '"event":"state_write_failed"}'
+        exit "$rc"
+    fi
+    success=1
+    log "\"event\":\"done\",\"status\":\"ok\",\"bytes\":$bytes}"
+else
+    log "\"event\":\"done\",\"status\":\"fail\",\"rc\":$rc,\"errors\":$errors}"
+    ntfy_send "Drive backup FAILED" high "rotating_light,cloud" \
+        "rclone sync exited $rc with $errors error(s). Off-site copy is now STALE. Detailed log: $DETAIL_LOG; summary: $LOG"
+fi
+exit "$rc"

@@ -1,0 +1,33 @@
+---
+- name: Converge — render vmagent templates to tmp dir for assertion
+  hosts: localhost
+  gather_facts: false
+  vars:
+    docker_user: pi
+    timezone: Europe/Istanbul
+  pre_tasks:
+    - name: Load role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../defaults/main.yml"
+
+    - name: Override compose/data/config dirs to a tmp sandbox
+      ansible.builtin.set_fact:
+        vmagent_compose_dir: /tmp/molecule-vmagent
+        vmagent_data_dir: /tmp/molecule-vmagent/data
+        vmagent_config_dir: /tmp/molecule-vmagent/config
+
+    - name: Ensure sandbox dirs exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ vmagent_compose_dir }}"
+        - "{{ vmagent_data_dir }}"
+        - "{{ vmagent_config_dir }}"
+  tasks:
+    - name: Render docker-compose.yml
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../templates/docker-compose.yml.j2"
+        dest: "{{ vmagent_compose_dir }}/docker-compose.yml"
+        mode: "0644"

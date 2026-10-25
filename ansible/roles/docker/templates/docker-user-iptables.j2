@@ -1,0 +1,16 @@
+# Docker DOCKER-USER chain rules
+# Managed by Ansible - do not edit manually
+#
+# Only restricts traffic entering from external interfaces.
+# Container-to-container and container-to-internet traffic is untouched.
+*filter
+:DOCKER-USER - [0:0]
+-F DOCKER-USER
+-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+-A DOCKER-USER -i docker0 -j RETURN
+-A DOCKER-USER -i br-+ -j RETURN
+{% for network in docker_trusted_networks %}
+-A DOCKER-USER -s {{ network }} -j RETURN
+{% endfor %}
+-A DOCKER-USER -j DROP
+COMMIT

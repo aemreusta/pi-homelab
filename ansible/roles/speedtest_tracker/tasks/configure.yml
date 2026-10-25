@@ -1,0 +1,58 @@
+---
+# Post-deploy configuration — set in the app's settings DB, which the image
+# does not expose as env vars. Idempotent (the PHP script prints CHANGED only
+# when it modifies a value). See templates/configure-integrations.php.j2.
+
+- name: Deploy Speedtest integration-config script
+  ansible.builtin.template:
+    src: configure-integrations.php.j2
+    dest: "{{ speedtest_tracker_config_dir }}/{{ speedtest_tracker_configure_script }}"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+
+# Toggling the Prometheus integration changes a cached setting; the notified
+# handler restarts speedtest so the web process picks it up (only on change).
+- name: Apply Speedtest integration settings (Prometheus enable)
+  ansible.builtin.command:
+    cmd: "docker exec speedtest-tracker php /config/{{ speedtest_tracker_configure_script }}"
+  register: speedtest_tracker_configure
+  changed_when: "'CHANGED' in speedtest_tracker_configure.stdout"
+  failed_when: speedtest_tracker_configure.rc != 0
+  # The container may still be running first-boot migrations when this fires;
+  # the script exits 1 ("DB not ready"/"row missing") until they finish.
+  retries: 6
+  delay: 10
+  until: speedtest_tracker_configure.rc == 0
+  become: true
+  become_user: "{{ docker_user }}"
+  notify: Restart speedtest_tracker
+
+# WAL journal mode — the image ships journal_mode=delete, which caused
+# "database is locked" (SQLITE_BUSY) under load (web reads vs queue/scheduler
+# writes). WAL is persistent in the DB header (survives restarts), so this runs
+# once and is a no-op thereafter. Placed AFTER the integration-settings task +
+# its restart handler: WAL persists across the restart, and the retries below
+# cover the ~restart window if the handler fired. No notify — WAL needs none.
+- name: Deploy Speedtest SQLite WAL script
+  ansible.builtin.template:
+    src: configure-sqlite-wal.php.j2
+    dest: "{{ speedtest_tracker_config_dir }}/{{ speedtest_tracker_wal_script }}"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+
+- name: Convert Speedtest SQLite DB to WAL journal mode
+  ansible.builtin.command:
+    cmd: "docker exec speedtest-tracker php /config/{{ speedtest_tracker_wal_script }}"
+  register: speedtest_tracker_wal
+  changed_when: "'CHANGED' in speedtest_tracker_wal.stdout"
+  failed_when: speedtest_tracker_wal.rc != 0
+  # Mirrors the integration task: the container may still be migrating on first
+  # boot (script exits 1 until the DB is ready), and this also covers the
+  # restart window if the handler above fired.
+  retries: 6
+  delay: 10
+  until: speedtest_tracker_wal.rc == 0
+  become: true
+  become_user: "{{ docker_user }}"

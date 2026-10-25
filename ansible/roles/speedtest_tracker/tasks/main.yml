@@ -1,0 +1,16 @@
+---
+- name: Include Speedtest Tracker deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [speedtest_tracker]
+
+- name: Include Speedtest Tracker configure tasks
+  ansible.builtin.include_tasks: configure.yml
+  tags: [speedtest_tracker, configure]
+
+- name: Include Speedtest Tracker weekly-report tasks
+  ansible.builtin.include_tasks: alerts.yml
+  tags: [speedtest_tracker, alerts]
+
+- name: Include Speedtest Tracker UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [speedtest_tracker, firewall]

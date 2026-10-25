@@ -1,0 +1,32 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# Remove a stale qBittorrent application lockfile at container init.
+#
+# Why: qBittorrent's QLockFile (/config/qBittorrent/config/lockfile) stores the
+# holder's PID **and hostname**. When the container is recreated (image update /
+# Watchtower) or qbittorrent-nox is SIGKILL'd (e.g. by unhealthy-watchdog), the
+# lockfile is left behind. On the next start the hostname in the lockfile no
+# longer matches the new container's hostname, so QLockFile refuses to steal it
+# and qbittorrent-nox exits 0 **silently and immediately** — identical symptom
+# to the v5.2.0 missing-`--profile` bug (see 01-profile-fix.sh). s6 + the
+# unhealthy-watchdog then respawn nox in a loop; the WebUI never binds, every
+# pipeline qbit_login probe fails, and the import pipeline stalls.
+#
+# This hook runs in /custom-cont-init.d, which the LSIO init executes BEFORE the
+# s6 qbittorrent service starts. At that point no qbittorrent-nox can legitimately
+# hold the lock, so any lockfile present is by definition stale — remove it
+# unconditionally. Safe: the lockfile is a single-instance guard, never data.
+#
+# Incident: docs/incidents/2026-05-29-qbit-stale-lockfile-respawn-loop.md
+# Verified on lscr.io/linuxserver/qbittorrent:5.2.1_v2.0.12-ls459.
+
+set -euo pipefail
+
+LOCKFILE=/config/qBittorrent/config/lockfile
+
+if [[ -e "$LOCKFILE" ]]; then
+  rm -f "$LOCKFILE"
+  echo "[qbit-clear-stale-lock] removed stale lockfile $LOCKFILE"
+else
+  echo "[qbit-clear-stale-lock] no lockfile present — nothing to do"
+fi

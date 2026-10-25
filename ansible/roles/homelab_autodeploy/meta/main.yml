@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  role_name: homelab_autodeploy
+  namespace: homelab
+  author: operator
+  description: Pi-side GitOps CD for the raspi-homelab repo (auto-deploy changed roles + rollback, design 039)
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+        - trixie
+dependencies: []

@@ -1,0 +1,7 @@
+---
+- name: Restart alertmanager
+  community.docker.docker_compose_v2:
+    project_src: "{{ alertmanager_compose_dir }}"
+    state: restarted
+  become: true
+  become_user: "{{ docker_user }}"

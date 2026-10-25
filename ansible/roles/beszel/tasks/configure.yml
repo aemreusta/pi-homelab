@@ -1,0 +1,206 @@
+---
+- name: Wait for Beszel to be ready
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/health"
+    status_code: 200
+  register: beszel_health
+  retries: 10
+  delay: 3
+  until: beszel_health.status == 200
+
+# Authenticate to check if admin already exists.
+# PocketBase v0.22+ uses /api/collections/_superusers/auth-with-password.
+# Returns 200 if account exists, 4xx if not yet created.
+- name: Check if Beszel admin already exists
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/collections/_superusers/auth-with-password"
+    method: POST
+    body_format: json
+    body:
+      identity: "{{ beszel_admin_email }}"
+      password: "{{ beszel_admin_password }}"
+    status_code: [200, 400, 401, 403, 404]
+  register: beszel_auth_check
+  changed_when: false
+  no_log: true
+
+# Only create if auth failed (admin does not exist yet).
+# PocketBase v0.22+ super-user creation endpoint (no auth required when no admins exist).
+- name: Create Beszel admin account
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/collections/_superusers/records"
+    method: POST
+    body_format: json
+    body:
+      email: "{{ beszel_admin_email }}"
+      password: "{{ beszel_admin_password }}"
+      passwordConfirm: "{{ beszel_admin_password }}"
+    status_code: [200, 201, 400]
+  register: beszel_admin_create
+  changed_when: beszel_admin_create.status in [200, 201]
+  when: beszel_auth_check.status not in [200]
+  no_log: true
+
+# Authenticate as admin to get auth token for API calls.
+- name: Authenticate as Beszel admin
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/collections/_superusers/auth-with-password"
+    method: POST
+    body_format: json
+    body:
+      identity: "{{ beszel_admin_email }}"
+      password: "{{ beszel_admin_password }}"
+    status_code: 200
+  register: beszel_auth
+  changed_when: false
+  no_log: true
+
+# Authenticate as regular user to get user ID for system ownership.
+- name: Authenticate as Beszel user
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/collections/users/auth-with-password"
+    method: POST
+    body_format: json
+    body:
+      identity: "{{ beszel_admin_email }}"
+      password: "{{ beszel_admin_password }}"
+    headers:
+      Authorization: "{{ beszel_auth.json.token }}"
+    status_code: [200, 400, 404]
+  register: beszel_user_auth
+  changed_when: false
+  no_log: true
+
+# Check if the homelab system is already registered.
+- name: Check if homelab system exists
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/collections/systems/records?filter=(name='{{ beszel_system_name }}')"
+    method: GET
+    headers:
+      Authorization: "{{ beszel_auth.json.token }}"
+    status_code: [200]
+  register: beszel_systems
+  changed_when: false
+
+# Add the homelab system if it doesn't exist yet.
+- name: Add homelab system to Beszel
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/collections/systems/records"
+    method: POST
+    body_format: json
+    body:
+      name: "{{ beszel_system_name }}"
+      host: "{{ beszel_system_host }}"
+      port: "{{ beszel_system_port }}"
+      users: "{{ [beszel_user_auth.json.record.id] if beszel_user_auth.status == 200 else [] }}"
+    headers:
+      Authorization: "{{ beszel_auth.json.token }}"
+    status_code: [200, 201]
+  register: beszel_system_create
+  changed_when: beszel_system_create.status in [200, 201]
+  when: beszel_systems.json.totalItems == 0
+
+# Save system ID for alert configuration.
+- name: Set homelab system ID
+  ansible.builtin.set_fact:
+    beszel_system_id: >-
+      {{ beszel_system_create.json.id
+         if beszel_systems.json.totalItems == 0
+         else beszel_systems.json['items'][0].id }}
+
+# --- Notification configuration (ntfy) ---
+# Beszel user_settings schema: { settings: { emails: [], webhooks: [], ... } }
+
+# Check if user_settings record exists for the user.
+- name: Check user notification settings
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/collections/user_settings/records?filter=(user='{{ beszel_user_auth.json.record.id }}')"
+    method: GET
+    headers:
+      Authorization: "{{ beszel_auth.json.token }}"
+    status_code: [200]
+  register: beszel_user_settings
+  changed_when: false
+  when: beszel_user_auth.status == 200
+
+# Build the settings object with webhook added.
+- name: Set notification settings fact
+  ansible.builtin.set_fact:
+    beszel_notification_settings: >-
+      {{ beszel_user_settings.json['items'][0].settings
+         | combine({'webhooks': [beszel_ntfy_url]}) }}
+  when:
+    - beszel_user_auth.status == 200
+    - beszel_user_settings.json.totalItems > 0
+
+# Update user_settings with ntfy webhook inside settings object.
+- name: Update user notification settings with ntfy webhook
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/collections/user_settings/records/{{ beszel_user_settings.json['items'][0].id }}"
+    method: PATCH
+    body_format: json
+    body:
+      settings: "{{ beszel_notification_settings }}"
+    headers:
+      Authorization: "{{ beszel_auth.json.token }}"
+    status_code: [200]
+  changed_when: true
+  when:
+    - beszel_user_auth.status == 200
+    - beszel_user_settings.json.totalItems > 0
+    - beszel_ntfy_url not in (beszel_user_settings.json['items'][0].settings.webhooks | default([]))
+
+# --- Alert thresholds ---
+# Beszel alerts collection fields: name, system, user, min (duration minutes), value (threshold)
+
+# Check existing alerts for this system.
+- name: Check existing alerts for homelab system
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/collections/alerts/records?filter=(system='{{ beszel_system_id }}')"
+    method: GET
+    headers:
+      Authorization: "{{ beszel_auth.json.token }}"
+    status_code: [200]
+  register: beszel_existing_alerts
+  changed_when: false
+
+# Delete alerts that are no longer managed by Beszel (e.g. Disk — now handled
+# by the common/disk-alert.sh cron with cooldown + action buttons).
+- name: Delete deprecated Beszel alerts  # noqa: loop-var-prefix
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/collections/alerts/records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Authorization: "{{ beszel_auth.json.token }}"
+    status_code: [200, 204, 404]
+  loop: "{{ beszel_existing_alerts.json['items'] | selectattr('name', 'in', beszel_alert_rules_to_remove) | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: beszel_existing_alerts.json.totalItems > 0
+  changed_when: true
+
+# Create alert rules that don't already exist for this system. Per-item
+# filter (instead of `totalItems == 0` on the whole loop) so new rules
+# can be added later — e.g. "Load" introduced after CPU/Temperature/Status
+# already shipped.
+- name: Create Beszel alert rules
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ beszel_port }}/api/collections/alerts/records"
+    method: POST
+    body_format: json
+    body:
+      name: "{{ item.name }}"
+      system: "{{ beszel_system_id }}"
+      user: "{{ beszel_user_auth.json.record.id }}"
+      min: "{{ item.min }}"
+      value: "{{ item.value }}"
+    headers:
+      Authorization: "{{ beszel_auth.json.token }}"
+    status_code: [200, 201]
+  register: beszel_alert_create
+  changed_when: beszel_alert_create.status in [200, 201]
+  loop: "{{ beszel_alert_rules | rejectattr('name', 'in', beszel_existing_alerts.json['items'] | default([]) | map(attribute='name') | list) | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - beszel_user_auth.status == 200

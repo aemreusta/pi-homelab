@@ -1,0 +1,6 @@
+---
+- name: Deploy Homepage dashboard
+  hosts: pi
+  become: true
+  roles:
+    - homepage

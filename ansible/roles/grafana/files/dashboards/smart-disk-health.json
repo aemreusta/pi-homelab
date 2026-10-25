@@ -1,0 +1,193 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "description": "SSD SMART health for /dev/sda from the common-role smart-check.sh (05:00 cron → node_exporter textfile). Replaces the retired Scrutiny role, which could not detect the USB-bridge SSD. Mirrors the SmartHealthNotOK / SmartCheckStale / SmartReallocatedSectorsGrowing vmalert rules.",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "SMART health",
+      "description": "smart_check_health_ok: 1 = PASSED/OK, 0 = FAILED. Only meaningful when data-available = yes.",
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "victoriametrics"}, "expr": "smart_check_health_ok", "instant": true}
+      ],
+      "options": {
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "orientation": "auto", "textMode": "value_and_name", "colorMode": "background", "graphMode": "none", "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"1": {"text": "PASSED", "color": "green", "index": 0}}},
+            {"type": "value", "options": {"0": {"text": "FAILED", "color": "red", "index": 1}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]},
+          "noValue": "no data"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Data available",
+      "description": "smart_check_data_available: 1 = smartctl returned SMART data this run. If 0, the health value above is not meaningful.",
+      "gridPos": {"h": 8, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "victoriametrics"}, "expr": "smart_check_data_available", "instant": true}
+      ],
+      "options": {
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "orientation": "auto", "textMode": "value_and_name", "colorMode": "background", "graphMode": "none", "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"1": {"text": "yes", "color": "green", "index": 0}}},
+            {"type": "value", "options": {"0": {"text": "no", "color": "red", "index": 1}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]},
+          "noValue": "no data"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Check age",
+      "description": "Seconds since the last smart-check.sh run. Mirrors SmartCheckStale (warn at 2d). Green < 1d, amber 1d, red 2d.",
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "victoriametrics"}, "expr": "time() - smart_check_last_run_unix_seconds", "instant": true}
+      ],
+      "options": {
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "orientation": "auto", "textMode": "value_and_name", "colorMode": "background", "graphMode": "none", "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 86400}, {"color": "red", "value": 172800}]},
+          "noValue": "never run"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Temperature",
+      "description": "Current disk temperature (SMART attr 194). Green < 60, amber 60, red 80 — SSDs throttle well below the SoC's 80 °C.",
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "victoriametrics"}, "expr": "smart_check_temperature_celsius", "instant": true}
+      ],
+      "options": {
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "orientation": "auto", "textMode": "value_and_name", "colorMode": "background", "graphMode": "area", "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 60}, {"color": "red", "value": 80}]},
+          "noValue": "no data"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Temperature trend",
+      "description": "smart_check_temperature_celsius over time. Threshold lines at 60 (amber) / 80 °C (red, thermal stress).",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "victoriametrics"}, "expr": "smart_check_temperature_celsius", "range": true, "legendFormat": "temp"}
+      ],
+      "options": {
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "single", "sort": "none"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": true, "thresholdsStyle": {"mode": "line"}},
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 60}, {"color": "red", "value": 80}]}
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Reallocated sectors",
+      "description": "smart_check_reallocated_sectors (SMART attr 5). Any sustained growth is an early SSD-wear signal (SmartReallocatedSectorsGrowing fires on increase[7d] > 0).",
+      "gridPos": {"h": 9, "w": 6, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "victoriametrics"}, "expr": "smart_check_reallocated_sectors", "range": true, "legendFormat": "reallocated"}
+      ],
+      "options": {
+        "legend": {"showLegend": false, "displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "single", "sort": "none"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": true},
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Pending sectors",
+      "description": "smart_check_pending_sectors (SMART attr 197). Current pending sector count; non-zero warrants attention.",
+      "gridPos": {"h": 9, "w": 6, "x": 18, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "victoriametrics"}, "expr": "smart_check_pending_sectors", "range": true, "legendFormat": "pending"}
+      ],
+      "options": {
+        "legend": {"showLegend": false, "displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "single", "sort": "none"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": true},
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}
+        },
+        "overrides": []
+      }
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 39,
+  "tags": ["smart", "disk-health", "homelab"],
+  "templating": {"list": []},
+  "time": {"from": "now-7d", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "SMART / Disk Health",
+  "uid": "smart-disk-health",
+  "version": 1,
+  "weekStart": ""
+}

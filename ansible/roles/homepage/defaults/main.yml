@@ -1,0 +1,67 @@
+---
+homepage_compose_dir: /home/{{ docker_user }}/docker/core/homepage
+homepage_config_dir: /home/{{ docker_user }}/docker/core/homepage/config
+homepage_tz: "{{ timezone }}"
+
+# Dashboard assets — both the background image (files/background.jpg) and the
+# logo (files/ts-logo.png) are bundled in the repo and deployed via copy (NOT
+# get_url), so a deploy never depends on a third-party CDN. (The Trabzonspor CDN
+# began returning HTTP 405 to get_url's conditional request, breaking the CD.)
+
+# Service widget credentials (sourced from vault.yml)
+homepage_qbittorrent_username: "{{ vault_qbittorrent_username }}"
+homepage_qbittorrent_password: "{{ vault_qbittorrent_password }}"
+
+# Media service API keys (sourced from vault.yml)
+homepage_jellyfin_api_key: "{{ vault_jellyfin_api_key }}"
+homepage_sonarr_api_key: "{{ vault_sonarr_api_key }}"
+homepage_radarr_api_key: "{{ vault_radarr_api_key }}"
+homepage_prowlarr_api_key: "{{ vault_prowlarr_api_key }}"
+
+# NextDNS
+homepage_nextdns_profile: "abc123"
+homepage_nextdns_api_key: "{{ vault_nextdns_api_key }}"
+
+# Control API
+homepage_control_port: 9099
+homepage_control_token: "{{ vault_homelab_control_token }}"
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+# Raised 128M -> 192M on 2026-08-02. Homepage is a single Next.js
+# (`next-server`) process whose baseline RSS on ARM is ~122 MB, so a 128 M cap
+# left ~5% headroom and it ran at 90-100% of its own limit for the whole
+# 20-day sweep window — the first real customer of ContainerMemoryHeadroomLow.
+# There is nothing to optimise inside the container: one process, no worker
+# pool, no background queue (contrast mlflow, where 87% of RSS was an
+# unrequested huey pool). The cap was simply chosen too small.
+# Per docs/conventions/container-mem-limits.md this raises THIS container only
+# — never shrink another to "pay" for it; the ceiling sum overcommits by design.
+homepage_mem_limit: 192M
+
+# --- Container security hardening ---
+homepage_pids_limit: 200
+homepage_cap_drop:
+  - ALL
+homepage_cap_add: []
+
+# --- Synthetic probe (pageload / service latency -> Grafana) ---
+# A host cron curls the dashboard + its backing service endpoints, measuring
+# HTTP response time + reachability, and emits them to the node_exporter
+# textfile collector (-> vmagent -> VictoriaMetrics -> Grafana dashboard
+# "Homepage / Service Probe"). This is *server-side* response time, not the
+# in-browser render. Toggle / retarget here.
+homepage_probe_enabled: true
+homepage_probe_host: "{{ adguard_host_ip | default(ansible_facts['default_ipv4']['address']) }}"
+homepage_probe_textfile_dir: "{{ common_node_exporter_textfile_dir | default('/var/lib/node_exporter/textfile') }}"
+homepage_probe_timeout: 5          # per-target curl timeout (seconds)
+homepage_probe_schedule_minute: "*/2"
+# name = the `target` label; port = host-published port probed at the LAN host.
+homepage_probe_targets:
+  - { name: homepage, port: 3001 }
+  - { name: jellyfin, port: 8096 }
+  - { name: sonarr, port: 8989 }
+  - { name: radarr, port: 7878 }
+  - { name: prowlarr, port: 9696 }
+  - { name: qbittorrent, port: 8181 }
+  - { name: tdarr, port: 8265 }
+  - { name: grafana, port: 3003 }

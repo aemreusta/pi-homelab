@@ -1,0 +1,6 @@
+---
+- name: Deploy Label Studio
+  hosts: pi
+  become: true
+  roles:
+    - label_studio

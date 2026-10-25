@@ -1,0 +1,62 @@
+---
+# VictoriaMetrics — single-node TSDB, Prometheus-compatible
+# https://docs.victoriametrics.com/
+
+services:
+  victoriametrics:
+    image: {{ victoriametrics_image }}
+    container_name: victoriametrics
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ victoriametrics_mem_limit }}
+    pids_limit: {{ victoriametrics_pids_limit }}
+    read_only: {{ victoriametrics_read_only | lower }}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size={{ victoriametrics_tmpfs_size }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in victoriametrics_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+{% if victoriametrics_cap_add | length > 0 %}
+    cap_add:
+{% for cap in victoriametrics_cap_add %}
+      - {{ cap }}
+{% endfor %}
+{% endif %}
+    labels:
+{% for k, v in victoriametrics_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    networks:
+      - {{ victoriametrics_network }}
+    ports:
+      - "{{ victoriametrics_port }}:8428"
+    volumes:
+      - {{ victoriametrics_data_dir }}:/victoria-metrics-data
+    command:
+      - --storageDataPath=/victoria-metrics-data
+      - --retentionPeriod={{ victoriametrics_retention_period }}
+      - --search.cacheTimestampOffset={{ victoriametrics_cache_timestamp_offset }}
+      - --httpListenAddr=:8428
+    environment:
+      - TZ={{ victoriametrics_tz }}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Use 127.0.0.1 explicitly: with read_only filesystem, glibc's getaddrinfo
+    # in some images resolves "localhost" to ::1 (IPv6) first, but the VM
+    # service listens on IPv4 only — Connection refused. 127.0.0.1 is deterministic.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8428/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  {{ victoriametrics_network }}:
+    external: true

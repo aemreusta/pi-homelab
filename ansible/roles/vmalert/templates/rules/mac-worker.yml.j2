@@ -1,0 +1,80 @@
+# Mac worker presence — the root-cause signal for every Mac-dependent alert.
+#
+# The Mac worker is a MacBook on battery + Wi-Fi. Sleep and low-battery
+# hibernation are its NORMAL states. Before this file, every lid-close fanned
+# out into separate pages (NFS read failing/resolved flapping, worker
+# heartbeats stale, runner supervisor down, offload skipped): on
+# 2026-09-28/29 a 1%-battery Low Power Sleep produced ~20 ntfy pushes for one
+# physical cause.
+#
+# Source: mac_worker.prom, written every minute on the Pi by
+# `homelab-agent mac-presence` (role nfs_server) — a TCP probe where a refused
+# connection counts as present, debounced over 3 failed probes.
+#
+# MacWorkerAway is an INHIBITION SOURCE ONLY (notify="none" routes it to the
+# Alertmanager blackhole receiver). While it fires, every alert labelled
+# mac_dependent="true" is suppressed. It also covers a 15-minute settle window
+# after the Mac wakes, so heartbeats/NFS mounts get time to recover before a
+# stale value can page.
+#
+# Quoting: docs/conventions/vmalert-rule-quoting.md.
+
+groups:
+  - name: mac-worker
+    interval: 1m
+    rules:
+      # Both branches aggregate `by (instance)` so the away→settling hand-over
+      # keeps ONE label set; otherwise the alert would resolve and re-fire at
+      # wake and a dependent alert could slip through the gap.
+      - alert: MacWorkerAway
+        expr: >-
+          max by (instance) (mac_worker_reachable == 0)
+          or
+          max by (instance) (
+            ((time() - mac_worker_reachable_since_timestamp_seconds) < {{ vmalert_mac_worker_settle_seconds | default(900) }})
+            and on(instance) (mac_worker_reachable == 1)
+          )
+        for: 1m
+        labels:
+          severity: info
+          service: mac-worker
+          notify: "none"
+          source: vmalert
+        annotations:
+          summary: 'Mac worker is away or settling after wake'
+          description: 'Inhibition source only (never delivered). While active, alerts labelled mac_dependent="true" are suppressed in Alertmanager. The Mac is a laptop; sleeping is expected.'
+
+      # Away for a day is worth one page (re-sent at most daily via
+      # alertmanager_sustained_alert_pattern). Uses last_seen, not `for: 24h`,
+      # so a vmalert restart does not reset the clock. The > 0 guard skips a
+      # Mac that has never been seen since the collector's state was created.
+      - alert: MacWorkerAwayLong
+        expr: >-
+          (time() - mac_worker_last_seen_timestamp_seconds) > {{ vmalert_mac_worker_away_long_seconds | default(86400) }}
+          and mac_worker_last_seen_timestamp_seconds > 0
+          and mac_worker_reachable == 0
+        for: 10m
+        labels:
+          severity: warn
+          service: mac-worker
+          source: vmalert
+        annotations:
+          summary: 'Mac worker unreachable for {{ "{{ $value | humanizeDuration }}" }}'
+          description: 'No TCP answer from the Mac for over a day, so the Mac-side workers and the CI runner are all paused (their own alerts are inhibited). Wake it, plug it in and confirm it is on the LAN; everything resumes on its own.'
+
+      # The presence signal is only trustworthy while its collector runs. A
+      # dead collector must not look like "Mac away" forever (which would
+      # inhibit everything) — MacWorkerAway needs fresh samples to fire, and
+      # this alert makes the gap visible. NOT mac_dependent: it is Pi-side.
+      - alert: MacPresenceCollectorStale
+        expr: >-
+          (time() - mac_worker_probe_timestamp_seconds > 300)
+          or absent(mac_worker_probe_timestamp_seconds)
+        for: 5m
+        labels:
+          severity: warn
+          service: mac-worker
+          source: vmalert
+        annotations:
+          summary: 'Mac presence collector has stopped publishing'
+          description: 'The per-minute `homelab-agent mac-presence` cron (role nfs_server) is not refreshing mac_worker.prom. Mac-dependent alerts are no longer inhibited while the Mac sleeps. Check root crontab and run the command by hand.'

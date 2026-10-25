@@ -1,0 +1,88 @@
+---
+- name: Verify — assert hardening directives are present in rendered files
+  hosts: localhost
+  gather_facts: false
+  vars:
+    sandbox: /tmp/molecule-watchtower
+  tasks:
+
+    - name: Slurp docker-compose.yml
+      ansible.builtin.slurp:
+        src: "{{ sandbox }}/docker-compose.yml"
+      register: dc
+
+    - name: Decode docker-compose
+      ansible.builtin.set_fact:
+        compose_yaml: "{{ (dc.content | b64decode) | from_yaml }}"
+
+    - name: Assert security_opt no-new-privileges
+      ansible.builtin.assert:
+        that:
+          - "'no-new-privileges:true' in compose_yaml.services.watchtower.security_opt"
+        fail_msg: "no-new-privileges:true missing from security_opt"
+
+    - name: Assert cap_drop ALL
+      ansible.builtin.assert:
+        that:
+          - "'ALL' in compose_yaml.services.watchtower.cap_drop"
+        fail_msg: "cap_drop must include ALL"
+
+    - name: Assert read_only true
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.watchtower.read_only | bool
+        fail_msg: "read_only must be true"
+
+    - name: Assert tmpfs has /tmp with hardening flags
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.watchtower.tmpfs | length > 0
+          - compose_yaml.services.watchtower.tmpfs[0] is search('^/tmp:')
+          - compose_yaml.services.watchtower.tmpfs[0] is search('size=')
+          - compose_yaml.services.watchtower.tmpfs[0] is search('noexec')
+          - compose_yaml.services.watchtower.tmpfs[0] is search('nosuid')
+          - compose_yaml.services.watchtower.tmpfs[0] is search('nodev')
+        fail_msg: "tmpfs /tmp missing or missing hardening flags"
+
+    - name: Assert pids_limit set and reasonable
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.watchtower.pids_limit is defined
+          - compose_yaml.services.watchtower.pids_limit | int > 0
+          - compose_yaml.services.watchtower.pids_limit | int <= 500
+        fail_msg: "pids_limit missing or out of range"
+
+    - name: Assert mem_limit set
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.watchtower.mem_limit is defined
+        fail_msg: "mem_limit must be set"
+
+    - name: Assert healthcheck uses watchtower built-in --health-check
+      ansible.builtin.assert:
+        that:
+          - "'watchtower' in compose_yaml.services.watchtower.healthcheck.test | join(' ')"
+          - "'--health-check' in compose_yaml.services.watchtower.healthcheck.test"
+        fail_msg: "healthcheck must use /watchtower --health-check"
+
+    - name: Assert OCI labels present
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.watchtower.labels['org.opencontainers.image.title'] is defined
+          - compose_yaml.services.watchtower.labels['org.opencontainers.image.source'] is defined
+          - compose_yaml.services.watchtower.labels['org.opencontainers.image.vendor'] is defined
+          - compose_yaml.services.watchtower.labels['org.opencontainers.image.documentation'] is defined
+          - compose_yaml.services.watchtower.labels['org.opencontainers.image.description'] is defined
+        fail_msg: "OCI image labels incomplete"
+
+    - name: Assert docker.sock mount present (Watchtower needs it)
+      ansible.builtin.assert:
+        that:
+          - "'/var/run/docker.sock:/var/run/docker.sock' in compose_yaml.services.watchtower.volumes"
+        fail_msg: "docker.sock mount missing — Watchtower cannot inspect/update containers without it"
+
+    - name: Assert no com.centurylinklabs.watchtower.enable=false (would disable self-updates)
+      ansible.builtin.assert:
+        that:
+          - "'com.centurylinklabs.watchtower.enable' not in compose_yaml.services.watchtower.labels or compose_yaml.services.watchtower.labels['com.centurylinklabs.watchtower.enable'] | string != 'false'"
+        fail_msg: "watchtower.enable=false would prevent Watchtower from updating itself"

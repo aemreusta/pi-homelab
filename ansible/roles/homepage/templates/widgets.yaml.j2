@@ -1,0 +1,30 @@
+---
+- logo:
+    icon: /images/ts-logo.png
+
+- greeting:
+    text_size: xl
+    text: Homelab
+
+- datetime:
+    text_size: lg
+    locale: tr           # Türkiye locale -> "7 Haziran 2026 18:43", 24h
+    format:
+      timeStyle: short
+      dateStyle: long
+      hourCycle: h23
+
+- openmeteo:
+    label: Istanbul
+    latitude: 41.01
+    longitude: 28.97
+    timezone: {{ timezone }}
+    units: metric
+    cache: 5
+
+- resources:
+    cpu: true
+    memory: true
+    cputemp: true
+    uptime: true
+    disk: /

@@ -1,0 +1,58 @@
+---
+# VictoriaLogs — single-node log database, LogsQL queryable
+# https://docs.victoriametrics.com/victorialogs/
+
+services:
+  victorialogs:
+    image: {{ victorialogs_image }}
+    container_name: victorialogs
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ victorialogs_mem_limit }}
+    pids_limit: {{ victorialogs_pids_limit }}
+    read_only: {{ victorialogs_read_only | lower }}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size={{ victorialogs_tmpfs_size }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in victorialogs_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+{% if victorialogs_cap_add | length > 0 %}
+    cap_add:
+{% for cap in victorialogs_cap_add %}
+      - {{ cap }}
+{% endfor %}
+{% endif %}
+    labels:
+{% for k, v in victorialogs_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    networks:
+      - {{ victorialogs_network }}
+    ports:
+      - "{{ victorialogs_port }}:9428"
+    volumes:
+      - {{ victorialogs_data_dir }}:/victoria-logs-data
+    command:
+      - --storageDataPath=/victoria-logs-data
+      - --retentionPeriod={{ victorialogs_retention_period }}
+      - --httpListenAddr=:9428
+    environment:
+      - TZ={{ victorialogs_tz }}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # NO healthcheck — intentional. Upstream went distroless with v1.52.0
+    # (2026-07-16): the image has no shell, no wget, no busybox — nothing an
+    # exec-based healthcheck could run (976-strike unhealthy streak while the
+    # service itself was fine). Same class as portainer/beszel scratch images.
+    # Liveness is covered externally instead: vmagent scrapes :9428/metrics
+    # (up{job="victorialogs"}) and vmalert fires VictoriaLogsDown on it.
+
+networks:
+  {{ victorialogs_network }}:
+    external: true

@@ -1,0 +1,19 @@
+---
+# 2026-08-04: port 8082 is now bound to 127.0.0.1 only (docker-compose.yml.j2),
+# so nothing external ever reaches it — Traefik+Authelia is the only path in.
+# Both prior UFW rules (LAN-scope Phase 0, and the pre-2026-07-14 Anywhere
+# rule before that) are removed; idempotent no-op once already gone.
+- name: Remove superseded LAN-scope rule (host port closed, gate is Traefik+Authelia now)
+  community.general.ufw:
+    rule: allow
+    port: "8082"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    delete: true
+
+- name: Remove superseded Anywhere rule (pre-2026-07-14)
+  community.general.ufw:
+    rule: allow
+    port: "8082"
+    proto: tcp
+    delete: true

@@ -1,0 +1,41 @@
+# Authelia SSO alerts.
+#
+# Scope: liveness. Authelia is the forward-auth gate for the *arr and file UIs
+# (traefik_services `auth: true` → the `authelia` forwardAuth middleware). Traefik
+# calls its authz endpoint on EVERY request to a gated service, so if Authelia is
+# down those services fail at the gate (502/deny) even though their own containers
+# are perfectly healthy — an outage that looks like "sonarr is broken" while sonarr
+# is fine. That makes Authelia load-bearing and its liveness non-optional to
+# observe (silent failure is the same severity class as loud failure).
+#
+# Datasource: VictoriaMetrics (PromQL). Source: the `authelia` vmagent scrape job
+# (up{job="authelia"}) against 127.0.0.1:9959/metrics (telemetry.metrics in the
+# authelia role config; loopback-published, never LAN-exposed).
+#
+# Quoting: any annotation surfacing $value/printf uses single-quoted-outer /
+# escaped-inner per docs/conventions/vmalert-rule-quoting.md.
+
+groups:
+  - name: authelia
+    interval: 1m
+    rules:
+
+      # ── Authelia liveness (container down OR scrape failing) ──────────
+      - alert: AutheliaDown
+        expr: up{job="authelia"} == 0
+        for: {{ vmalert_authelia_down_for | default('5m') }}
+        labels:
+          severity: crit
+        annotations:
+          summary: "Authelia SSO is down — gated services are unreachable"
+          description: >-
+            The authelia scrape target has been down for
+            {{ vmalert_authelia_down_for | default('5m') }}. Traefik calls
+            Authelia's authz endpoint on every request to a forward-auth'd
+            service, so the gated UIs are failing at the gate right now even
+            though their own containers may be healthy. Check
+            `docker logs authelia` and its Postgres backend (it stores sessions
+            in the `authelia` DB on the shared postgresql container — a Postgres
+            outage takes Authelia with it). Break-glass: reach the services on
+            their LAN host ports (e.g. sonarr :8989, radarr :7878), which bypass
+            Traefik and the gate entirely.

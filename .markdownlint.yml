@@ -1,0 +1,9 @@
+default: true
+MD013: false  # line-length — içerik dosyaları için çok kısıtlayıcı
+MD024: false  # no-duplicate-heading — CHANGELOG formatında kaçınılmaz (Added/Changed/Fixed tekrarı)
+MD033: false  # no-inline-html — tablolarda gerekebilir
+MD036: false  # no-emphasis-as-heading — Türkçe öncelik etiketleri için
+MD060: false  # table-column-style — separator satırı stilini zorunlu tutma
+MD010:
+  code_blocks: false  # no-hard-tabs — Makefile recipe lines REQUIRE a tab;
+                      # prose outside code blocks is still checked

@@ -1,0 +1,43 @@
+---
+# VictoriaMetrics — Prometheus-compatible TSDB
+# https://docs.victoriametrics.com/
+
+victoriametrics_compose_dir: /home/{{ docker_user }}/docker/observability/victoriametrics
+victoriametrics_data_dir: /home/{{ docker_user }}/docker/observability/victoriametrics/data
+victoriametrics_tz: "{{ timezone }}"
+
+victoriametrics_image: victoriametrics/victoria-metrics:latest
+victoriametrics_port: 8428
+
+# 90 günlük metrik retention. Metrikler küçük (~5 GB tahmin), uzun tutulabilir.
+victoriametrics_retention_period: 90d
+
+# vmalert aligns 5-minute groups and delays evaluation; writes can arrive
+# 5-6 minutes behind wall time. Do not cache that still-changing range.
+victoriametrics_cache_timestamp_offset: 10m
+
+# Container memory limit (kernel cgroup_enable=memory gerekli)
+victoriametrics_mem_limit: 384M
+
+# Shared docker bridge network for the observability stack
+victoriametrics_network: observability
+
+# --- Container security hardening ---
+
+victoriametrics_pids_limit: 200
+victoriametrics_read_only: true
+victoriametrics_tmpfs_size: 64m
+
+# Drop all caps — VM is a Go binary that listens on a non-privileged port (8428)
+# and writes only to its bind-mounted data dir.
+victoriametrics_cap_drop:
+  - ALL
+victoriametrics_cap_add: []
+
+victoriametrics_oci_labels:
+  org.opencontainers.image.title: victoriametrics
+  org.opencontainers.image.description: "VictoriaMetrics — Prometheus-compatible TSDB"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/victoriametrics/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://docs.victoriametrics.com/"

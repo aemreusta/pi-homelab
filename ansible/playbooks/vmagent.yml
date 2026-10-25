@@ -1,0 +1,6 @@
+---
+- name: Deploy vmagent (metric scraper for VictoriaMetrics)
+  hosts: pi
+  become: true
+  roles:
+    - vmagent

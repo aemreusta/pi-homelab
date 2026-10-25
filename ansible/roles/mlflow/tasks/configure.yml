@@ -1,0 +1,64 @@
+---
+# Mint a MinIO service identity scoped to the mlflow-artifacts bucket ONLY, so
+# MLflow's artifact proxy never holds credentials that can reach the sensitive
+# `datasets` bucket (review finding B4). Driven through the MinIO container's
+# bundled `mc` using the root admin creds, passed via MC_HOST_<alias> env so the
+# root credentials never appear in argv / the process list. Idempotent throughout.
+
+- name: Render the bucket-scoped MinIO policy
+  ansible.builtin.template:
+    src: minio-mlflow-policy.json.j2
+    dest: "{{ mlflow_compose_dir }}/minio-mlflow-policy.json"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+
+- name: Copy the policy into the MinIO container
+  ansible.builtin.command:
+    cmd: docker cp {{ mlflow_compose_dir }}/minio-mlflow-policy.json minio:/tmp/minio-mlflow-policy.json
+  changed_when: true
+
+- name: Check whether the MLflow MinIO policy already exists
+  ansible.builtin.command:
+    cmd: >-
+      docker exec
+      -e MC_HOST_local=http://{{ mlflow_minio_root_user }}:{{ mlflow_minio_root_password }}@127.0.0.1:9000
+      minio mc --quiet admin policy info local {{ mlflow_minio_policy_name }}
+  register: mlflow_policy_info
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Create the bucket-scoped MinIO policy
+  ansible.builtin.command:
+    cmd: >-
+      docker exec
+      -e MC_HOST_local=http://{{ mlflow_minio_root_user }}:{{ mlflow_minio_root_password }}@127.0.0.1:9000
+      minio mc --quiet admin policy create local {{ mlflow_minio_policy_name }} /tmp/minio-mlflow-policy.json
+  when: mlflow_policy_info.rc != 0
+  changed_when: true
+  no_log: true
+
+- name: Ensure the scoped MinIO service user exists (idempotent upsert = rotation)
+  ansible.builtin.command:
+    cmd: >-
+      docker exec
+      -e MC_HOST_local=http://{{ mlflow_minio_root_user }}:{{ mlflow_minio_root_password }}@127.0.0.1:9000
+      minio mc --quiet admin user add local {{ mlflow_minio_access_key }} {{ mlflow_minio_secret_key }}
+  register: mlflow_user_add
+  changed_when: false
+  failed_when: mlflow_user_add.rc != 0 and 'already' not in (mlflow_user_add.stderr | default('') | lower)
+  no_log: true
+
+- name: Attach the scoped policy to the MLflow MinIO user
+  ansible.builtin.command:
+    cmd: >-
+      docker exec
+      -e MC_HOST_local=http://{{ mlflow_minio_root_user }}:{{ mlflow_minio_root_password }}@127.0.0.1:9000
+      minio mc --quiet admin policy attach local {{ mlflow_minio_policy_name }} --user {{ mlflow_minio_access_key }}
+  register: mlflow_policy_attach
+  changed_when: "'attached' in (mlflow_policy_attach.stdout | default('') | lower)"
+  failed_when: >-
+    mlflow_policy_attach.rc != 0
+    and 'already in effect' not in (mlflow_policy_attach.stderr | default('') | lower)
+  no_log: true

@@ -1,0 +1,43 @@
+<?php
+// Speedtest Tracker SQLite WAL config — managed by Ansible, do not edit.
+// Idempotently converts the app's SQLite DB to WAL journal mode. Run via:
+//   docker exec speedtest-tracker php /config/{{ speedtest_tracker_wal_script }}
+// Prints "CHANGED <old>-><new>" if it flipped the mode, "OK wal" if already WAL,
+// so the Ansible task can report changed_when correctly.
+//
+// Why: the image ships journal_mode=delete (the most lock-prone mode), which
+// caused "SQLSTATE[HY000]: General error: 5 database is locked" under load
+// (php-fpm web reads colliding with queue:work + scheduler writes). WAL lets
+// readers run concurrently with the single writer. journal_mode=WAL is
+// PERSISTENT in the DB header — it survives container restarts, so this only
+// needs to run once (re-running is a no-op). busy_timeout is intentionally NOT
+// set here: it is per-connection runtime state, so an external connection
+// can't make it stick for the app's own connections — that would need image
+// support the third-party image doesn't expose.
+
+try {
+    $db = new PDO('sqlite:/config/database.sqlite');
+    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (Exception $e) {
+    fwrite(STDERR, "DB not ready: " . $e->getMessage() . "\n");
+    exit(1);
+}
+
+// Read the ACTUAL current mode — never assume it is "delete".
+$old = strtolower((string) $db->query('PRAGMA journal_mode')->fetchColumn());
+
+if ($old === 'wal') {
+    echo "OK wal\n";
+    exit(0);
+}
+
+// PRAGMA journal_mode=WAL returns the resulting mode.
+$new = strtolower((string) $db->query('PRAGMA journal_mode=WAL')->fetchColumn());
+
+if ($new !== 'wal') {
+    fwrite(STDERR, "failed to set WAL (mode is now '$new')\n");
+    exit(1);
+}
+
+echo "CHANGED $old->$new\n";
+exit(0);

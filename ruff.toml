@@ -1,0 +1,28 @@
+# Ruff Python Linter Configuration
+# https://docs.astral.sh/ruff/
+
+line-length = 130
+target-version = "py311"
+
+[per-file-target-version]
+"mac-worker/nfs_mount.py" = "py39"  # macOS system Python used by launchd
+
+[lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "S",      # flake8-bandit (security)
+]
+ignore = [
+    "S101",   # Allow assert statements (used in tests)
+    "S102",   # Allow exec usage (used in tests for template rendering)
+    "S105",   # Allow hardcoded passwords in test fixtures
+]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S102", "S105"]  # Allow assert/exec/test fixtures in tests

@@ -1,0 +1,6 @@
+---
+- name: Deploy Alertmanager + ntfy-bridge webhook receiver
+  hosts: pi
+  become: true
+  roles:
+    - alertmanager

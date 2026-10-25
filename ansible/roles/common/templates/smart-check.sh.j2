@@ -1,0 +1,187 @@
+#!/bin/bash
+# Daily SMART disk health check — alerts on SMART overall-health failure
+# or reallocated-sector growth. Reads current values from smartctl, compares
+# to previous run stored in state file.
+#
+# Requires: smartmontools package (deployed by common/packages.yml).
+# Managed by Ansible (common role) — do not edit manually.
+
+set -uo pipefail
+
+NTFY_URL="{{ ntfy_external_topic_url }}"
+STATE_DIR="{{ common_alert_state_dir | default('/var/lib/homelab') }}"
+STATE_FILE="$STATE_DIR/smart-check.state"
+DEVICE="{{ common_smart_device | default('/dev/sda') }}"
+# Role default is `auto` (probes SATA/NVMe/USB transports). The prod Pi's
+# SanDisk USB3 bridge (0x0781:0x55bb) needs an explicit `-d scsi` override,
+# set in inventory/group_vars/all/main.yml. Per-host override lives there,
+# not here — keeps the role portable to other Pis / enclosures.
+DEVICE_TYPE="{{ common_smart_device_type | default('auto') }}"
+TEXTFILE_DIR="{{ common_node_exporter_textfile_dir | default('/var/lib/node_exporter/textfile') }}"
+
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+mkdir -p "$STATE_DIR"
+
+# ── Observability metrics (silent-cron hard rule) ────────────────────────
+# All initialised up-front so the EXIT trap always emits a complete file,
+# regardless of which early-exit path is taken (smartctl missing, no SMART
+# data, health failure). The last_run gauge lets vmalert detect a silently
+# dead cron (SmartCheckStale) — the one failure the in-script ntfy below
+# CANNOT cover, because a dead cron sends nothing.
+DATA_AVAILABLE=0   # 1 once smartctl returns a health string
+HEALTH_OK=0        # 1 only when health is PASSED/OK (meaningful iff DATA_AVAILABLE=1)
+REALLOC=0
+PENDING=0
+TEMP=0
+HOURS=0
+
+emit_textfile() {
+    [ -d "$TEXTFILE_DIR" ] || return 0
+    local tf="$TEXTFILE_DIR/smart_check.prom"
+    local tmp="$tf.$$"
+    if {
+        echo "# HELP smart_check_last_run_unix_seconds Unix time of the last smart-check run."
+        echo "# TYPE smart_check_last_run_unix_seconds gauge"
+        echo "smart_check_last_run_unix_seconds $(date +%s)"
+        echo "# HELP smart_check_data_available 1 if smartctl returned SMART health data."
+        echo "# TYPE smart_check_data_available gauge"
+        echo "smart_check_data_available ${DATA_AVAILABLE}"
+        echo "# HELP smart_check_health_ok 1 if overall health is PASSED/OK (only meaningful when data_available=1)."
+        echo "# TYPE smart_check_health_ok gauge"
+        echo "smart_check_health_ok ${HEALTH_OK}"
+        echo "# HELP smart_check_reallocated_sectors Reallocated sector count (SMART attr 5)."
+        echo "# TYPE smart_check_reallocated_sectors gauge"
+        echo "smart_check_reallocated_sectors ${REALLOC}"
+        echo "# HELP smart_check_pending_sectors Current pending sector count (SMART attr 197)."
+        echo "# TYPE smart_check_pending_sectors gauge"
+        echo "smart_check_pending_sectors ${PENDING}"
+        echo "# HELP smart_check_temperature_celsius Disk temperature in Celsius (SMART attr 194)."
+        echo "# TYPE smart_check_temperature_celsius gauge"
+        echo "smart_check_temperature_celsius ${TEMP}"
+    } > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$tf" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+}
+trap emit_textfile EXIT
+
+# Root's *user* crontab defaults to /usr/bin:/bin, unlike /etc/crontab.
+# smartmontools installs into /usr/sbin on Debian; never depend on login PATH.
+SMARTCTL_BIN=/usr/sbin/smartctl
+if [ ! -x "$SMARTCTL_BIN" ]; then
+    alert_event "smart-check" run "skip" "reason=smartctl_not_found"
+    exit 0
+fi
+
+SMARTCTL=("$SMARTCTL_BIN" -d "$DEVICE_TYPE")
+
+# Read overall health status.
+# Two output shapes to handle:
+#   SATA: "SMART overall-health self-assessment test result: PASSED"
+#   SCSI: "SMART Health Status: OK"     (USB→SATA bridge / SanDisk 0x0781:0x55bb)
+# The SanDisk USB3→SATA bridge intermittently fails the health query under I/O
+# load: on 2026-06-05 the 04:00 run (backup + dedup window) got a single
+# empty read → smart_check_data_available=0 for the whole day, even though the
+# bridge answers fine the rest of the time. Retry a few times before declaring
+# the data unavailable so a transient hiccup doesn't zero the metric.
+HEALTH=""
+for _attempt in 1 2 3; do
+    HEALTH=$("${SMARTCTL[@]}" -H "$DEVICE" 2>/dev/null \
+        | awk -F: '/SMART (overall-health|Health Status)/{sub(/^ +/,"",$NF); print $NF; exit}' \
+        | xargs)
+    [ -n "$HEALTH" ] && break
+    sleep 5
+done
+if [ -z "$HEALTH" ]; then
+    # Genuinely no SMART data after retries — bridge wedged or device gone.
+    alert_event "smart-check" run "skip" "reason=no_smart_data" "device=${DEVICE}"
+    exit 0
+fi
+DATA_AVAILABLE=1
+
+# NOTE: on the SanDisk USB3→SATA bridge the `-d scsi` transport exposes overall
+# health ("SMART Health Status: OK") but NOT the SATA attribute pages — `-A`
+# returns an empty section and `-d sat` is rejected ("unsupported scsi opcode",
+# verified 2026-06-05). So REALLOC/PENDING/TEMP/HOURS stay 0 BY DESIGN on this
+# hardware; health_ok is the only meaningful signal. The reads below are kept so
+# the script stays correct on any future enclosure that does pass attributes.
+
+# Read reallocated sector count (attribute 5).
+REALLOC=$("${SMARTCTL[@]}" -A "$DEVICE" 2>/dev/null \
+    | awk '/Reallocated_Sector_Ct/{print $NF}')
+REALLOC=${REALLOC:-0}
+
+# Read current pending sector count (attribute 197).
+PENDING=$("${SMARTCTL[@]}" -A "$DEVICE" 2>/dev/null \
+    | awk '/Current_Pending_Sector/{print $NF}')
+PENDING=${PENDING:-0}
+
+# Read temperature (attribute 194).
+TEMP=$("${SMARTCTL[@]}" -A "$DEVICE" 2>/dev/null \
+    | awk '/Temperature_Celsius/{print $NF}')
+TEMP=${TEMP:-0}
+
+# Read power-on hours (attribute 9).
+HOURS=$("${SMARTCTL[@]}" -A "$DEVICE" 2>/dev/null \
+    | awk '/Power_On_Hours/{print $NF}')
+HOURS=${HOURS:-0}
+
+alert_event "smart-check" scan "ok" "health=${HEALTH}" "realloc=${REALLOC}" "pending=${PENDING}" "temp=${TEMP}" "hours=${HOURS}"
+
+# Check overall health — anything other than "PASSED" or "OK" is critical.
+case "$HEALTH" in
+    PASSED|OK) HEALTH_OK=1 ;;
+    *)
+        ntfy_send "smart-check" \
+            -H "Title: SMART Health: ${HEALTH}" \
+            -H "Priority: urgent" \
+            -H "Tags: rotating_light,floppy_disk" \
+            -H "Markdown: yes" \
+            -d "Disk ${DEVICE} reports **${HEALTH}**.
+
+Reallocated: ${REALLOC}
+Pending: ${PENDING}
+Temp: ${TEMP}°C
+Power-on: ${HOURS}h
+
+Run \`smartctl -a ${DEVICE}\` for details. Replace the disk soon." \
+            "$NTFY_URL"
+        exit 0
+        ;;
+esac
+
+# Check for reallocated-sector growth since last run.
+PREV_REALLOC=0
+if [ -f "$STATE_FILE" ]; then
+    PREV_REALLOC=$(awk '/^realloc=/{split($0,a,"="); print a[2]}' "$STATE_FILE")
+fi
+
+DELTA=$((REALLOC - PREV_REALLOC))
+if [ "$DELTA" -gt 0 ]; then
+    ntfy_send "smart-check" \
+        -H "Title: SMART: ${DELTA} new reallocated sectors" \
+        -H "Priority: high" \
+        -H "Tags: warning,floppy_disk" \
+        -H "Markdown: yes" \
+        -d "Disk ${DEVICE} grew ${DELTA} reallocated sector(s).
+Total: ${REALLOC} (was ${PREV_REALLOC})
+Pending: ${PENDING}
+
+Monitor closely. Replace if growth continues." \
+        "$NTFY_URL"
+fi
+
+# Check for high pending sector count.
+if [ "$PENDING" -gt 0 ]; then
+    ntfy_send "smart-check" \
+        -H "Title: SMART: ${PENDING} pending sectors" \
+        -H "Priority: high" \
+        -H "Tags: warning,floppy_disk" \
+        -d "Disk ${DEVICE} has ${PENDING} pending sector(s). Run \`smartctl -a ${DEVICE}\`." \
+        "$NTFY_URL"
+fi
+
+# Save state for next run.
+echo "realloc=${REALLOC}" > "$STATE_FILE"

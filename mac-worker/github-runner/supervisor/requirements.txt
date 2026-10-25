@@ -1,0 +1,2 @@
+# Supervisor deps — installed with uv (never pip). httpx for the GitHub REST API.
+httpx==0.28.1

@@ -1,0 +1,46 @@
+---
+# github_runner_metrics — deploy the Pi-side emitter (renderer module + bash
+# orchestrator + cron). No host ports, so no ufw.yml.
+
+- name: Validate runner collector engine
+  ansible.builtin.assert:
+    that:
+      - github_runner_metrics_engine in ['go', 'python']
+
+- name: Deploy the Go runtime for the runner collector
+  ansible.builtin.include_role:
+    name: homelab_runtime
+  when: github_runner_metrics_engine == 'go'
+
+- name: Deploy gh_runner_metrics renderer module
+  ansible.builtin.copy:
+    src: gh_runner_metrics.py
+    dest: "{{ github_runner_metrics_bin_dir }}/gh_runner_metrics.py"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy gh-runner-metrics emitter script
+  ansible.builtin.template:
+    src: gh-runner-metrics.sh.j2
+    dest: "{{ github_runner_metrics_bin_dir }}/gh-runner-metrics.sh"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure emitter log file exists
+  ansible.builtin.file:
+    path: "{{ github_runner_metrics_log_file }}"
+    state: touch
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Schedule gh-runner-metrics emitter
+  ansible.builtin.cron:
+    name: "gh-runner-metrics"
+    minute: "{{ github_runner_metrics_cron_minute }}"
+    job: "{{ github_runner_metrics_bin_dir }}/gh-runner-metrics.sh"
+    user: "{{ docker_user }}"

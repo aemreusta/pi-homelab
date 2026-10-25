@@ -1,0 +1,15 @@
+---
+- name: Include node_exporter deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [node_exporter]
+
+- name: Include node_exporter kernel storage-fault scanner tasks
+  ansible.builtin.include_tasks:
+    file: kernel-io-scan.yml
+    apply:
+      tags: [node_exporter, kernel_io_scan]
+  tags: [node_exporter, kernel_io_scan]
+
+- name: Include node_exporter UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [node_exporter, firewall]

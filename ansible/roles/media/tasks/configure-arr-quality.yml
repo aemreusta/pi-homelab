@@ -1,0 +1,107 @@
+---
+# Release size ceilings, REMUX exclusion and queue-first grabs for Radarr/Sonarr
+# (media_arr_quality_targets).
+# GET → diff → PUT only what differs, so repeat deploys submit nothing. Radarr
+# omits preferredSize/maxSize entirely when a definition is unbounded.
+# Live-API only: excluded from check mode by the gate in main.yml
+# (2026-07-02 uri-skip class, tests/test_uri_check_mode_safety.py).
+
+- name: Read arr quality definitions
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ item.port }}/api/v3/qualitydefinition"
+    headers:
+      X-Api-Key: "{{ lookup('ansible.builtin.vars', item.api_key_var) }}"
+    return_content: true
+  register: media_arr_quality_definitions
+  loop: "{{ media_arr_quality_targets }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Apply arr release size ceilings
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ item.item.port }}/api/v3/qualitydefinition/update"
+    method: PUT
+    headers:
+      X-Api-Key: "{{ lookup('ansible.builtin.vars', item.item.api_key_var) }}"
+    body_format: json
+    body: "{{ media_arr_size_updates | from_json }}"
+    status_code: [200, 202]
+  vars:
+    media_arr_size_updates: >-
+      [{% for d in item.json if d.quality.name in item.item.sizes
+           and (d.minSize, d.preferredSize | default(none), d.maxSize | default(none)) != (item.item.sizes[d.quality.name].min,
+                item.item.sizes[d.quality.name].preferred, item.item.sizes[d.quality.name].max) %}
+      {{ dict(d, minSize=item.item.sizes[d.quality.name].min,
+              preferredSize=item.item.sizes[d.quality.name].preferred,
+              maxSize=item.item.sizes[d.quality.name].max) | to_json }}{{ '' if loop.last else ',' }}
+      {% endfor %}]
+  loop: "{{ media_arr_quality_definitions.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: media_arr_size_updates | from_json | length > 0
+  changed_when: true
+
+- name: Read arr quality profiles
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ item.port }}/api/v3/qualityprofile"
+    headers:
+      X-Api-Key: "{{ lookup('ansible.builtin.vars', item.api_key_var) }}"
+    return_content: true
+  register: media_arr_quality_profiles
+  loop: "{{ media_arr_quality_targets }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Disallow disc-copy qualities in the in-use profile
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ item.item.port }}/api/v3/qualityprofile/{{ media_arr_profile.id }}"
+    method: PUT
+    headers:
+      X-Api-Key: "{{ lookup('ansible.builtin.vars', item.item.api_key_var) }}"
+    body_format: json
+    body: "{{ dict(media_arr_profile, items=(media_arr_profile_items | from_json)) }}"
+    status_code: [200, 202]
+  vars:
+    media_arr_profile: "{{ item.json | selectattr('name', 'equalto', item.item.profile) | first }}"
+    media_arr_profile_items: >-
+      [{% for i in media_arr_profile['items'] %}
+      {{ (dict(i, allowed=false) if (i.quality is defined and i.quality.name in item.item.disallowed) else i) | to_json }}{{ '' if loop.last else ',' }}
+      {% endfor %}]
+  loop: "{{ media_arr_quality_profiles.results }}"
+  loop_control:
+    label: "{{ item.item.name }}/{{ item.item.profile }}"
+  when: (media_arr_profile_items | from_json) != media_arr_profile['items']
+  changed_when: true
+
+- name: Read arr download clients
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ item.port }}/api/v3/downloadclient"
+    headers:
+      X-Api-Key: "{{ lookup('ansible.builtin.vars', item.api_key_var) }}"
+    return_content: true
+  register: media_arr_download_clients
+  loop: "{{ media_arr_quality_targets }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Put new arr grabs at the top of the qBittorrent queue
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ item.0.item.port }}/api/v3/downloadclient/{{ item.1.id }}"
+    method: PUT
+    headers:
+      X-Api-Key: "{{ lookup('ansible.builtin.vars', item.0.item.api_key_var) }}"
+    body_format: json
+    body: "{{ dict(item.1, fields=(media_arr_client_fields | from_json)) }}"
+    status_code: [200, 202]
+  vars:
+    media_arr_client_fields: >-
+      [{% for f in item.1.fields %}
+      {{ (dict(f, value=1) if f.name in item.0.item.priority_fields else f) | to_json }}{{ '' if loop.last else ',' }}
+      {% endfor %}]
+  loop: "{{ media_arr_download_clients.results | subelements('json') }}"
+  loop_control:
+    label: "{{ item.0.item.name }}/{{ item.1.name }}"
+  when:
+    - item.1.implementation == 'QBittorrent'
+    - (media_arr_client_fields | from_json) != item.1.fields
+  changed_when: true

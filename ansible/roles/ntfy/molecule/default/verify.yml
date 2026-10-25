@@ -1,0 +1,27 @@
+---
+- name: Verify — assert hardening directives
+  hosts: localhost
+  gather_facts: false
+  vars:
+    sandbox: /tmp/molecule-ntfy
+  tasks:
+    - name: Slurp docker-compose.yml
+      ansible.builtin.slurp:
+        src: "{{ sandbox }}/docker-compose.yml"
+      register: dc
+
+    - name: Decode docker-compose
+      ansible.builtin.set_fact:
+        compose_yaml: "{{ (dc.content | b64decode) | from_yaml }}"
+
+    - name: Assert hardening
+      ansible.builtin.assert:
+        that:
+          - "'no-new-privileges:true' in compose_yaml.services.ntfy.security_opt"
+          - "'ALL' in compose_yaml.services.ntfy.cap_drop"
+          - "'NET_BIND_SERVICE' in compose_yaml.services.ntfy.cap_add"
+          - compose_yaml.services.ntfy.read_only | bool
+          - compose_yaml.services.ntfy.tmpfs[0] is search('/tmp:.*noexec.*nosuid.*nodev')
+          - compose_yaml.services.ntfy.pids_limit | int > 0
+          - compose_yaml.services.ntfy.labels['org.opencontainers.image.title'] is defined
+        fail_msg: "ntfy hardening incomplete"

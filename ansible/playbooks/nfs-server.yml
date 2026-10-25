@@ -1,0 +1,6 @@
+---
+- name: Deploy NFS Server
+  hosts: pi
+  become: true
+  roles:
+    - nfs_server

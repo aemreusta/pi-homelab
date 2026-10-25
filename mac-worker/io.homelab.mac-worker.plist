@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.homelab.mac-worker</string>
+
+    <!-- Re-assert the worker compose project (byparr) at login AND every 15 min.
+         Originally login-only, on the assumption that restart:unless-stopped
+         would keep the containers up between logins. That assumption failed
+         on 2026-08-08: the worker containers stopped and NOTHING brought them
+         back for 26 days — until an unrelated Mac restart happened to
+         re-trigger RunAtLoad. restart:unless-stopped only covers a container
+         that dies while its engine is healthy — it does not cover OrbStack
+         itself restarting, being stopped, or Tahoe dropping its network out
+         from under it.
+
+         2026-09-07: a stopped OrbStack VM defeated a compose-only re-assert;
+         byparr rides in this compose, so a stopped Mac VM silently took
+         Prowlarr's only Cloudflare solver offline and stalled 44 Pi-side qBit
+         grabs. The script now runs `orb start` before the compose re-assert.
+
+         2026-09-29: the orb-start + bounded-wait + compose logic moved into
+         the shared, Bats-tested mac-worker/ensure-compose.sh. Interval
+         tightened 3600 -> 900 s: the Mac is a MacBook that sleeps, so
+         post-wake recovery latency matters. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/Users/operator/.orbstack/bin</string>
+        <key>HOME</key>
+        <string>/Users/operator</string>
+    </dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/operator/GitHub/raspi-homelab/mac-worker/ensure-compose.sh</string>
+        <string>/Users/operator/GitHub/raspi-homelab/mac-worker</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Idempotent re-assert: a no-op when the containers already run, the
+         recovery when they do not. The docker-info wait inside ensure-compose.sh
+         is BOUNDED, because launchd will not start a second instance of a job
+         that is still running — an unbounded wait would swallow every later
+         trigger. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/operator/GitHub/raspi-homelab/mac-worker/logs/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/operator/GitHub/raspi-homelab/mac-worker/logs/launchd.log</string>
+</dict>
+</plist>

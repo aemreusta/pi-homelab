@@ -1,0 +1,88 @@
+---
+# NOTE: every `include_tasks` MUST use `apply: tags: [...]` to propagate tags
+# to the inner tasks. A bare `tags:` on the include only gates whether the
+# include itself runs — inner tasks have no tags and get filtered out when
+# `--tags <name>` is used. See memory: "Ansible Tag Propagation".
+- name: Include pre-flight validation
+  ansible.builtin.include_tasks:
+    file: validate.yml
+    apply:
+      tags: [common, validate]
+  tags: [common, validate]
+
+- name: Include package tasks
+  ansible.builtin.include_tasks:
+    file: packages.yml
+    apply:
+      tags: [common, packages]
+  tags: [common, packages]
+
+- name: Include timezone tasks
+  ansible.builtin.include_tasks:
+    file: timezone.yml
+    apply:
+      tags: [common, timezone]
+  tags: [common, timezone]
+
+- name: Include sysctl tasks
+  ansible.builtin.include_tasks:
+    file: sysctl.yml
+    apply:
+      tags: [common, sysctl]
+  tags: [common, sysctl]
+
+- name: Include DNS fallback tasks
+  ansible.builtin.include_tasks:
+    file: dns.yml
+    apply:
+      tags: [common, dns]
+  tags: [common, dns]
+
+- name: Include /etc/hosts pins
+  ansible.builtin.include_tasks:
+    file: hosts.yml
+    apply:
+      tags: [common, hosts]
+  tags: [common, hosts]
+
+- name: Include WiFi disable tasks
+  ansible.builtin.include_tasks:
+    file: wifi.yml
+    apply:
+      tags: [common, wifi]
+  tags: [common, wifi]
+
+- name: Include swap tasks
+  ansible.builtin.include_tasks:
+    file: swap.yml
+    apply:
+      tags: [common, swap]
+  tags: [common, swap]
+
+- name: Include cgroup tasks
+  ansible.builtin.include_tasks:
+    file: cgroup.yml
+    apply:
+      tags: [common, cgroup]
+  tags: [common, cgroup]
+
+- name: Include monitoring tasks
+  ansible.builtin.include_tasks:
+    file: monitoring.yml
+    apply:
+      tags: [common, monitoring]
+  tags: [common, monitoring]
+
+- name: Include persistent journald tasks
+  ansible.builtin.include_tasks:
+    file: journald.yml
+    apply:
+      tags: [common, journald]
+  tags: [common, journald]
+
+- name: Include internal-CA host trust tasks
+  ansible.builtin.include_tasks:
+    file: internal-ca-trust.yml
+    apply:
+      tags: [common, tls]
+  tags: [common, tls]

@@ -1,0 +1,74 @@
+---
+# Split-DNS drift detection. See defaults/main.yml for why this exists and
+# files/tailscale_split_dns.py for why it detects rather than converges.
+
+- name: Deploy split-DNS decision module
+  ansible.builtin.copy:
+    src: tailscale_split_dns.py
+    dest: "{{ tailscale_dns_split_check_decider }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy split-DNS drift-check script
+  ansible.builtin.template:
+    src: tailscale-split-dns-check.sh.j2
+    dest: "{{ tailscale_dns_split_check_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+# The script appends to this before its first cron run only if it can create
+# it; pre-creating keeps the log root-owned and rotated like its siblings.
+- name: Create split-DNS check log
+  ansible.builtin.file:
+    path: "{{ tailscale_dns_split_check_log }}"
+    state: touch
+    owner: root
+    group: root
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Rotate split-DNS check log
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/tailscale-split-dns-check
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {{ tailscale_dns_split_check_log }} {
+          weekly
+          rotate 4
+          compress
+          missingok
+          notifempty
+          copytruncate
+      }
+
+- name: Schedule split-DNS drift check
+  ansible.builtin.cron:
+    name: "tailscale-split-dns-check"
+    minute: "{{ tailscale_dns_split_check_cron_minute }}"
+    hour: "{{ tailscale_dns_split_check_cron_hour }}"
+    job: "{{ tailscale_dns_split_check_script }} >/dev/null 2>&1"
+    user: root
+    state: "{{ 'present' if tailscale_dns_split_check_enabled else 'absent' }}"
+
+# Seed the metric immediately so the series exists before the first cron tick —
+# otherwise `absent()`-style reasoning and the first dashboard load see nothing
+# and cannot distinguish "not deployed yet" from "check never ran".
+# check_mode: false because this is a read-only probe that writes only a metric;
+# skipping it under --check would leave the CD's deep-check pass unable to
+# confirm the script even runs (see ops-discipline §6, the check-mode-skip class).
+- name: Run split-DNS drift check once to seed the metric
+  ansible.builtin.command:
+    cmd: "{{ tailscale_dns_split_check_script }}"
+  register: tailscale_dns_split_seed
+  changed_when: false
+  # 0 = no drift, 1 = drift detected, 2 = could not read tailscale status.
+  # None of these should fail the play: the metric + alert own the outcome, and
+  # a deploy that aborts because the tailnet is currently misconfigured would
+  # block the very change that fixes it.
+  failed_when: false
+  check_mode: false

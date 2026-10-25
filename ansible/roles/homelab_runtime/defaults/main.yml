@@ -1,0 +1,13 @@
+---
+# Build tool only; scheduled jobs execute the static binary without Go/Python.
+# Official https://go.dev/dl/?mode=json, 2026-09-27; ~64 MiB download.
+homelab_runtime_go_version: "1.27.1"
+homelab_runtime_go_sha256: "3450b45a3f9ee8568792736a5c5e70a1f2e9b36c35a8f74958c03e51d7d92bec"
+homelab_runtime_root: /opt/homelab/runtime
+homelab_runtime_binary: /usr/local/bin/homelab-agent
+# Directory bind consumers resolve this file on each invocation. Atomic host
+# replacement cannot refresh an already mounted single-file container inode.
+homelab_runtime_shared_dir: /srv/.homelab-runtime
+homelab_runtime_shared_binary: /srv/.homelab-runtime/homelab-agent
+# A content identity from a retained release; empty builds the current source.
+homelab_runtime_rollback_id: ""

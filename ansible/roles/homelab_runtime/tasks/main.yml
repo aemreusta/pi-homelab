@@ -1,0 +1,84 @@
+---
+- name: Install per-process resource measurement tool
+  ansible.builtin.apt:
+    name: time
+    state: present
+
+- name: Compute Go source identity on the controller
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ playbook_dir }}/../../scripts/go-source-id.py"
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  changed_when: false
+  register: homelab_runtime_source_id
+
+- name: Select immutable runtime release
+  ansible.builtin.set_fact:
+    homelab_runtime_release_id: >-
+      {{ homelab_runtime_rollback_id | default('', true)
+         or ((homelab_runtime_source_id.stdout ~ ':' ~ homelab_runtime_go_version) | hash('sha256')) }}
+
+- name: Validate the runtime release identity
+  ansible.builtin.assert:
+    that:
+      - homelab_runtime_release_id is match('^[0-9a-f]{64}$')
+
+- name: Inspect the selected runtime release
+  ansible.builtin.stat:
+    path: "{{ homelab_runtime_root }}/releases/{{ homelab_runtime_release_id }}/homelab-agent"
+  register: homelab_runtime_release
+
+- name: Require an existing artifact for rollback
+  ansible.builtin.assert:
+    that:
+      - homelab_runtime_release.stat.exists
+    fail_msg: Requested runtime rollback artifact is absent; active binary is unchanged.
+  when: homelab_runtime_rollback_id | length > 0
+
+- name: Prepare Go compiler and build artifact
+  ansible.builtin.include_tasks: build.yml
+  when:
+    - not homelab_runtime_release.stat.exists
+    - homelab_runtime_rollback_id | length == 0
+
+- name: Verify the staged executable before activation
+  ansible.builtin.command:
+    argv:
+      - "{{ homelab_runtime_root }}/releases/{{ homelab_runtime_release_id }}/homelab-agent"
+      - version
+  register: homelab_runtime_version
+  changed_when: false
+  failed_when: homelab_runtime_version.stdout != homelab_runtime_release_id
+  when: not ansible_check_mode
+
+- name: Atomically activate the runtime with a rollback copy
+  ansible.builtin.copy:
+    src: "{{ homelab_runtime_root }}/releases/{{ homelab_runtime_release_id }}/homelab-agent"
+    dest: "{{ homelab_runtime_binary }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+    backup: true
+  when: not ansible_check_mode or homelab_runtime_release.stat.exists
+
+- name: Ensure root-owned runtime publication directory for live container hooks
+  ansible.builtin.file:
+    path: "{{ homelab_runtime_shared_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Atomically publish the selected runtime to directory bind consumers
+  ansible.builtin.copy:
+    src: "{{ homelab_runtime_root }}/releases/{{ homelab_runtime_release_id }}/homelab-agent"
+    dest: "{{ homelab_runtime_shared_binary }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  when: not ansible_check_mode or homelab_runtime_release.stat.exists

@@ -1,0 +1,12 @@
+#!/bin/bash
+# Safe homelab restart: reboot and let Docker auto-restart containers.
+#
+# NOTE: We intentionally do NOT run "docker stop" here.
+# The "unless-stopped" restart policy only auto-starts containers
+# that were NOT explicitly stopped via "docker stop". By letting
+# systemd send SIGTERM to Docker during reboot, containers are
+# treated as "crashed" and will auto-restart on next boot.
+set -euo pipefail
+
+echo "Rebooting..."
+reboot

@@ -1,0 +1,64 @@
+---
+# MinIO — S3-compatible object storage.
+# https://github.com/minio/minio
+# Managed by Ansible — do not edit manually.
+
+services:
+  minio:
+    image: {{ minio_image }}
+    container_name: minio
+    restart: unless-stopped
+    init: true
+    # Run as pi (1000:1000) so objects on /srv/data/minio are host-owned and
+    # no in-container chown is needed (keeps cap_drop ALL viable).
+    user: "{{ minio_puid }}:{{ minio_pgid }}"
+    command: server /data --console-address ":9001"
+    mem_limit: {{ minio_mem_limit }}
+    pids_limit: {{ minio_pids_limit }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for c in minio_cap_drop %}
+      - {{ c }}
+{% endfor %}
+    labels:
+{% for k, v in minio_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - TZ={{ minio_tz }}
+      - MINIO_ROOT_USER={{ minio_root_user }}
+      - MINIO_ROOT_PASSWORD={{ minio_root_password }}
+      # Console behind Traefik internal-CA HTTPS — fixes login redirect target.
+      - MINIO_BROWSER_REDIRECT_URL={{ minio_browser_redirect_url }}
+      # Serve /minio/v2/metrics/* without a bearer token so vmagent can scrape.
+      - MINIO_PROMETHEUS_AUTH_TYPE={{ minio_prometheus_auth_type }}
+    ports:
+      # host:container — 9000/9001 clash with Portainer, so remap on the host.
+      - "{{ minio_api_port }}:9000"
+      - "{{ minio_ui_port }}:9001"
+    volumes:
+      - {{ minio_data_dir }}:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "-sf", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - minio_net
+      - mlstack_net
+
+networks:
+  minio_net:
+    driver: bridge
+  # Shared ML-stack bridge (created by the postgresql role). MinIO joins it so
+  # MLflow (and future ML services) reach the S3 API as minio:9000 by service
+  # name — no LAN-IP hairpin. Declared external; deploy postgresql before minio.
+  mlstack_net:
+    external: true

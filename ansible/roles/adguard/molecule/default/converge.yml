@@ -1,0 +1,37 @@
+---
+- name: Converge — render AdGuard templates to tmp dir for assertion
+  hosts: localhost
+  gather_facts: false
+  vars:
+    docker_user: pi
+    timezone: Europe/Istanbul
+    ansible_facts:
+      default_ipv4:
+        address: "192.0.2.100"
+  pre_tasks:
+    - name: Load role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../defaults/main.yml"
+
+    - name: Override compose/data dirs to a tmp sandbox
+      ansible.builtin.set_fact:
+        adguard_compose_dir: /tmp/molecule-adguard
+        adguard_data_dir: /tmp/molecule-adguard/data
+        adguard_host_ip: "192.0.2.100"
+
+    - name: Ensure sandbox dirs exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ adguard_compose_dir }}"
+        - "{{ adguard_data_dir }}"
+        - "{{ adguard_data_dir }}/work"
+        - "{{ adguard_data_dir }}/conf"
+  tasks:
+    - name: Render docker-compose.yml
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../templates/docker-compose.yml.j2"
+        dest: "{{ adguard_compose_dir }}/docker-compose.yml"
+        mode: "0644"

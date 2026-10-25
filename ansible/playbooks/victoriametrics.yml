@@ -1,0 +1,6 @@
+---
+- name: Deploy VictoriaMetrics (single-node TSDB)
+  hosts: pi
+  become: true
+  roles:
+    - victoriametrics

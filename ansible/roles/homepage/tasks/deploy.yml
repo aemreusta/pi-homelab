@@ -1,0 +1,121 @@
+---
+- name: Look up docker group GID for socket access
+  ansible.builtin.getent:
+    database: group
+    key: docker
+
+- name: Set docker GID fact for homepage container
+  ansible.builtin.set_fact:
+    homepage_docker_gid: "{{ ansible_facts.getent_group.docker[1] }}"
+
+- name: Create Homepage compose directory
+  ansible.builtin.file:
+    path: "{{ homepage_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create Homepage config directory
+  ansible.builtin.file:
+    path: "{{ homepage_config_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Copy Homepage docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ homepage_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart homepage
+
+- name: Create Homepage images directory
+  ansible.builtin.file:
+    path: "{{ homepage_config_dir }}/images"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+# Both images are Git-LFS tracked (.gitattributes: *.jpg, *.png). If the
+# controller's checkout has not run the LFS smudge filter, `src:` is a
+# ~132-byte pointer TEXT file and copy: ships it as the image — the container
+# serves it 200 OK and the dashboard renders with no background and no logo,
+# silently. That is exactly what happened on 2026-09-03: the CD runs
+# --connection=local against the PI's checkout (pointers, no git-lfs installed)
+# while `make homepage` from the Mac resolves src: against the operator's
+# working tree (real bytes), so it passed by hand and failed only under the CD.
+# Fail loudly here instead of shipping a broken asset.
+- name: Assert the bundled images are real binaries, not Git-LFS pointers
+  ansible.builtin.assert:
+    that:
+      - (lookup('ansible.builtin.file', item) is not match('^version https://git-lfs'))
+    fail_msg: >-
+      {{ item }} is a Git-LFS pointer, not an image. The controller's checkout
+      has not materialised LFS objects. Run `git lfs install && git lfs pull` in
+      the repo, then re-run. On the Pi this is handled by the homelab_autodeploy
+      role (it installs git-lfs and pulls after every checkout).
+  loop:
+    - background.jpg
+    - ts-logo.png
+
+- name: Copy dashboard background image
+  ansible.builtin.copy:
+    src: background.jpg
+    dest: "{{ homepage_config_dir }}/images/background.jpg"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+
+- name: Copy Trabzonspor logo
+  # Bundled in the repo (files/ts-logo.png), NOT fetched at deploy time. The
+  # previous get_url hit the Trabzonspor CDN on every run; the CDN started
+  # returning HTTP 405 to get_url's conditional request → the homepage deploy
+  # failed at this step (and, because it's version-independent, a rollback
+  # re-deploy would fail too). Same fix + precedent as the bundled background
+  # image (584e7c3): a deploy must not depend on a flaky third-party host.
+  ansible.builtin.copy:
+    src: ts-logo.png
+    dest: "{{ homepage_config_dir }}/images/ts-logo.png"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+
+# Read the repo CHANGELOG on the control node so custom.js can embed it (via
+# to_json) and render the version/changelog drawer. role_path is <repo>/ansible/
+# roles/homepage, so three levels up is the repo root. Works under both a manual
+# `make homepage` (Mac repo) and the GitOps CD (the Pi's tag checkout — it shows
+# exactly the changelog of the deployed tag). Embedding avoids an extra public
+# mount + client fetch; to_json renders the string VALUE, so any {{ }} or markup
+# inside the changelog is data, never re-templated.
+- name: Read repo CHANGELOG for the homepage version/changelog drawer
+  ansible.builtin.set_fact:
+    homepage_changelog_md: "{{ lookup('file', role_path ~ '/../../../CHANGELOG.md', errors='ignore') | default('', true) }}"
+
+- name: Copy Homepage configuration files
+  ansible.builtin.template:
+    src: "{{ item }}"
+    dest: "{{ homepage_config_dir }}/{{ item | replace('.j2', '') }}"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  loop:
+    - services.yaml.j2
+    - settings.yaml.j2
+    - docker.yaml.j2
+    - widgets.yaml.j2
+    - bookmarks.yaml.j2
+    - custom.css.j2
+    - custom.js.j2
+  notify: Restart homepage
+
+- name: Start Homepage container
+  community.docker.docker_compose_v2:
+    project_src: "{{ homepage_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

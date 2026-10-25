@@ -1,0 +1,218 @@
+---
+traefik_compose_dir: /home/{{ docker_user }}/docker/network/traefik
+traefik_config_dir: /home/{{ docker_user }}/docker/network/traefik/config
+traefik_certs_dir: /home/{{ docker_user }}/docker/network/traefik/certs
+traefik_tz: "{{ timezone }}"
+
+# Traefik image version
+traefik_image: traefik:v3.3
+
+# Entrypoint ports
+traefik_http_port: 80
+traefik_https_port: 443
+traefik_dashboard_port: 8180
+
+# Tailscale FQDN for TLS certs (e.g. homelab.tail1234.ts.net)
+# Leave empty to skip TLS cert generation
+traefik_tailscale_fqdn: "{{ vault_tailscale_fqdn | default('') }}"
+
+# Services to reverse proxy — each entry generates a routing rule
+# subdomain.example → 127.0.0.1:port
+traefik_services:
+  - name: jellyfin
+    port: 8096
+  - name: sonarr
+    port: 8989
+    auth: true         # forward-auth (Authelia) — added 2026-08-04 so the *arr UIs
+                       # sit behind one SSO login. Its own
+                       # Forms login is still ON: the host port is LAN-open, so
+                       # disabling it here would leave the app unauthenticated on
+                       # the direct port. Closing that port is the remaining step —
+                       # an open TODO ("SSO / centralised auth").
+  - name: radarr
+    port: 7878
+    auth: true         # forward-auth (Authelia) — added 2026-08-04 so the *arr UIs
+                       # sit behind one SSO login. Its own
+                       # Forms login is still ON: the host port is LAN-open, so
+                       # disabling it here would leave the app unauthenticated on
+                       # the direct port. Closing that port is the remaining step —
+                       # an open TODO ("SSO / centralised auth").
+  - name: prowlarr
+    port: 9696
+    auth: true         # forward-auth (Authelia) — added 2026-08-04 so the *arr UIs
+                       # sit behind one SSO login. Its own
+                       # Forms login is still ON: the host port is LAN-open, so
+                       # disabling it here would leave the app unauthenticated on
+                       # the direct port. Closing that port is the remaining step —
+                       # an open TODO ("SSO / centralised auth").
+  - name: qbittorrent
+    port: 8181
+  - name: homepage
+    port: 3001
+  - name: filebrowser
+    port: 8082
+    auth: true         # forward-auth (Authelia). Added 2026-08-02 — this had never
+                       # been flagged, so "Authelia doesn't work on filebrowser" was
+                       # never a failure, it was simply never enabled. filebrowser
+                       # exposes the whole /srv tree, so it belongs behind the gate.
+                       # NOTE: like every service here, host port 8082 stays LAN-open,
+                       # so this is convenience routing, not a boundary — see
+                       # docs/conventions/reverse-proxy-not-an-auth-boundary.md.
+                       # filebrowser keeps its own login too; that second prompt is
+                       # expected, not a misconfiguration.
+  - name: adguard
+    port: 8080
+  - name: portainer
+    port: 9000
+  - name: control
+    port: 9099
+  - name: jellyseerr
+    port: 5055
+  - name: beszel
+    port: 8090
+  - name: tdarr
+    port: 8265
+  - name: logs       # VictoriaLogs vmui
+    port: 9428
+  - name: metrics    # VictoriaMetrics vmui
+    port: 8428
+  - name: vmagent
+    port: 8429
+  - name: grafana
+    port: 3003
+  - name: vmalert
+    port: 8880
+  - name: vmalert-logs
+    port: 8881
+  - name: alertmanager
+    port: 9093
+  - name: uptime       # Uptime Kuma — endpoint monitor
+    port: 3011
+  - name: speedtest    # Speedtest Tracker — ISP bandwidth log
+    port: 8765
+  - name: ntfy         # ntfy push — behind Traefik (doc 025 Phase 2); backend = host port 2586
+    port: 2586
+  - name: minio        # MinIO web console (S3 object storage)
+    port: 9011
+  - name: minio-api    # MinIO S3 API endpoint
+    port: 9010
+  - name: label-studio # Label Studio CE — dataset labeling UI
+    port: 8085
+  - name: mlflow       # MLflow — experiment tracking + model registry
+    port: 5000
+  - name: registry     # Zot OCI registry — browser UI (TLS). docker push uses raspberrypi.local:5050 (plain HTTP + insecure-registries), NOT this route.
+    port: 5050
+  - name: auth         # Authelia SSO portal (loopback 127.0.0.1:9091). Never `auth: true` (would self-gate → redirect loop).
+    port: 9091
+
+# ── Forward-auth (Authelia) ──────────────────────────────────────────────────
+# When enabled, services flagged `auth: true` above get the `authelia`
+# forwardAuth middleware on their hostname routers (browser path only — machine
+# clients reach these services on localhost/host-IP/container-name, which UFW/the
+# Docker network govern, NOT Traefik). NOTE: this gates the *.example(.io) path;
+# it is NOT a full boundary until the service's host port is also closed
+# (docs/conventions/reverse-proxy-not-an-auth-boundary.md). Authelia's authz
+# endpoint (v4.39) on its loopback-published port:
+traefik_forward_auth_enabled: true
+traefik_authelia_address: "http://127.0.0.1:9091/api/authz/forward-auth"
+
+# Dashboard basic auth (htpasswd format: "user:$2y$...")
+# Generate with: htpasswd -nbB admin yourpassword
+# Set via vault: vault_traefik_dashboard_htpasswd
+# Leave empty to disable auth (LAN-only access via UFW)
+traefik_dashboard_htpasswd: "{{ vault_traefik_dashboard_htpasswd | default('') }}"
+
+# Security headers on all routers
+traefik_security_headers: true
+
+# --- Internal CA + *.example trusted HTTPS (LAN + Tailscale) ---
+# Stands up a private CA whose root is installed on devices, signing a single
+# *.example wildcard leaf that Traefik presents on :443. Because AdGuard (LAN)
+# and dnsmasq (Tailscale) both resolve *.example to the Pi, one cert serves both
+# networks. See docs/design/033-internal-ca-https.md.
+traefik_internal_ca_enabled: true
+traefik_internal_ca_cn: "homelab CA"
+# Leaf CN is the first internal domain's wildcard (legacy primary).
+traefik_internal_leaf_cn: "*.{{ (homelab_internal_domains | default(['homelab']))[0] }}"
+# A bare `*.<tld>` wildcard is REJECTED by OpenSSL/curl/browsers when the parent
+# is a single label (`*.example`) — wildcards need a 2+ label parent. So we
+# enumerate explicit `DNS:<svc>.<domain>` SANs for EVERY internal domain
+# (homelab_internal_domains) × every service (+ apex + dashboard). The bare
+# wildcards are kept too for lenient clients. One cert serves both the legacy
+# `.example` and the new `.example.org` names during the migration; adding a
+# service or a domain auto-extends the SAN → cert re-issues on next deploy.
+traefik_internal_leaf_san: >-
+  {{ (homelab_internal_domains | default(['homelab']) | map('regex_replace', '^(.+)$', 'DNS:*.\1') | list)
+     + (homelab_internal_domains | default(['homelab']) | map('regex_replace', '^(.+)$', 'DNS:\1') | list)
+     + (((traefik_services | map(attribute='name') | list) + ['traefik'])
+        | product(homelab_internal_domains | default(['homelab']))
+        | map('join', '.')
+        | map('regex_replace', '^(.+)$', 'DNS:\1') | list) }}
+# Absolute validity (NOT relative "+Nd" — keeps generation idempotent and makes
+# expiry explicit). Bump these + redeploy to renew; the expiry-guard task fails
+# the play when the leaf has < 30 days left. CA ~10y, leaf ~2y.
+traefik_internal_ca_not_after: "20360606000000Z"
+traefik_internal_leaf_not_after: "20280606000000Z"
+# DR: after first run, copy the generated key+cert into vault so an SSD rebuild
+# reuses the same CA (no device re-trust). Empty → generate on the Pi.
+traefik_internal_ca_key: "{{ vault_traefik_internal_ca_key | default('') }}"
+traefik_internal_ca_cert: "{{ vault_traefik_internal_ca_cert | default('') }}"
+
+# Force HTTP->HTTPS redirect at the web entrypoint. Now TRUE: the internal CA is
+# trusted on devices and HTTPS is verified stable, so plaintext HTTP 301s to
+# HTTPS for every host. Set back to false only to roll back to dual-stack.
+# NOTE: this only affects Traefik's web entrypoint (:80) — ntfy's direct :2586
+# host port is untouched, so internal http senders keep working. See docs/design/033-internal-ca-https.md.
+traefik_force_https_redirect: true
+
+# HSTS max-age (seconds) for the websecure security-headers middleware. Bumped to
+# 1 year now that trusted HTTPS is stable (was 86400 during the rollout ramp).
+traefik_hsts_seconds: 31536000
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+traefik_mem_limit: 256M
+
+# --- Container security hardening ---
+
+# PID limit — Traefik is a Go binary; ~30 OS threads typical. 100 leaves headroom.
+traefik_pids_limit: 100
+
+# Read-only root filesystem. Traefik writes only to /tmp at runtime; tmpfs covers it.
+traefik_read_only: true
+traefik_tmpfs_size: 64m
+
+# Linux capabilities. Drop all, re-add only NET_BIND_SERVICE for binding 80/443.
+traefik_cap_drop:
+  - ALL
+traefik_cap_add:
+  - NET_BIND_SERVICE
+
+# TLS hardening (applied to dynamic.yml `tls.options.default`).
+# Mozilla intermediate (2024) — TLS 1.2 ECDHE+AEAD suites. TLS 1.3 ciphers are
+# Go-runtime-controlled and not configurable here.
+traefik_tls_min_version: VersionTLS12
+traefik_tls_cipher_suites:
+  - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+  - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+  - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+  - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+  - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+  - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+traefik_tls_curve_preferences:
+  - X25519
+  - CurveP256
+
+# Access logging → container stdout for central logging (fluentbit →
+# VictoriaLogs). JSON so the DownstreamStatus code is field-matchable by the
+# TraefikErrorRateHigh alert. Set false to silence per-request logging.
+traefik_access_log_enabled: true
+traefik_access_log_format: json
+
+# OCI image labels (applied to the container).
+traefik_oci_labels:
+  org.opencontainers.image.title: traefik
+  org.opencontainers.image.description: "Reverse proxy for *.example + Tailscale HTTPS"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/traefik/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.version: "{{ traefik_image | regex_replace('^.*:', '') }}"

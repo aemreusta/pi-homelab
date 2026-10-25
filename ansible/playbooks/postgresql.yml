@@ -1,0 +1,6 @@
+---
+- name: Deploy PostgreSQL shared ML backend
+  hosts: pi
+  become: true
+  roles:
+    - postgresql

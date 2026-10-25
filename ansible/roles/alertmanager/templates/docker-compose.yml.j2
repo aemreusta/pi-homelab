@@ -1,0 +1,108 @@
+---
+# Alertmanager + ntfy-bridge — Sprint 18.
+# https://prometheus.io/docs/alerting/latest/alertmanager/
+
+services:
+  alertmanager:
+    image: {{ alertmanager_image }}
+    container_name: alertmanager
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ alertmanager_mem_limit }}
+    pids_limit: {{ alertmanager_pids_limit }}
+    read_only: {{ alertmanager_read_only | lower }}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size={{ alertmanager_tmpfs_size }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in alertmanager_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+    labels:
+{% for k, v in alertmanager_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    networks:
+      - {{ alertmanager_network }}
+    ports:
+      - "{{ alertmanager_port }}:9093"
+    volumes:
+      - {{ alertmanager_compose_dir }}/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - {{ alertmanager_data_dir }}:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=:9093
+      - --web.external-url={{ alertmanager_external_url }}
+    environment:
+      - TZ={{ alertmanager_tz }}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:9093/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  ntfy-bridge:
+    image: {{ alertmanager_bridge_image }}
+    container_name: ntfy-bridge
+    restart: unless-stopped
+    # Tiny — runs a stdlib HTTP server. 64M is generous.
+    mem_limit: 64M
+    pids_limit: 32
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    user: "65534:65534"  # nobody — bridge has no host-fs writes besides audit log
+    networks:
+      - {{ alertmanager_network }}
+    ports:
+      # LOOPBACK ONLY. Published solely so host-networked vmagent can scrape
+      # /metrics (ntfy_bridge_send_failures_total → NtfyBridgeSendFailures).
+      # Alertmanager itself reaches the bridge over the compose network by
+      # container name, so this mapping is for the scrape path alone.
+      #
+      # 127.0.0.1 rather than the LAN-scoped form used by service ports: it
+      # needs no UFW rule and cannot be reached off-box at all, which is the
+      # right exposure for a webhook receiver that takes unauthenticated
+      # POSTs. Do NOT widen this to 0.0.0.0 to "make debugging easier" —
+      # anyone on the LAN could then forge alerts into your phone.
+      - "127.0.0.1:{{ alertmanager_bridge_port }}:{{ alertmanager_bridge_port }}"
+    volumes:
+      - {{ alertmanager_compose_dir }}/bridge/ntfy-bridge.py:/app/ntfy-bridge.py:ro
+      # Append-only access to alert-audit.log (0666 set at deploy time).
+      - {{ alertmanager_bridge_audit_log }}:{{ alertmanager_bridge_audit_log }}
+    environment:
+      - NTFY_URL={{ ntfy_external_topic_url }}
+      - AUDIT_LOG={{ alertmanager_bridge_audit_log }}
+      - LISTEN_PORT={{ alertmanager_bridge_port }}
+      - TZ={{ alertmanager_tz }}
+    command: ["python3", "/app/ntfy-bridge.py"]
+    labels:
+      org.opencontainers.image.title: ntfy-bridge
+      org.opencontainers.image.description: "Alertmanager → ntfy webhook receiver with audit log"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:{{ alertmanager_bridge_port }}/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  {{ alertmanager_network }}:
+    external: true

@@ -1,0 +1,57 @@
+---
+services:
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ portainer_mem_limit }}
+    pids_limit: {{ portainer_pids_limit }}
+    read_only: {{ portainer_read_only | lower }}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size={{ portainer_tmpfs_size }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in portainer_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+{% if portainer_cap_add | length > 0 %}
+    cap_add:
+{% for cap in portainer_cap_add %}
+      - {{ cap }}
+{% endfor %}
+{% endif %}
+    labels:
+{% for k, v in portainer_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+{% if vault_portainer_password is defined and vault_portainer_password | length > 0 %}
+    command: "--admin-password '{{ vault_portainer_password | password_hash('bcrypt') }}'"
+{% endif %}
+    environment:
+      - TZ={{ portainer_tz }}
+    ports:
+      - "9000:9000"
+      - "9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - {{ portainer_data_dir }}:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Portainer ships as a scratch image (no shell, no wget, no curl, and the
+    # binary has no `health` subcommand). The previous wget-based healthcheck
+    # has been silently failing since v2.x. Disable it explicitly so Docker
+    # reports "Up" rather than "Up (unhealthy)" — Docker has no built-in HTTP
+    # healthcheck. Reachability is monitored via Traefik / Beszel instead.
+    healthcheck:
+      disable: true
+    networks:
+      - portainer_net
+
+networks:
+  portainer_net:
+    driver: bridge

@@ -1,0 +1,79 @@
+---
+# Swap on Debian Trixie / Raspberry Pi.
+#
+# rpi-swap design: a single `dev-zram0.swap` systemd unit exposes zram0
+# (compressed RAM) as the primary swap, and uses /var/swap as zram's
+# WRITEBACK device — i.e. when zram exhausts its compressed capacity it
+# spills evicted pages to /var/swap. /var/swap is NOT a parallel
+# priority-10 swap device under this design; it's a backing file behind
+# zram0 (see /run/systemd/zram-generator.conf.d/20-rpi-swap-zram0-ctrl.conf
+# at boot: writeback-device=/dev/disk/by-backingfile/var-swap).
+#
+# We previously added /var/swap to fstab thinking it had to be activated
+# manually. That entry caused systemd to mount /var/swap before
+# rpi-resize-swap-file.service ran, which made mkswap refuse ("/var/swap is
+# mounted"), which cascaded into a dependency failure for
+# systemd-zram-setup@zram0.service → no zram at all. The fstab entry is
+# now removed and we let rpi-swap manage everything via dev-zram0.swap.
+
+- name: Configure rpi-swap size
+  ansible.builtin.template:
+    src: rpi-swap.conf.j2
+    dest: /etc/rpi/swap.conf
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  register: common_swap_config
+
+# Remove the legacy fstab entry that activated /var/swap as a standalone
+# priority-10 swap. rpi-swap's dev-zram0.swap unit uses /var/swap as
+# writeback storage; the duplicate activation broke the resize at boot.
+- name: Remove legacy /var/swap fstab entry
+  ansible.posix.mount:
+    path: none
+    src: /var/swap
+    fstype: swap
+    state: absent
+  become: true
+  register: common_swap_fstab_legacy
+
+# rpi-resize-swap-file calls mkswap, which refuses to overwrite a mounted
+# swap. swapoff first so the resize succeeds. failed_when:false because it
+# may already be off.
+- name: Deactivate /var/swap before resize  # noqa: no-handler
+  ansible.builtin.command: swapoff /var/swap
+  become: true
+  when: common_swap_config is changed or common_swap_fstab_legacy is changed
+  changed_when: true
+  failed_when: false
+
+- name: Resize swap file  # noqa: no-handler
+  ansible.builtin.command: /usr/lib/rpi-swap/bin/rpi-resize-swap-file
+  become: true
+  when: common_swap_config is changed or common_swap_fstab_legacy is changed
+  changed_when: true
+
+# Bring up the combined zram+writeback swap device. If it's already active,
+# this is a no-op. Need a daemon-reload first so systemd picks up the
+# regenerated zram-generator drop-in.
+- name: Reload systemd to pick up regenerated zram-generator drop-in
+  ansible.builtin.systemd:
+    daemon_reload: true
+  become: true
+  when: common_swap_config is changed or common_swap_fstab_legacy is changed
+
+- name: Activate dev-zram0.swap (the rpi-swap managed combined zram+writeback)
+  ansible.builtin.systemd:
+    name: dev-zram0.swap
+    state: started
+  become: true
+  failed_when: false
+  register: common_swap_zram_activate
+  when: common_swap_config is changed or common_swap_fstab_legacy is changed
+
+- name: Check active swap devices
+  ansible.builtin.slurp:
+    src: /proc/swaps
+  register: common_active_swaps
+  become: true

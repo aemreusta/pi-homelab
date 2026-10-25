@@ -1,0 +1,115 @@
+// ── Versions + Changelog drawer ────────────────────────────────────────────
+// A floating pill (bottom-right) shows the newest version and opens a right-side
+// slide-in drawer listing every release as a collapsible section — the repo
+// CHANGELOG rendered in-dashboard. The markdown is embedded at deploy time via
+// Ansible `to_json` (below), so there is no runtime fetch/CSP concern. Styling
+// lives in custom.css (#cl-*).
+(function () {
+  var MD = {{ homepage_changelog_md | default('') | to_json }};
+  if (typeof MD !== 'string' || !MD.trim()) return;
+
+  function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function inline(s) {
+    s = esc(s);
+    s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (_, t, u) {
+      return '<a href="' + u.replace(/"/g, '%22') + '" target="_blank" rel="noopener noreferrer">' + t + '</a>';
+    });
+    s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    return s;
+  }
+
+  // Parse the CHANGELOG into version sections (## [name] — date) with ### heads
+  // and - bullets. Everything before the first ## is ignored (the file preamble).
+  var versions = [], cur = null;
+  MD.split('\n').forEach(function (ln) {
+    var mV = ln.match(/^##\s+\[([^\]]+)\]\s*(?:[—\-]\s*(.*))?$/);
+    if (mV) { cur = { name: mV[1], date: (mV[2] || '').trim(), blocks: [] }; versions.push(cur); return; }
+    if (!cur) return;
+    var mH = ln.match(/^###\s+(.*)$/); if (mH) { cur.blocks.push(['h', mH[1].trim()]); return; }
+    var mL = ln.match(/^\s*[-*]\s+(.*)$/); if (mL) { cur.blocks.push(['li', mL[1]]); return; }
+    if (ln.trim()) cur.blocks.push(['p', ln.trim()]);
+  });
+  // Drop empty sections (e.g. a promoted [Unreleased] with nothing under it) so
+  // the badge shows the latest REAL release, not an empty "Unreleased".
+  versions = versions.filter(function (v) { return v.blocks.length; });
+  if (!versions.length) return;
+
+  // Progressive disclosure: CHANGELOG bullets are "**Bold summary.** long detail".
+  // Render the bold lead as a scannable one-liner and hide the detail behind a
+  // click — otherwise every entry is a wall of text (readability fix 2026-07-14).
+  function li(raw) {
+    var m = raw.match(/^\*\*(.+?)\*\*(.*)$/);
+    if (m && m[2].trim()) {
+      var rest = m[2].replace(/^[\s.:—\-]+/, '');
+      return '<li class="cl-li"><strong class="cl-lead">' + esc(m[1]) + '.</strong>'
+           + '<span class="cl-detail"> ' + inline(rest) + '</span></li>';
+    }
+    return '<li>' + inline(raw) + '</li>';
+  }
+
+  function render(blocks) {
+    var html = '', inList = false;
+    blocks.forEach(function (b) {
+      if (b[0] === 'li') { if (!inList) { html += '<ul>'; inList = true; } html += li(b[1]); return; }
+      if (inList) { html += '</ul>'; inList = false; }
+      html += b[0] === 'h' ? '<h4>' + esc(b[1]) + '</h4>' : '<p>' + inline(b[1]) + '</p>';
+    });
+    if (inList) html += '</ul>';
+    return html;
+  }
+
+  var fab = document.createElement('button');
+  fab.id = 'cl-fab'; fab.type = 'button';
+  fab.innerHTML = '<span class="cl-ico">📋</span> Changelog <span class="cl-badge"></span>';
+  fab.querySelector('.cl-badge').textContent = versions[0].name;
+
+  var backdrop = document.createElement('div'); backdrop.id = 'cl-backdrop';
+  var drawer = document.createElement('aside'); drawer.id = 'cl-drawer';
+  drawer.setAttribute('role', 'dialog'); drawer.setAttribute('aria-label', 'Homelab changelog');
+  var header = document.createElement('header');
+  var h3 = document.createElement('h3'); h3.textContent = 'Homelab — Versions & Changelog';
+  var close = document.createElement('button'); close.id = 'cl-close'; close.type = 'button';
+  close.setAttribute('aria-label', 'Close'); close.innerHTML = '✕';
+  header.appendChild(h3); header.appendChild(close);
+  var body = document.createElement('div'); body.id = 'cl-body';
+
+  versions.forEach(function (v, i) {
+    var sec = document.createElement('section'); sec.className = 'cl-ver' + (i === 0 ? ' open' : '');
+    var head = document.createElement('button'); head.type = 'button'; head.className = 'cl-ver-head';
+    head.innerHTML = '<span class="cl-caret">▸</span><span class="cl-ver-name"></span><span class="cl-ver-date"></span>';
+    head.querySelector('.cl-ver-name').textContent = v.name;
+    head.querySelector('.cl-ver-date').textContent = v.date;
+    var content = document.createElement('div'); content.className = 'cl-ver-content'; content.innerHTML = render(v.blocks);
+    // Click a collapsed bullet to reveal its detail (ignore clicks on links).
+    content.addEventListener('click', function (e) {
+      if (e.target.closest('a')) return;
+      var item = e.target.closest('.cl-li');
+      if (item && content.contains(item)) item.classList.toggle('cl-expanded');
+    });
+    head.addEventListener('click', function () { sec.classList.toggle('open'); });
+    sec.appendChild(head); sec.appendChild(content); body.appendChild(sec);
+  });
+  drawer.appendChild(header); drawer.appendChild(body);
+
+  function open() { document.documentElement.classList.add('cl-open'); }
+  function shut() { document.documentElement.classList.remove('cl-open'); }
+  fab.addEventListener('click', open);
+  close.addEventListener('click', shut);
+  backdrop.addEventListener('click', shut);
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') shut(); });
+
+  function mount() {
+    if (!document.body || document.getElementById('cl-fab')) return;
+    document.body.appendChild(backdrop);
+    document.body.appendChild(drawer);
+    document.body.appendChild(fab);
+  }
+  mount();
+  if (!document.getElementById('cl-fab')) document.addEventListener('DOMContentLoaded', mount);
+  // Re-mount if a React re-render drops our nodes (same defensive pattern as above).
+  try {
+    new MutationObserver(function () { mount(); })
+      .observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) {}
+})();

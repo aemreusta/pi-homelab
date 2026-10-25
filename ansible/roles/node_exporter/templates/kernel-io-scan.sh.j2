@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Kernel storage-fault scanner -> node_exporter textfile collector.
+# MANAGED BY ANSIBLE (roles/node_exporter) — do not edit on the host.
+#
+# Orchestration ONLY. All classification lives in kernel_io_scan.py, which
+# has a pytest suite (tests/test_kernel_io_scan.py). Per CLAUDE.md, diff /
+# classification logic must never live in bash or Jinja2.
+#
+# Source is `dmesg` — the kernel's IN-RAM ring buffer — deliberately, NOT
+# journalctl, even though persistent journald is configured here.
+#
+# Verified on the 2026-08-01 incident: `journalctl -k -b -1` contains the USB
+# disconnect but NO ext4 error and NO "Remounting filesystem read-only",
+# because by the time ext4 gave up, journald could no longer write to the
+# disk that had just failed. The evidence for a root-filesystem failure
+# cannot be stored on the root filesystem. dmesg lives in RAM and keeps
+# reporting through a read-only root and through a full disk (this host runs
+# at 97%, where journald also starts dropping).
+#
+# Trade-off accepted: the ring buffer wraps. On this host kernel chatter is
+# low (59 of 910 lines in the last boot were UFW BLOCK noise), and a 5-minute
+# scan interval against per-boot gauges makes eviction a non-issue in
+# practice. If UFW logging ever gets loud, revisit — a wrapped buffer
+# silently lowers these counts.
+#
+# See docs/incidents/2026-08-01-usb-ssd-root-dropout-readonly.md
+set -uo pipefail
+
+LOCK="/var/lock/kernel-io-scan.lock"
+TF_DIR="{{ node_exporter_textfile_dir }}"
+TF="$TF_DIR/kernel_io.prom"
+SCANNER="{{ node_exporter_scan_script_dir }}/kernel_io_scan.py"
+
+# Non-blocking: if a previous run is somehow still going, skip rather than
+# pile up. Cron every 5 min against a sub-second scan makes overlap unlikely,
+# but a wedged journalctl on a sick disk is exactly when this fires.
+exec 9>"$LOCK" || exit 0
+flock -n 9 || exit 0
+
+[ -d "$TF_DIR" ] || exit 0
+[ -x "$SCANNER" ] || exit 0
+
+now="$(date +%s)"
+TMP="$TF.$$"
+
+# Current boot id. Stable for the life of a boot, regenerated on every boot —
+# so a change between two scans is exactly "we rebooted in between". Passed
+# to the scanner, which promotes the previous boot's counts into the
+# *_last_boot series when it changes. Without this, the reboot that follows a
+# storage dropout erases the only record that the dropout happened (verified
+# 2026-08-02). Empty if the file is unreadable: the scanner then treats it as
+# "same boot" and leaves any existing snapshot alone, which is the safe
+# direction — a spurious promotion would overwrite real evidence.
+boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+
+# dmesg may fail on a sick host — that is itself signal, but we must not emit
+# a partial/empty file that would zero out a real fault count. On failure we
+# leave the previous .prom in place and let the staleness rule
+# (KernelIOScanStale) fire instead.
+if ! kernel_log="$(dmesg 2>/dev/null)"; then
+    exit 0
+fi
+
+# Atomic publish: node_exporter may scrape mid-write. Same-filesystem mv is
+# atomic; a cross-filesystem mv degrades to copy+unlink and would expose a
+# partial read — hence TMP lives in TF_DIR, not /tmp.
+# "$TF" is the PREVIOUS emit — still on disk from before the reboot, which is
+# what makes the last-boot snapshot possible at all. Read by the scanner, not
+# by this script: parsing is logic and logic does not live in bash (CLAUDE.md).
+if printf '%s\n' "$kernel_log" | "$SCANNER" "$now" "$boot_id" "$TF" > "$TMP" 2>/dev/null; then
+    # Guard against a truncated write (the root fs sits near-full; ENOSPC
+    # would leave a 0-byte file, which node_exporter reports as a scrape
+    # error and which would blank every series).
+    if [ -s "$TMP" ]; then
+        mv "$TMP" "$TF" || rm -f "$TMP"
+    else
+        rm -f "$TMP"
+    fi
+else
+    rm -f "$TMP"
+fi

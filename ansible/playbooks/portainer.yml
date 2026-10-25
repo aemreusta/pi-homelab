@@ -1,0 +1,6 @@
+---
+- name: Deploy Portainer container management
+  hosts: pi
+  become: true
+  roles:
+    - portainer

@@ -1,0 +1,55 @@
+---
+services:
+  adguard:
+    image: adguard/adguardhome:latest
+    container_name: adguard
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ adguard_mem_limit }}
+    pids_limit: {{ adguard_pids_limit }}
+    read_only: {{ adguard_read_only | lower }}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size={{ adguard_tmpfs_size }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in adguard_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+    cap_add:
+{% for cap in adguard_cap_add %}
+      - {{ cap }}
+{% endfor %}
+    labels:
+{% for k, v in adguard_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - TZ={{ adguard_tz }}
+    ports:
+      - "{{ adguard_host_ip }}:53:53/tcp"
+      - "{{ adguard_host_ip }}:53:53/udp"
+      - "127.0.0.1:53:53/tcp"
+      - "127.0.0.1:53:53/udp"
+      - "3000:3000/tcp"
+      - "8080:80/tcp"
+    volumes:
+      - {{ adguard_data_dir }}/work:/opt/adguardhome/work
+      - {{ adguard_data_dir }}/conf:/opt/adguardhome/conf
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - adguard_net
+
+networks:
+  adguard_net:
+    driver: bridge

@@ -1,0 +1,6 @@
+---
+- name: Deploy Beszel monitoring
+  hosts: pi
+  become: true
+  roles:
+    - beszel

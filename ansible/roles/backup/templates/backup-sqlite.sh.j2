@@ -1,0 +1,89 @@
+#!/bin/bash
+# backup-sqlite.sh — host-side SQLite online .backup against a live
+# container's DB file. Verified live 2026-05-18 on a 976M *arr DB
+# (320854 rows preserved across the backup).
+#
+# Invoked by homelab-backup.sh with: $1=service_name, $2=db_host_path
+#
+# SQLite's online backup API is WAL-safe across processes — the container
+# can keep writing while the host reads. No `docker exec` needed (no
+# container has the sqlite3 binary anyway, verified 2026-05-18).
+set -uo pipefail
+
+BACKUP_ROOT="{{ backup_root }}"
+SERVICE="$1"
+DB_PATH="$2"
+
+DATE="$(date -u +%Y-%m-%d)"
+DEST_DIR="${BACKUP_ROOT}/${SERVICE}/${DATE}"
+# Atomic write pattern: build into .partial, mv to final at the very
+# end. Prevents a same-day re-run (manual POST /backup, ad-hoc trigger)
+# from corrupting the existing snapshot mid-write — the previous final
+# stays intact until the new one fully materializes.
+PARTIAL_UNCOMPRESSED="${DEST_DIR}/${SERVICE}.db.bak.partial.$$"
+PARTIAL_FINAL="${PARTIAL_UNCOMPRESSED}.gz"
+BAK_FINAL="${DEST_DIR}/${SERVICE}.db.bak.gz"
+
+mkdir -p "$DEST_DIR"
+
+cleanup_partial() {
+    rm -f "$PARTIAL_UNCOMPRESSED" "$PARTIAL_FINAL"
+}
+trap cleanup_partial EXIT INT TERM
+
+if [ ! -f "$DB_PATH" ]; then
+    printf '{"service":"%s","method":"sqlite","status":"fail","bytes":0,"duration_ms":0,"error":"db not found at %s"}\n' \
+        "$SERVICE" "$DB_PATH"
+    exit 1
+fi
+
+start_ms=$(date +%s%3N)
+
+sqlite3 "$DB_PATH" ".backup '${PARTIAL_UNCOMPRESSED}'" 2>/tmp/backup-${SERVICE}.err
+rc=$?
+
+if [ "$rc" -ne 0 ]; then
+    err=$(head -c 200 /tmp/backup-${SERVICE}.err 2>/dev/null | tr '\n' ' ')
+    rm -f /tmp/backup-${SERVICE}.err "$PARTIAL_UNCOMPRESSED"
+    duration_ms=$(( $(date +%s%3N) - start_ms ))
+    printf '{"service":"%s","method":"sqlite","status":"fail","bytes":0,"duration_ms":%d,"error":"%s"}\n' \
+        "$SERVICE" "$duration_ms" "$err"
+    exit 1
+fi
+
+# Host-side integrity check on the snapshot BEFORE gzip — catches a
+# half-written backup that succeeded the .backup call but produced an
+# unreadable file. .schema is cheap and exercises the full file.
+if ! sqlite3 "$PARTIAL_UNCOMPRESSED" ".schema" >/dev/null 2>&1; then
+    rm -f "$PARTIAL_UNCOMPRESSED" /tmp/backup-${SERVICE}.err
+    duration_ms=$(( $(date +%s%3N) - start_ms ))
+    printf '{"service":"%s","method":"sqlite","status":"fail","bytes":0,"duration_ms":%d,"error":"integrity check failed (.schema unreadable)"}\n' \
+        "$SERVICE" "$duration_ms"
+    exit 1
+fi
+
+gzip -f "$PARTIAL_UNCOMPRESSED" 2>/tmp/backup-${SERVICE}.err
+rc=$?
+
+if [ "$rc" -ne 0 ]; then
+    err=$(head -c 200 /tmp/backup-${SERVICE}.err 2>/dev/null | tr '\n' ' ')
+    rm -f "$PARTIAL_UNCOMPRESSED" "$PARTIAL_FINAL" /tmp/backup-${SERVICE}.err
+    duration_ms=$(( $(date +%s%3N) - start_ms ))
+    printf '{"service":"%s","method":"sqlite","status":"fail","bytes":0,"duration_ms":%d,"error":"gzip failed: %s"}\n' \
+        "$SERVICE" "$duration_ms" "$err"
+    exit 1
+fi
+
+# Atomic-rename last. mv on the same filesystem is a single rename(2)
+# syscall — the prior snapshot stays intact up to this instant. If the
+# script is killed before this line, the EXIT trap cleans up the
+# partial and the previous BAK_FINAL stays usable.
+mv -f "$PARTIAL_FINAL" "$BAK_FINAL"
+trap - EXIT INT TERM
+
+duration_ms=$(( $(date +%s%3N) - start_ms ))
+bytes=$(stat -c '%s' "$BAK_FINAL")
+rm -f /tmp/backup-${SERVICE}.err
+
+printf '{"service":"%s","method":"sqlite","status":"ok","bytes":%d,"duration_ms":%d}\n' \
+    "$SERVICE" "$bytes" "$duration_ms"

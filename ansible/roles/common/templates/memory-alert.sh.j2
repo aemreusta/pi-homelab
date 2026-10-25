@@ -1,0 +1,142 @@
+#!/bin/bash
+# Memory monitoring — alerts on sustained high swap usage and on OOM kills.
+# Runs hourly via cron.
+#
+# Swap rule uses hysteresis:
+#   - fire when swap_pct ≥ HIGH and (cooldown elapsed OR not already firing)
+#   - silent while still ≥ LOW (no re-fire spam)
+#   - send a cleared event when swap_pct ≤ LOW, then re-arm
+# See docs/design/024-alert-discipline.md for the taxonomy.
+set -uo pipefail
+
+NTFY_URL="{{ ntfy_external_topic_url }}"
+SWAP_HIGH={{ common_swap_alert_high_pct | default(85) }}
+SWAP_LOW={{ common_swap_alert_low_pct | default(70) }}
+COOLDOWN_HOURS={{ common_swap_alert_cooldown_hours | default(24) }}
+STATE_DIR="{{ common_alert_state_dir | default('/var/lib/homelab') }}"
+STATE_FILE="$STATE_DIR/memory-alert.state"
+LOG="/var/log/memory-monitor.log"
+CONTROL_URL="{{ homelab_control_internal_url | default('http://127.0.0.1:' ~ (homelab_control_port | default(9099))) }}"
+# memory-alert's only ntfy action is the internal Restart POST. The Beszel
+# view action below already opens the relevant dashboard. Add
+# CONTROL_EXTERNAL_URL back here when wiring a Storage/Containers view action
+# (see disk-alert.sh.j2 for the pattern).
+BESZEL_URL="http://{{ beszel_hostname }}:{{ beszel_port | default(8090) }}"
+CONTROL_TOKEN="{{ homelab_control_token | default('') }}"
+
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+mkdir -p "$STATE_DIR"
+
+# Witness line: proves the cron fired even if swap stays low.
+alert_event "memory-alert" run ok "swap_high=${SWAP_HIGH}" "swap_low=${SWAP_LOW}"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M') $*" >> "$LOG"
+}
+
+# State file format: single line "<last_fire_ts> <last_pct> <fired_flag>"
+# fired_flag = 1 while we're in the "currently alerting" state, 0 when cleared.
+read_state() {
+    if [ -f "$STATE_FILE" ]; then
+        awk '{print $1, $2, $3}' "$STATE_FILE" 2>/dev/null
+    else
+        echo "0 0 0"
+    fi
+}
+
+write_state() {
+    local ts="$1" pct="$2" fired="$3"
+    echo "$ts $pct $fired" > "$STATE_FILE"
+}
+
+# --- Swap usage alert (with hysteresis) ---
+SWAP_TOTAL=$(free -m | awk '/^Swap:/ {print $2}')
+SWAP_USED=$(free -m | awk '/^Swap:/ {print $3}')
+
+if [ "$SWAP_TOTAL" -gt 0 ]; then
+    SWAP_PCT=$((SWAP_USED * 100 / SWAP_TOTAL))
+    read -r LAST_TS _LAST_PCT FIRED < <(read_state)
+    NOW=$(date +%s)
+    AGE_HOURS=$(( (NOW - LAST_TS) / 3600 ))
+
+    # Fire path: above HIGH, either not yet firing OR cooldown elapsed.
+    if [ "$SWAP_PCT" -ge "$SWAP_HIGH" ] \
+       && { [ "$FIRED" != "1" ] || [ "$AGE_HOURS" -ge "$COOLDOWN_HOURS" ]; }; then
+        MEM_TOTAL=$(free -h | awk '/^Mem:/ {print $2}')
+        MEM_USED=$(free -h | awk '/^Mem:/ {print $3}')
+        MEM_FREE=$(free -h | awk '/^Mem:/ {print $4}')
+
+        PRIORITY="high"
+        TAG="warning"
+        [ "$SWAP_PCT" -ge 90 ] && PRIORITY="urgent" && TAG="rotating_light"
+
+        TOP3=$(docker stats --no-stream --format '{%raw%}{{.Name}}: {{.MemUsage}}{%endraw%}' 2>/dev/null \
+            | sort -t: -k2 -h -r | head -3)
+
+        ntfy_send "memory-alert" \
+            -H "Title: Swap at ${SWAP_PCT}% (${SWAP_USED}M/${SWAP_TOTAL}M)" \
+            -H "Priority: ${PRIORITY}" \
+            -H "Tags: ${TAG},brain" \
+            -H "Markdown: yes" \
+            -H "Actions: view, Open Beszel, ${BESZEL_URL}, clear=true; http, Restart, ${CONTROL_URL}/restart, headers.Authorization=Bearer ${CONTROL_TOKEN}, method=POST, clear=true" \
+            -d "**RAM:** ${MEM_USED} / ${MEM_TOTAL} (${MEM_FREE} free)
+
+**Top containers:**
+${TOP3}" \
+            "$NTFY_URL"
+        write_state "$NOW" "$SWAP_PCT" 1
+        log "[ALERT] Swap at ${SWAP_PCT}% (${SWAP_USED}M/${SWAP_TOTAL}M)"
+    # Clear path: was firing, dropped below LOW → send one cleared event + re-arm.
+    elif [ "$FIRED" = "1" ] && [ "$SWAP_PCT" -le "$SWAP_LOW" ]; then
+        ntfy_send "memory-alert" \
+            -H "Title: Swap recovered (${SWAP_PCT}%)" \
+            -H "Priority: low" \
+            -H "Tags: white_check_mark" \
+            -d "Swap dropped to ${SWAP_PCT}% (was ≥${SWAP_HIGH}%). Alert cleared." \
+            "$NTFY_URL"
+        write_state "$NOW" "$SWAP_PCT" 0
+        log "[CLEARED] Swap recovered to ${SWAP_PCT}%"
+    # Refresh last-seen pct without changing fired-flag (helps debugging the state file).
+    else
+        write_state "$LAST_TS" "$SWAP_PCT" "$FIRED"
+    fi
+fi
+
+# --- OOM kill detection ---
+OOM_LINES=$(journalctl -k --since "1 hour ago" --no-pager -o short-precise 2>/dev/null \
+    | grep -E 'oom-kill|Out of memory.*Killed process' | tail -5)
+if [ -n "$OOM_LINES" ]; then
+    KILLED=$(echo "$OOM_LINES" | grep -oP 'Killed process \d+ \(\K[^)]+' | sort -u | tr '\n' ', ')
+
+    ntfy_send "memory-alert" \
+        -H "Title: OOM Kill Detected" \
+        -H "Priority: urgent" \
+        -H "Tags: rotating_light,skull" \
+        -H "Markdown: yes" \
+        -H "Actions: view, Open Beszel, ${BESZEL_URL}, clear=true" \
+        -d "**Kernel OOM-killer invoked in the last hour.**
+
+Killed: ${KILLED}
+
+\`\`\`
+${OOM_LINES}
+\`\`\`" \
+        "$NTFY_URL"
+    log "[ALERT] OOM kill detected: ${KILLED}"
+fi
+
+# --- Per-container memory log (info only, no alert) ---
+docker stats --no-stream --format "{%raw%}{{.Name}} {{.MemUsage}}{%endraw%}" 2>/dev/null | while read -r name memusage; do
+    current=$(echo "$memusage" | cut -d'/' -f1 | xargs)
+    mb=0
+    if [[ "$current" == *GiB* ]]; then
+        gb=${current//GiB/}
+        mb=$(awk -v g="$gb" 'BEGIN {printf "%.0f", g * 1024}')
+    elif [[ "$current" == *MiB* ]]; then
+        mb=$(awk -v m="${current//MiB/}" 'BEGIN {printf "%.0f", m}')
+    fi
+    if [ "$mb" -gt 1024 ]; then
+        log "[INFO] ${name} using ${current} (${mb}MB)"
+    fi
+done

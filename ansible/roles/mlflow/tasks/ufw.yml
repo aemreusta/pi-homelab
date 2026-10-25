@@ -1,0 +1,11 @@
+---
+# LAN-only access to the MLflow UI/API host port. External/HTTPS access goes
+# through Traefik (mlflow.example), which terminates on the host and needs no
+# extra rule here.
+- name: Allow MLflow UI/API through UFW (LAN only)
+  community.general.ufw:
+    rule: allow
+    port: "{{ mlflow_port }}"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: MLflow tracking server

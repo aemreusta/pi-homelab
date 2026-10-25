@@ -1,0 +1,95 @@
+---
+- name: Create zot compose directory
+  ansible.builtin.file:
+    path: "{{ zot_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create zot config directory
+  ansible.builtin.file:
+    path: "{{ zot_config_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create zot storage directory
+  ansible.builtin.file:
+    path: "{{ zot_data_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+# Hash on the controller (Mac has passlib+bcrypt<4.1, per the portainer precedent);
+# the Pi's system python has no passlib. htpasswd verifies the password against the
+# stored hash, so this stays idempotent across runs (no salt re-churn).
+# check_mode: false is LOAD-BEARING. Under `--check` the htpasswd module makes no
+# change, so the temp file is never written; the next task's `copy: src=` then
+# fails its check-mode diff with "Could not find or access /tmp/.zot_htpasswd_*"
+# (the check-mode-skip class — cf. CLAUDE.md / test_uri_check_mode_safety). It
+# passed on the Mac only because a prior real run left the file in the Mac /tmp;
+# the CD deep-check runs on the Pi's clean /tmp and failed every time (self-
+# sabotaging-rollback, 2026-07-14). Forcing this task to run even in check mode
+# regenerates the (idempotent, salt-stable) temp file so the copy always has a
+# source. Writing a private temp file during a dry-run is harmless.
+- name: Generate zot htpasswd (bcrypt) on the controller
+  community.general.htpasswd:
+    path: "/tmp/.zot_htpasswd_{{ inventory_hostname }}"
+    name: "{{ zot_username }}"
+    password: "{{ zot_password }}"
+    crypt_scheme: bcrypt
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  no_log: true
+
+- name: Install zot htpasswd onto the Pi
+  ansible.builtin.copy:
+    src: "/tmp/.zot_htpasswd_{{ inventory_hostname }}"
+    dest: "{{ zot_config_dir }}/htpasswd"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  no_log: true
+  notify: Restart zot
+
+- name: Template zot config.json
+  ansible.builtin.template:
+    src: config.json.j2
+    dest: "{{ zot_config_dir }}/config.json"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart zot
+
+- name: Copy zot docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ zot_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart zot
+
+- name: Start zot container
+  community.docker.docker_compose_v2:
+    project_src: "{{ zot_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"
+
+- name: Log the Pi docker daemon into the local zot registry
+  # So any role can pull localhost:{{ zot_port }}/*
+  # images. localhost is insecure-registry-exempt, so no daemon.json change is
+  # needed Pi-side. Writes creds to {{ docker_user }}'s ~/.docker/config.json.
+  community.docker.docker_login:
+    registry_url: "localhost:{{ zot_port }}"
+    username: "{{ zot_username }}"
+    password: "{{ zot_password }}"
+  become: true
+  become_user: "{{ docker_user }}"
+  no_log: true

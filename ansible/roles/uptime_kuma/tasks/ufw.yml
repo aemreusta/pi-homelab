@@ -1,0 +1,17 @@
+---
+- name: Allow Uptime Kuma through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ uptime_kuma_port }}"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: Uptime Kuma
+
+# One-time reconciliation of the pre-2026-07-14 Anywhere rule (see media role
+# ufw.yml). Idempotent no-op once removed.
+- name: Remove superseded Anywhere rule (migrated to LAN scope, Phase 0)
+  community.general.ufw:
+    rule: allow
+    port: "{{ uptime_kuma_port }}"
+    proto: tcp
+    delete: true

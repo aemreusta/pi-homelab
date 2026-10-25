@@ -1,0 +1,48 @@
+{% if common_watchdog_engine | default('go') == 'go' %}
+groups:
+  - name: watchdog
+    interval: 60s
+    rules:
+      - alert: WatchdogStale
+        expr: (time() - watchdog_last_run_timestamp_seconds > 900) or absent(watchdog_last_run_timestamp_seconds)
+        for: 10m
+        labels:
+          severity: crit
+          source: vmalert
+          service: docker
+        annotations:
+          summary: 'Container watchdog stopped publishing observations'
+          description: 'The five-minute watchdog is stale or absent. Inspect cron, the lock, installed runtime and state/textfile permissions.'
+      - alert: WatchdogScanFailed
+        expr: watchdog_success == 0 or watchdog_docker_read_success == 0
+        for: 10m
+        labels:
+          severity: crit
+          source: vmalert
+          service: docker
+        annotations:
+          summary: 'Container watchdog cannot complete its scan'
+          description: 'Failed Docker inventories or unreadable state prevent restarts and orphan cleanup. Inspect Docker and the watchdog log; an empty response is not healthy evidence.'
+      - alert: WatchdogRestartFailed
+        expr: watchdog_restart_failed == 1
+        for: 5m
+        labels:
+          severity: crit
+          source: vmalert
+          service: docker
+        annotations:
+          summary: 'Watchdog restart failed or remains unconfirmed'
+          description: 'Container {{ "{{ $labels.container }}" }} remains unhealthy after a failed or interrupted restart. Inspect Docker health logs, network endpoints and mounts.'
+      - alert: WatchdogRestartBudgetExhausted
+        expr: watchdog_budget_exhausted == 1
+        for: 5m
+        labels:
+          severity: crit
+          source: vmalert
+          service: docker
+        annotations:
+          summary: 'Watchdog restart budget exhausted'
+          description: 'Container {{ "{{ $labels.container }}" }} is still unhealthy after its restart budget. A restart cannot reconstruct a missing Docker endpoint. Manual diagnosis is required.'
+{% else %}
+groups: []
+{% endif %}

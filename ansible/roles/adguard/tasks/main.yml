@@ -1,0 +1,20 @@
+---
+- name: Include AdGuard deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [adguard]
+
+# Gated out of check mode: configure.yml drives the live AdGuard REST API. Its
+# `uri` GETs are skipped under `--check`, leaving their registers as bare dicts,
+# so the downstream `adguard_current_rewrites.content | from_json` loop crashes
+# at arg-finalization (the check-mode uri-skip class — design 040). This gate is
+# the canonical fix and is enforced by tests/test_uri_check_mode_safety.py. The
+# CD deep-check (--check --diff) therefore does not preview DNS-rewrite changes;
+# they apply live (a wrong var there fails at apply, not the gate). 2026-07-14.
+- name: Include AdGuard configuration tasks
+  ansible.builtin.include_tasks: configure.yml
+  tags: [adguard, configure]
+  when: not ansible_check_mode
+
+- name: Include AdGuard UFW tasks
+  ansible.builtin.include_tasks: ufw.yml
+  tags: [adguard, firewall]

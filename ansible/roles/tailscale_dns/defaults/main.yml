@@ -1,0 +1,83 @@
+---
+tailscale_dns_compose_dir: /home/{{ docker_user }}/docker/network/tailscale-dns
+tailscale_dns_config_dir: /home/{{ docker_user }}/docker/network/tailscale-dns/config
+tailscale_dns_container_name: tailscale-dns
+tailscale_dns_tz: "{{ timezone }}"
+
+# Pi's Tailscale IP — dnsmasq binds to this address
+tailscale_dns_ip: "{{ tailscale_ip | default('100.64.0.10') }}"
+
+# Domain to resolve via Tailscale IP
+tailscale_dns_local_domain: example
+
+# Upstream DNS servers (for non-homelab queries)
+tailscale_dns_upstream:
+  - "1.1.1.1"
+  - "9.9.9.9"
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+tailscale_dns_mem_limit: 128M
+
+# --- Container security hardening ---
+
+tailscale_dns_pids_limit: 100
+# read_only disabled — 4km3/dnsmasq image writes to /run + /var/lib + other paths
+# during startup. Enumerating all tmpfs mounts proved fragile.
+
+# dnsmasq binds port 53 + drops to "nobody" user after init.
+tailscale_dns_cap_drop:
+  - ALL
+tailscale_dns_cap_add:
+  - NET_BIND_SERVICE
+  - SETUID
+  - SETGID
+  - CHOWN
+  # KILL is what lets the init process do its only job. The compose file sets
+  # `init: true`, so Docker injects tini as PID 1; dnsmasq then drops privileges
+  # to its own user, and tini — root but stripped by `cap_drop: ALL` — needs
+  # CAP_KILL to signal a process it no longer shares a UID with. Without it every
+  # `docker restart` logs
+  #     [FATAL tini (1)] Unexpected error when forwarding signal: 'Operation not permitted'
+  # SIGTERM never reaches dnsmasq, the stop is unclean, and the container can be
+  # left exited(1) with RestartCount=0 — which `restart: unless-stopped` does NOT
+  # recover. That is how this service sat dead for 30 h on 2026-09-07: the
+  # unhealthy-watchdog tried to restart it, logged RESTART FAILED, and later
+  # garbage-collected its own state as "container absent".
+  #
+  # Third instance of the hardening class (2026-06-07: `init: true` vs s6-overlay,
+  # `cap_drop: ALL` vs DAC_OVERRIDE). The rule that keeps earning itself: an init
+  # or supervisor you inject must keep the capabilities its job requires, and the
+  # damage only appears on RESTART, never at first start — so a green deploy
+  # proves nothing about it.
+  - KILL
+  - DAC_OVERRIDE
+
+tailscale_dns_oci_labels:
+  org.opencontainers.image.title: tailscale-dns
+  org.opencontainers.image.description: "dnsmasq — DNS resolver for Tailscale clients (*.example → Tailscale IP)"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/tailscale_dns/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://thekelleys.org.uk/dnsmasq/"
+
+# Resume service — waits for tailscale0 IP after boot, then starts the container
+tailscale_dns_resume_script: /usr/local/bin/tailscale-dns-resume.sh
+
+# ── Split-DNS drift check (design: the one thing Ansible cannot converge) ──
+# Tailscale split-DNS routes are tailnet CONTROL-PLANE state — admin console /
+# `/dns/split-dns` API — so this role can render a perfect dnsmasq while
+# MagicDNS still points at a domain that no longer exists. That is exactly what
+# happened at the 2026-07-15 `.example` -> `.example.internal` cut: the route
+# kept saying `example`, and since `example.internal` is a SIBLING of `example`
+# rather than a child, every internal name went NXDOMAIN for three weeks.
+# Detection only; see files/tailscale_split_dns.py for why it does not
+# self-heal (converging needs a tailnet-wide DNS-write API key).
+tailscale_dns_split_check_enabled: true
+tailscale_dns_split_check_script: /usr/local/bin/tailscale-split-dns-check.sh
+tailscale_dns_split_check_decider: /usr/local/bin/tailscale_split_dns.py
+tailscale_dns_split_check_log: /var/log/tailscale-split-dns-check.log
+# Hourly. The route only changes when a human edits the console, but the cost
+# of a miss is total internal-DNS failure for every container, and the check is
+# one local CLI call — there is no reason to find out a day late.
+tailscale_dns_split_check_cron_minute: "17"
+tailscale_dns_split_check_cron_hour: "*"

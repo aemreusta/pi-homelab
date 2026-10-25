@@ -1,0 +1,11 @@
+---
+- name: Restart docker
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+    daemon_reload: true
+
+- name: Reload docker user iptables
+  ansible.builtin.shell:
+    cmd: /sbin/iptables-restore -n < /etc/iptables/docker-user-rules.v4
+  changed_when: true

@@ -1,0 +1,7 @@
+---
+- name: Restart filebrowser
+  community.docker.docker_compose_v2:
+    project_src: "{{ filebrowser_compose_dir }}"
+    state: restarted
+  become: true
+  become_user: "{{ docker_user }}"

@@ -1,0 +1,56 @@
+groups:
+  - name: tailscale-split-dns
+    # Emitted by /usr/local/bin/tailscale-split-dns-check.sh (tailscale_dns role,
+    # hourly). Watches the one piece of internal-DNS config no Ansible run can
+    # converge: the tailnet's split-DNS routes, which live in the Tailscale
+    # control plane.
+    #
+    # Why this group exists (2026-08-05). The 2026-07-15 `.example` ->
+    # `.example.internal` cut updated AdGuard, dnsmasq, Traefik, Authelia and
+    # every var in the repo, but the split-DNS route still said `example`.
+    # `example.internal` is a SIBLING of `example`, not a child, so MagicDNS
+    # matched nothing and answered NXDOMAIN for every internal name — for three
+    # weeks, with no alert. Every container resolves through
+    # 127.0.0.11 -> 100.100.100.100 (tailscaled), so the blast radius was every
+    # container that uses an internal hostname.
+    rules:
+      - alert: TailscaleSplitDnsDrift
+        # Per-domain rather than on the aggregate `_ok` gauge so the alert can
+        # name the domain that is broken. Someone reading this at 3am should not
+        # have to go query a second metric to learn WHICH name stopped resolving.
+        expr: tailscale_split_dns_domain_ok == 0
+        # 15m, not 5m: a console edit propagates through the coordination server
+        # and tailscaled's poll, so a brief mismatch right after a legitimate
+        # change is expected and must not page.
+        for: 15m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Tailscale split-DNS does not route {{ '{{ $labels.domain }}' }} to the Pi'
+          description: 'MagicDNS has no split-DNS route sending {{ '{{ $labels.domain }}' }} to the tailnet resolver, so every client that resolves through tailscaled — which is EVERY Docker container, via 127.0.0.11 -> 100.100.100.100 — gets NXDOMAIN for names under it. Looks intermittent because Docker caches hits. This is control-plane state Ansible cannot fix; `/usr/local/bin/tailscale-split-dns-check.sh -v` prints the exact PATCH body, and the log line is in {{ tailscale_dns_split_check_log | default('/var/log/tailscale-split-dns-check.log') }}.'
+
+      - alert: TailscaleSplitDnsCheckStale
+        # Silent-cron rule: the check itself must be watched, or "no drift" and
+        # "the checker died" look identical on the dashboard.
+        expr: time() - max(tailscale_split_dns_last_run_unix_seconds) > 10800
+        for: 30m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Tailscale split-DNS drift check has not run in 3h+'
+          description: 'The hourly split-DNS drift check has stopped emitting. Internal-domain routing is now unwatched — the failure it guards against (a stale route silently NXDOMAINing every internal name) would go unnoticed again. Check the cron and {{ tailscale_dns_split_check_log | default('/var/log/tailscale-split-dns-check.log') }}.'
+
+      - alert: TailscaleSplitDnsScrapeFailed
+        # Distinguishes "looked and found nothing" from "could not look".
+        # Without this, a dead tailscaled reads as zero routes and would fire
+        # TailscaleSplitDnsDrift, pointing the operator at the wrong problem.
+        expr: tailscale_split_dns_scrape_ok == 0
+        for: 30m
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'Cannot read Tailscale DNS status — split-DNS drift is unverifiable'
+          description: '`tailscale dns status --json` returned nothing or unparseable output, so the drift check could not form a verdict. Usually tailscaled down or logged out; that is itself worth knowing, since the tailnet resolver is in the DNS path for every container.'

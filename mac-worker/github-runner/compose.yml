@@ -1,0 +1,50 @@
+### mac-worker/github-runner — ephemeral GitHub Actions runner supervisor.
+###
+### One long-running supervisor container. It mints JIT configs (via the PAT in
+### .env) and `docker run`s short-lived ephemeral runner containers — one job
+### each — against the Mac's Docker daemon (socket mounted below). It does NOT
+### run jobs itself. See docs/design/039-mac-ci-runner.md.
+
+name: homelab-github-runner
+
+services:
+  supervisor:
+    build:
+      context: ./supervisor
+      dockerfile: Dockerfile
+    # Built once and pushed to Zot (039 Setup); pulled thereafter. The build:
+    # block lets `docker compose build` rebuild it locally on the Mac.
+    image: raspberrypi.local:5050/homelab/github-runner-supervisor:latest
+    container_name: homelab-github-runner-supervisor
+    restart: unless-stopped
+    env_file:
+      - .env
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256M
+    volumes:
+      # The supervisor needs the daemon to spawn/reap ephemeral runner
+      # containers. This is the privilege grant documented in 039 — acceptable
+      # because the Mac is the dedicated, secret-free CI box.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Heartbeat + status JSON land here; the Pi reads them over NFS. Uses
+      # the shared Mac-worker export (gh-runner/ subdir). See 039.
+      - nfs-generated:/generated:rw
+      - ./logs:/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+# Direct NFS-from-the-VM volume (not a host bind of /Volumes/...) avoids the
+# VirtioFS↔NFS flicker — see ../README.md "NFS volumes". LAN IP via OrbStack NAT.
+volumes:
+  nfs-generated:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=192.0.2.100,rw,nfsvers=3,nolock,soft,timeo=50,retrans=3"
+      device: ":/home/pi/docker/mac-worker/shared"

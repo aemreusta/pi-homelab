@@ -1,0 +1,137 @@
+---
+# vmagent — VictoriaMetrics' lightweight scraper + remote_write forwarder
+# https://docs.victoriametrics.com/vmagent.html
+
+vmagent_compose_dir: /home/{{ docker_user }}/docker/observability/vmagent
+vmagent_data_dir: /home/{{ docker_user }}/docker/observability/vmagent/data
+vmagent_config_dir: /home/{{ docker_user }}/docker/observability/vmagent/config
+vmagent_tz: "{{ timezone }}"
+
+vmagent_image: victoriametrics/vmagent:latest
+vmagent_port: 8429
+
+vmagent_mem_limit: 256M
+
+# --- Container security hardening ---
+
+vmagent_pids_limit: 200
+vmagent_read_only: true
+vmagent_tmpfs_size: 64m
+
+# Drop all caps. vmagent runs network_mode: host but listens on 8429 (>1024).
+vmagent_cap_drop:
+  - ALL
+vmagent_cap_add: []
+
+vmagent_oci_labels:
+  org.opencontainers.image.title: vmagent
+  org.opencontainers.image.description: "vmagent — Prometheus scraper + remote_write forwarder"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/vmagent/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://docs.victoriametrics.com/vmagent.html"
+
+# Where vmagent forwards metrics to. vmagent runs on host network mode
+# (the DOCKER-USER iptables chain blocks bridge→host traffic, so the
+# observability-bridge route to VL/VM/host-services is dead). Host network
+# means everything is reachable on 127.0.0.1.
+vmagent_remote_write_url: http://127.0.0.1:8428/api/v1/write
+
+# Scrape config — every entry becomes a Prometheus job.
+# All targets are addressed on localhost since vmagent shares the host net.
+
+# Speedtest Tracker Prometheus integration is enabled (2026-05-30) → scrape it.
+# Path /prometheus + prefix speedtest_tracker_* verified live. Flip back to
+# false if the integration is ever disabled in the speedtest UI.
+vmagent_speedtest_metrics_enabled: true
+
+vmagent_scrape_interval: 30s
+# Default scrape_timeout in Prometheus is 10s. This was bumped 10s → 20s →
+# 30s chasing "broken pipe" errors in node-exporter's log — that diagnosis
+# was WRONG and the bumps fixed nothing (the count kept climbing, ~76k/day
+# then ~100k/day). Root cause found 2026-07-31: node-exporter's own Docker
+# healthcheck ran `wget --spider /metrics` every 30s and hung up mid-body,
+# so the errors were the healthcheck, never vmagent. Actual vmagent scrape
+# takes ~0.157s (scrape_duration_seconds) against a 30s budget. Fixed in
+# roles/node_exporter/templates/docker-compose.yml.j2.
+# Left at 30s: harmless headroom, and reverting is churn with no upside.
+# Never raise above the scrape interval (timeout >= interval queues scrapes);
+# if a target genuinely gets slow, drop collectors via --no-collector.X.
+vmagent_scrape_timeout: 30s
+vmagent_scrape_jobs:
+  # Authelia SSO — loopback metrics endpoint. Load-bearing: if it dies, every
+  # forward-auth'd service fails at the gate. Feeds AutheliaDown.
+  - name: authelia
+    target: 127.0.0.1:9959
+  - name: node-exporter
+    target: 127.0.0.1:9100
+  - name: cadvisor
+    target: 127.0.0.1:8081
+  - name: victorialogs
+    target: 127.0.0.1:9428
+  - name: victoriametrics
+    target: 127.0.0.1:8428
+  - name: vmagent-self
+    target: 127.0.0.1:8429
+  - name: traefik
+    target: 127.0.0.1:8180
+    metrics_path: /metrics
+  - name: ntfy
+    target: 127.0.0.1:2586
+    metrics_path: /metrics
+  # ntfy-bridge (Alertmanager → ntfy webhook receiver). Added 2026-08-02
+  # after 10 alerts were lost in 24h to a post-boot DNS race and the ONLY
+  # trace was a line on container stderr, which nothing scrapes. The bridge
+  # is the last hop of every vmalert-routed notification, so its delivery
+  # health is exactly the thing that must not be log-only.
+  # Feeds NtfyBridgeSendFailures / NtfyBridgeDown.
+  - name: ntfy-bridge
+    target: 127.0.0.1:{{ alertmanager_bridge_port | default(9097) }}
+    metrics_path: /metrics
+  # MinIO S3 object storage (design 034). Cluster-scoped metrics; needs
+  # MINIO_PROMETHEUS_AUTH_TYPE=public (set in the minio compose) so no bearer
+  # token is required. v2 cluster endpoint is the stable single-node path.
+  - name: minio
+    target: 127.0.0.1:9010
+    metrics_path: /minio/v2/metrics/cluster
+  # MLflow tracking server (PRD-004, Faz-2). MLflow exposes /metrics via its
+  # --expose-prometheus flag (prometheus-flask-exporter). This drives the
+  # MlflowDown vmalert rule (up{job="mlflow"}==0). NOTE: scrape /metrics, NOT
+  # /health — /health returns plain "OK" which fails Prometheus parsing → up=0.
+  - name: mlflow
+    target: 127.0.0.1:5000
+    metrics_path: /metrics
+  # Speedtest Tracker (Sprint 020). ENABLED 2026-05-30: the Prometheus
+  # integration was turned on (settings: dataintegration.prometheus_enabled=true,
+  # persisted in the speedtest /config DB volume). VERIFIED live: path is
+  # /prometheus (NOT the PRD's /api/v1/metrics/prometheus, which 404s), metric
+  # prefix is speedtest_tracker_*, empty allowed-IPs list = allow-all (no 403).
+  # The exporter reads the latest result from a cache key the data-integration
+  # listener sets on each new result now that the integration is on.
+  - name: speedtest
+    target: 127.0.0.1:8765
+    enabled: "{{ vmagent_speedtest_metrics_enabled | default(false) }}"
+    metrics_path: "{{ vmagent_speedtest_metrics_path | default('/prometheus') }}"
+    drop_labels:
+      - healthy
+  # Uptime Kuma (Sprint 020) — meta-monitor so VictoriaMetrics screams if
+  # the monitor itself dies. UK's /metrics needs basic-auth (any username,
+  # API-key-as-password). The key is created in the UK UI after first-run,
+  # so this job stays inert (enabled=false) until vault_uptime_kuma_metrics_key
+  # is set — otherwise it would 401 → up=0 → a false "UK down" alert.
+  # `enabled` is gated in scrape.yml.j2 (this is a plain data file — only {{ }}
+  # interpolation works here, not {% %} control flow, so the job is listed
+  # unconditionally and the template skips it when enabled is false).
+  - name: uptime-kuma
+    target: 127.0.0.1:3011
+    metrics_path: /metrics
+    enabled: "{{ ((vault_uptime_kuma_metrics_key | default('')) | length) > 0 }}"
+    basic_auth_username: "{{ uptime_kuma_username | default('admin') }}"
+    basic_auth_password: "{{ vault_uptime_kuma_metrics_key | default('') }}"
+  # Zot OCI registry (local image host). /metrics is gated behind
+  # accessControl.metrics.users, so it needs the registry's basic-auth creds.
+  - name: zot
+    target: "127.0.0.1:{{ zot_port | default(5050) }}"
+    metrics_path: /metrics
+    basic_auth_username: "{{ zot_username | default('homelab') }}"
+    basic_auth_password: "{{ vault_zot_password | default('') }}"

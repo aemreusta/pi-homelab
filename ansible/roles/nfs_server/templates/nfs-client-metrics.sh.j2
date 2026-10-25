@@ -1,0 +1,15 @@
+#!/bin/bash
+# {{ ansible_managed }}
+set -euo pipefail
+exec 9>/run/lock/nfs-client-metrics.lock
+flock -n 9 || exit 0
+directory=/var/lib/node_exporter/textfile
+mkdir -p "$directory"
+temporary=$(mktemp "$directory/.mac_nfs.XXXXXX")
+trap 'rm -f "$temporary"' EXIT
+# The input is local on the Pi. Still bound I/O so a broken backing filesystem
+# results in the collector-stale alert rather than accumulating cron processes.
+timeout 10s /usr/bin/python3 /usr/local/bin/nfs_client_metrics.py \
+    /home/{{ ansible_user }}/docker/mac-worker/shared/mac-nfs-status.json > "$temporary"
+chmod 0644 "$temporary"
+mv -f "$temporary" "$directory/mac_nfs.prom"

@@ -1,0 +1,7 @@
+---
+collections:
+  - name: community.general
+  - name: community.docker
+  - name: ansible.posix
+  # Internal CA + *.example wildcard cert generation (traefik role internal-ca.yml).
+  - name: community.crypto

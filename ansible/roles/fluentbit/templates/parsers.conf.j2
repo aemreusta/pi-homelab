@@ -1,0 +1,21 @@
+# Fluent Bit parsers — managed by Ansible.
+# Overrides the image-bundled /fluent-bit/etc/parsers.conf because we add
+# the pipeline_event parser used by [INPUT] tail of {{ fluentbit_pipeline_log_path }}.
+
+# Docker JSON file driver — required by the docker.* tail input.
+[PARSER]
+    Name        docker
+    Format      json
+    Time_Key    time
+    Time_Format %Y-%m-%dT%H:%M:%S.%L
+    Time_Keep   On
+
+# Media pipeline structured events.
+# Each line is a JSON object with at least {ts, pipeline, step, status}
+# (written by the pipeline scripts' pl_event helper).
+[PARSER]
+    Name        pipeline_event
+    Format      json
+    Time_Key    ts
+    Time_Format %Y-%m-%dT%H:%M:%SZ
+    Time_Keep   On

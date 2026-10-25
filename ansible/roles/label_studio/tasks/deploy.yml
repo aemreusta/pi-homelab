@@ -1,0 +1,62 @@
+---
+# Fail loudly rather than booting Label Studio with no admin (which would open
+# an unauthenticated first-run signup on the LAN).
+- name: Assert Label Studio admin credentials are set in vault
+  ansible.builtin.assert:
+    that:
+      - label_studio_username | length > 0
+      - label_studio_password | length >= 8
+      # Asserted now (not deferred): a missing token boots fine but silently
+      # 401s the Faz-2 STT prediction-import script — fail loud here instead.
+      - label_studio_user_token | length > 0
+    fail_msg: >-
+      vault_label_studio_username / vault_label_studio_password /
+      vault_label_studio_user_token are unset or too short. Add them to
+      ansible/inventory/group_vars/all/vault.yml (username = an email, password
+      >= 8 chars, token non-empty) before deploying. See vault.yml.example.
+    quiet: true
+
+- name: Create Label Studio compose directory
+  ansible.builtin.file:
+    path: "{{ label_studio_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+# Owned by the image's runtime UID (1001), not docker_user (1000): the container
+# runs as 1001 and must write the SQLite DB / config here.
+- name: Create Label Studio data directory
+  ansible.builtin.file:
+    path: "{{ label_studio_data_dir }}"
+    state: directory
+    owner: "{{ label_studio_puid }}"
+    group: "{{ label_studio_pgid }}"
+    mode: "0755"
+
+- name: Copy Label Studio docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ label_studio_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart label-studio
+
+- name: Start Label Studio container
+  community.docker.docker_compose_v2:
+    project_src: "{{ label_studio_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"
+
+# First boot runs DB migrations + builds the admin user, so allow generous
+# retries (cold SQLite migrate on a Pi is slow).
+- name: Wait for Label Studio health endpoint to be live
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ label_studio_port }}/health"
+    status_code: 200
+  register: label_studio_health
+  until: label_studio_health.status == 200
+  retries: 30
+  delay: 10

@@ -1,0 +1,25 @@
+---
+- name: Verify
+  hosts: localhost
+  gather_facts: false
+  vars:
+    sandbox: /tmp/molecule-tailscale-dns
+  tasks:
+    - name: Slurp
+      ansible.builtin.slurp:
+        src: "{{ sandbox }}/docker-compose.yml"
+      register: dc
+    - name: Decode
+      ansible.builtin.set_fact:
+        compose_yaml: "{{ (dc.content | b64decode) | from_yaml }}"
+    - name: Assert hardening + caps required for dnsmasq
+      ansible.builtin.assert:
+        that:
+          - "'no-new-privileges:true' in compose_yaml.services.dnsmasq.security_opt"
+          - "'ALL' in compose_yaml.services.dnsmasq.cap_drop"
+          - "'NET_BIND_SERVICE' in compose_yaml.services.dnsmasq.cap_add"
+          - "'SETUID' in compose_yaml.services.dnsmasq.cap_add"
+          - "'SETGID' in compose_yaml.services.dnsmasq.cap_add"
+          - compose_yaml.services.dnsmasq.pids_limit | int > 0
+          - compose_yaml.services.dnsmasq.labels['org.opencontainers.image.title'] is defined
+        fail_msg: "tailscale-dns hardening incomplete"

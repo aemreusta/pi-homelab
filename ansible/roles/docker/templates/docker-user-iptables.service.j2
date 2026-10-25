@@ -1,0 +1,17 @@
+# Managed by Ansible - do not edit manually
+#
+# Applies DOCKER-USER iptables rules after Docker creates its chains.
+# Docker recreates chains on restart, so these must be re-applied.
+
+[Unit]
+Description=Apply DOCKER-USER iptables rules
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '/sbin/iptables-restore -n < /etc/iptables/docker-user-rules.v4'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

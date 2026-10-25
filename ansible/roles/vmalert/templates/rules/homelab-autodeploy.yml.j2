@@ -1,0 +1,108 @@
+# Homelab GitOps CD controller alerts — design 039.
+#
+# Source metrics: homelab_autodeploy.prom, emitted by homelab-autodeploy.sh
+# (role homelab_autodeploy, cron */5, root) into the node_exporter textfile dir.
+# The controller auto-deploys changed roles on a new green master commit and
+# rolls the checkout back on failure.
+#
+# Quoting: single-outer / escaped-inner per docs/conventions/vmalert-rule-quoting.md.
+
+groups:
+  - name: homelab-autodeploy
+    interval: 5m
+    rules:
+
+      # Controller stopped running. NB: only fires if the controller has EVER
+      # emitted (the series exists) — it's disabled by default, so absent series
+      # ≠ alert. Once enabled, a stale last-run means CD is silently off.
+      - alert: HomelabAutodeployStale
+        expr: time() - homelab_autodeploy_last_run_unix_seconds > {{ vmalert_homelab_autodeploy_stale_seconds | default(1800) }}
+        for: {{ vmalert_homelab_autodeploy_stale_for | default('30m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "homelab-autodeploy controller hasn't run in 30m+"
+          description: "homelab_autodeploy.prom last-run is stale — the GitOps CD controller (root cron */5) isn't running, so master pushes won't auto-deploy. Check `sudo tail /var/log/homelab-autodeploy.log`, `sudo crontab -l`."
+
+      # The most recent deploy failed and the checkout was rolled back to the
+      # last-good commit. The pushed commit broke a deploy.
+      - alert: HomelabAutodeployRolledBack
+        expr: homelab_autodeploy_last_result_rolled_back == 1
+        for: {{ vmalert_homelab_autodeploy_rolledback_for | default('5m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "Homelab CD rolled back — last master push failed to deploy"
+          description: "A new master commit was deployed, a role deploy failed, and the checkout was reset to the last-good commit (and re-deployed). The pushed commit is held (not retried) until you fix + re-push. See /var/log/homelab-autodeploy.log."
+
+      # A commit stuck HELD — rolled back and never superseded by a green
+      # deploy. RolledBack (warn, 5m) catches the rollback event; this catches
+      # the *sustained* stuck state, the silent-failure mode where the loop
+      # quietly stops shipping and last_good never advances (nobody notices
+      # until they wonder why a push didn't land). Escalates to crit.
+      - alert: HomelabAutodeployHeld
+        expr: homelab_autodeploy_held == 1
+        for: {{ vmalert_homelab_autodeploy_held_for | default('4h') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: "Homelab CD held 4h+ — a failed commit is blocking auto-deploy"
+          description: "A pushed commit failed to deploy, rolled back, and has stayed held for 4h+ without a green deploy superseding it — the GitOps CD is silently not shipping. Either fix + re-push the held commit, or (if intentional) expect this until you do. See /var/log/homelab-autodeploy.log and `.homelab-autodeploy-state.json` (failed_sha)."
+
+      # Run self-reported a failure (fetch failed, rollback incomplete, etc.).
+      - alert: HomelabAutodeployRunFailing
+        expr: homelab_autodeploy_last_run_success == 0
+        for: {{ vmalert_homelab_autodeploy_run_fail_for | default('20m') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: "homelab-autodeploy run reported a failure"
+          description: "The controller's last run flagged an error (git fetch failed, or a rollback didn't fully restore). Sustained → CD degraded, and a rollback may be incomplete. Check /var/log/homelab-autodeploy.log immediately."
+
+      # Repeated failed deploys — a flapping change being re-pushed, or the
+      # rollback path itself is struggling.
+      #
+      # fail_total is a CUMULATIVE gauge read from state (fail_count), emitted via
+      # the node_exporter textfile collector. delta() over it is fragile: if the
+      # .prom series GAPS and reappears (node_exporter blip, an atomic-write hiccup
+      # under disk pressure, an OOM restart storm), delta() reads the reappearance
+      # as a phantom 0→N rise and pages even though no deploy ran. This false-fired
+      # on 2026-07-04 (delta=7 while last_deploy_result=ok, held=0, last_good=HEAD).
+      # Guard: only alert when the CD is ACTUALLY in a bad state right now — the
+      # most recent deploy rolled back, or a commit is held. A real flapping burst
+      # is always in one of those states; a textfile gap is in neither, so the
+      # phantom edge is suppressed. See docs/incidents + the silent-cron rule.
+      - alert: HomelabAutodeployFailBurst
+        expr: >-
+          delta(homelab_autodeploy_fail_total[6h]) >= {{ vmalert_homelab_autodeploy_fail_burst | default(3) }}
+          and on()
+          (homelab_autodeploy_last_result_rolled_back == 1 or homelab_autodeploy_held == 1)
+        for: {{ vmalert_homelab_autodeploy_fail_burst_for | default('10m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'Homelab CD failed + rolled back {{ "{{ $value | printf \"%.0f\" }}" }} times in 6h'
+          description: "Repeated failed deploys — stop pushing and investigate. Either a change keeps breaking a deploy or the rollback path is failing. /var/log/homelab-autodeploy.log."
+
+      # A deny-listed target (base, homelab-autodeploy) has repo changes since
+      # its last MANUAL `make <target>` — those never auto-deploy (self-sabotage
+      # / host-brick protection), so a change there needs a deliberate operator
+      # action. The per-cycle ntfy at plan time is one-shot and easy to miss;
+      # this gauge stays lit until the make target actually runs. Source:
+      # homelab_autodeploy_denylist.prom, homelab-autodeploy.sh every cron cycle.
+      # Observed gap 2026-08-03: a fix to this controller itself sat undeployed
+      # for a day with no persistent signal — see defaults/main.yml.
+      - alert: HomelabAutodeployDenylistDrift
+        expr: homelab_autodeploy_denylist_drift == 1
+        for: {{ vmalert_homelab_autodeploy_denylist_drift_for | default('2h') }}
+        labels:
+          severity: warn
+          source: vmalert
+        annotations:
+          summary: 'deny-listed CD target {{ '{{ $labels.target }}' }} has undeployed repo changes'
+          description: 'Target {{ '{{ $labels.target }}' }} is on the CD deny-list (never auto-deploys) and its repo files changed since it was last manually applied. Run the matching make target by hand (e.g. `make homelab-autodeploy`, `make base`). /var/log/homelab-autodeploy.log.'

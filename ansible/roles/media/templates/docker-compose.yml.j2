@@ -1,0 +1,277 @@
+---
+# Media stack - all services share /srv as a single mount point
+# so hardlinks work between /downloads and /media (same filesystem + mount).
+#
+# Workflow:
+#   1. Prowlarr provides indexers to Sonarr/Radarr
+#   2. Sonarr/Radarr search via Prowlarr, send to qBittorrent
+#   3. qBittorrent downloads to /data/downloads/incomplete
+#   4. qBittorrent moves completed to /data/downloads/complete
+#   5. Sonarr/Radarr imports with hardlinks to /data/media/{movies,series}
+#   6. Jellyfin scans /data/media library
+#
+# CRITICAL: /srv is mounted as /data in all containers.
+# This ensures hardlinks work because source and target are on the
+# same mount point from the container's perspective.
+#
+# Hardening: every service has cap_drop: [ALL] + minimal cap_add.
+# linuxserver.io images need 6 caps for s6-overlay init (see defaults).
+# read_only is intentionally NOT applied — s6 writes to /run, /var/log/s6 etc.
+
+services:
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    restart: unless-stopped
+    mem_limit: {{ media_mem_qbittorrent }}
+    pids_limit: {{ media_pids_qbittorrent }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in media_lscr_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+    cap_add:
+{% for cap in media_lscr_cap_add %}
+      - {{ cap }}
+{% endfor %}
+    labels:
+      org.opencontainers.image.title: "qbittorrent"
+      org.opencontainers.image.description: "qBittorrent — BitTorrent client (linuxserver.io image)"
+{% for k, v in media_oci_base.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - PUID={{ media_puid }}
+      - PGID={{ media_pgid }}
+      - TZ={{ media_tz }}
+      - WEBUI_PORT=8181
+    ports:
+      - "8181:8181"
+      - "6881:6881"
+      - "6881:6881/udp"
+    volumes:
+      - {{ media_config_dir }}/qbittorrent:/config
+      # custom-cont-init.d patches the s6 svc-qbittorrent run script to
+      # pass --profile=/config (works around qBit 5.2.0 silent-exit bug)
+      - {{ media_config_dir }}/qbittorrent-init.d/01-profile-fix.sh:/custom-cont-init.d/01-profile-fix.sh:ro
+      # clears a stale QLockFile left by container recreate / SIGKILL'd nox,
+      # which otherwise traps qBit in a silent-exit respawn loop (2026-05-29)
+      - {{ media_config_dir }}/qbittorrent-init.d/02-clear-stale-lock.sh:/custom-cont-init.d/02-clear-stale-lock.sh:ro
+      - /srv:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # qBit v5 returns 403 on /api/v2/app/* without auth even when
+    # WebUI\AuthSubnetWhitelistEnabled=true + WebUI\AuthSubnetWhitelist=127.0.0.0/8
+    # are set in qBittorrent.conf (the whitelist bypass appears broken in 5.2.0).
+    # Use the WebUI root which is always public and returns HTTP 200.
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8181/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - media_net
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    restart: unless-stopped
+    mem_limit: {{ media_mem_sonarr }}
+    pids_limit: {{ media_pids_sonarr }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in media_lscr_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+    cap_add:
+{% for cap in media_lscr_cap_add %}
+      - {{ cap }}
+{% endfor %}
+    labels:
+      org.opencontainers.image.title: "sonarr"
+      org.opencontainers.image.description: "Sonarr — TV show manager (linuxserver.io image)"
+{% for k, v in media_oci_base.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - PUID={{ media_puid }}
+      - PGID={{ media_pgid }}
+      - TZ={{ media_tz }}
+    ports:
+      - "8989:8989"
+    volumes:
+      - {{ media_config_dir }}/sonarr:/config
+      - /srv:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8989/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - media_net
+    depends_on:
+      - qbittorrent
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    restart: unless-stopped
+    mem_limit: {{ media_mem_radarr }}
+    pids_limit: {{ media_pids_radarr }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in media_lscr_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+    cap_add:
+{% for cap in media_lscr_cap_add %}
+      - {{ cap }}
+{% endfor %}
+    labels:
+      org.opencontainers.image.title: "radarr"
+      org.opencontainers.image.description: "Radarr — movie manager (linuxserver.io image)"
+{% for k, v in media_oci_base.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - PUID={{ media_puid }}
+      - PGID={{ media_pgid }}
+      - TZ={{ media_tz }}
+    ports:
+      - "7878:7878"
+    volumes:
+      - {{ media_config_dir }}/radarr:/config
+      - /srv:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:7878/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - media_net
+    depends_on:
+      - qbittorrent
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    restart: unless-stopped
+    mem_limit: {{ media_mem_prowlarr }}
+    pids_limit: {{ media_pids_prowlarr }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in media_lscr_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+    cap_add:
+{% for cap in media_lscr_cap_add %}
+      - {{ cap }}
+{% endfor %}
+    labels:
+      org.opencontainers.image.title: "prowlarr"
+      org.opencontainers.image.description: "Prowlarr — indexer manager (linuxserver.io image)"
+{% for k, v in media_oci_base.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - PUID={{ media_puid }}
+      - PGID={{ media_pgid }}
+      - TZ={{ media_tz }}
+    ports:
+      - "9696:9696"
+    volumes:
+      - {{ media_config_dir }}/prowlarr:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9696/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - media_net
+
+  # NOTE: byparr (Cloudflare-bypass proxy) was moved OFF the Pi to the Mac
+  # worker on 2026-07-13. On the Pi 4B, Camoufox/Playwright leaked ~130 PIDs
+  # per /v1 request and could not solve a CF challenge inside Prowlarr's proxy
+  # timeout (a 200s direct solve of a protected site still returned nothing) while
+  # the /docs healthcheck falsely reported "healthy". The identical solve
+  # completes in ~3s on the Apple-Silicon Mac. It now runs as `homelab-byparr`
+  # in mac-worker/docker-compose.yml; Prowlarr's FlareSolverr indexer-proxy
+  # points at http://192.0.2.102:8191. See the mac-worker README "byparr".
+  # Do NOT re-add a Pi byparr — it cannot do the job here.
+
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    mem_limit: {{ media_mem_jellyfin }}
+    pids_limit: {{ media_pids_jellyfin }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in media_lscr_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+    cap_add:
+{% for cap in media_lscr_cap_add %}
+      - {{ cap }}
+{% endfor %}
+    labels:
+      org.opencontainers.image.title: "jellyfin"
+      org.opencontainers.image.description: "Jellyfin — open-source media server (linuxserver.io image, direct play only)"
+{% for k, v in media_oci_base.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - PUID={{ media_puid }}
+      - PGID={{ media_pgid }}
+      - TZ={{ media_tz }}
+      - JELLYFIN_PublishedServerUrl=jellyfin.{{ homelab_internal_domains[0] }}
+    ports:
+      - "8096:8096"
+    volumes:
+      - {{ media_config_dir }}/jellyfin:/config
+      - /srv/media:/data/media:ro
+    # No hardware transcoding — Pi 4B direct play only (HEVC/x265)
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8096/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - media_net
+
+networks:
+  media_net:
+    driver: bridge

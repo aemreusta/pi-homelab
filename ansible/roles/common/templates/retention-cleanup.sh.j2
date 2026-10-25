@@ -1,0 +1,158 @@
+#!/bin/bash
+# Retention cleanup — reclaim DISPOSABLE artifacts older than the retention
+# window. Supersedes the old unbounded `docker system prune -af --volumes`
+# weekly job (which removed ALL unused images immediately and could drop named
+# volumes holding data). This one is time-bounded and volume-safe.
+#
+# ┌─ WHAT THIS TOUCHES (all disposable, all age-gated to {{ common_retention_days | default(30) }} days) ─┐
+# │  • Docker images unused for > window          (docker image prune -a --filter until)        │
+# │  • Docker build cache  > window               (docker builder prune --filter until)         │
+# │  • Stopped containers  > window               (docker container prune --filter until)        │
+# │  • Unused networks     > window               (docker network prune --filter until)          │
+# │  • Tdarr transcode-cache scratch > window      (find -mtime +N -delete on {{ common_retention_transcode_cache_dir | default('/srv/transcode-cache') }}) │
+# └────────────────────────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─ WHAT THIS NEVER TOUCHES (personal / useful data — no-data-removal hard rule) ──────────────┐
+# │  • /srv/media and every other library tree                      (library content)            │
+# │  • /srv/downloads/**                                            (operator-reviewed only — O4) │
+# │  • Named Docker volumes  → `--volumes` is OFF by default ({{ common_retention_docker_prune_volumes | default(false) }})  │
+# │  • /srv/backups          (own 28-day retention in the backup role)                           │
+# │  • journald logs         (retained via MaxRetentionSec in the journald drop-in, not here)    │
+# └────────────────────────────────────────────────────────────────────────────────────────────┘
+#
+# Set common_retention_dry_run=true to log intended actions without executing.
+# Emits a node_exporter textfile metric so a silent / silent-zero run is
+# observable (CLAUDE.md silent-cron hard rule). See docs/runbooks/038-2026-05-29-retention-cleanup.md.
+set -uo pipefail
+
+NTFY_URL="{{ ntfy_external_topic_url }}"
+LOG="{{ common_retention_log | default('/var/log/retention-cleanup.log') }}"
+RETENTION_DAYS="{{ common_retention_days | default(30) }}"
+RETENTION_HOURS=$(( RETENTION_DAYS * 24 ))
+CACHE_DIR="{{ common_retention_transcode_cache_dir | default('/srv/transcode-cache') }}"
+PRUNE_VOLUMES="{{ 'true' if common_retention_docker_prune_volumes | default(false) else 'false' }}"
+DRY_RUN="{{ 'true' if common_retention_dry_run | default(false) else 'false' }}"
+TEXTFILE_DIR="{{ common_node_exporter_textfile_dir | default('/var/lib/node_exporter/textfile') }}"
+TEXTFILE="${TEXTFILE_DIR}/retention_cleanup.prom"
+
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+run() {
+    # Execute unless dry-run; echo either way so the log is a faithful record.
+    if [ "$DRY_RUN" = "true" ]; then
+        log "[DRY-RUN] would run: $*"
+        return 0
+    fi
+    "$@"
+}
+
+# Witness line — proves the cron fired even on a clean run that reclaims 0
+# bytes (silent-zero is the same severity class as silent-failure).
+alert_event "retention-cleanup" run ok "pid=$$ days=${RETENTION_DAYS} dry=${DRY_RUN}"
+log "=== retention-cleanup start (pid $$, retention=${RETENTION_DAYS}d, dry=${DRY_RUN}) ==="
+
+success=1
+docker_reclaimed="0B"
+
+# ── Docker: age-gated, volume-safe ───────────────────────────────────────
+# `until=<hours>h` only removes resources created/last-used before the window.
+# `--volumes` deliberately omitted unless explicitly opted in — named volumes
+# can hold service data and are NOT disposable.
+DOCKER_PRUNE_ARGS=(system prune -af "--filter" "until=${RETENTION_HOURS}h")
+if [ "$PRUNE_VOLUMES" = "true" ]; then
+    DOCKER_PRUNE_ARGS+=("--volumes")
+    log "[WARN] volume pruning ENABLED via common_retention_docker_prune_volumes"
+fi
+
+if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] would run: docker ${DOCKER_PRUNE_ARGS[*]}"
+elif OUTPUT=$(docker "${DOCKER_PRUNE_ARGS[@]}" 2>&1); then
+    docker_reclaimed=$(echo "$OUTPUT" | grep -i "reclaimed" | grep -oE '[0-9.]+ ?[KMGT]?B' | tail -1 || echo "0B")
+    log "[OK] docker prune: ${docker_reclaimed:-0B} reclaimed (until=${RETENTION_HOURS}h, volumes=${PRUNE_VOLUMES})"
+    echo "$OUTPUT" >> "$LOG"
+else
+    rc=$?
+    success=0
+    log "[ERROR] docker prune failed (rc=${rc})"
+    echo "$OUTPUT" >> "$LOG"
+fi
+
+# Builder cache has its own prune verb + until filter.
+if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] would run: docker builder prune -af --filter until=${RETENTION_HOURS}h"
+elif BOUT=$(docker builder prune -af --filter "until=${RETENTION_HOURS}h" 2>&1); then
+    log "[OK] docker builder prune: $(echo "$BOUT" | grep -i 'reclaimed' || echo 'nothing to reclaim')"
+else
+    log "[WARN] docker builder prune failed (non-fatal)"
+fi
+
+# ── Tdarr transcode-cache scratch (disposable workdir output) ────────────
+# Only loose files older than the window; the dir itself + active workdirs
+# stay. This is transient transcode scratch, NOT library or download content.
+cache_removed=0
+if [ -d "$CACHE_DIR" ]; then
+    # Count first so the metric reflects what was (or would be) removed.
+    cache_removed=$(find "$CACHE_DIR" -type f -mtime "+${RETENTION_DAYS}" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$DRY_RUN" = "true" ]; then
+        log "[DRY-RUN] would delete ${cache_removed} scratch file(s) >${RETENTION_DAYS}d in ${CACHE_DIR}"
+    else
+        find "$CACHE_DIR" -type f -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+        find "$CACHE_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+        log "[OK] transcode-cache: removed ${cache_removed} scratch file(s) >${RETENTION_DAYS}d"
+    fi
+else
+    log "[INFO] transcode cache ${CACHE_DIR} not present — skipped"
+fi
+
+log "=== retention-cleanup end (success=${success}) ==="
+
+# ── Observability: atomic textfile emit (silent-cron hard rule) ──────────
+if [ -d "$TEXTFILE_DIR" ]; then
+    tmp="${TEXTFILE}.$$"
+    dry_metric=0
+    [ "$DRY_RUN" = "true" ] && dry_metric=1
+    if {
+        echo "# HELP retention_cleanup_last_run_unix_seconds Unix time of the last retention-cleanup run."
+        echo "# TYPE retention_cleanup_last_run_unix_seconds gauge"
+        echo "retention_cleanup_last_run_unix_seconds $(date +%s)"
+        echo "# HELP retention_cleanup_last_run_success 1 if the last run completed without error."
+        echo "# TYPE retention_cleanup_last_run_success gauge"
+        echo "retention_cleanup_last_run_success ${success}"
+        echo "# HELP retention_cleanup_cache_files_removed Scratch files removed from the transcode cache last run."
+        echo "# TYPE retention_cleanup_cache_files_removed gauge"
+        echo "retention_cleanup_cache_files_removed ${cache_removed:-0}"
+        echo "# HELP retention_cleanup_dry_run 1 if the last run was a dry-run (no deletions)."
+        echo "# TYPE retention_cleanup_dry_run gauge"
+        echo "retention_cleanup_dry_run ${dry_metric}"
+    } > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$TEXTFILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+fi
+
+# ── ntfy summary ─────────────────────────────────────────────────────────
+if [ "$success" -eq 1 ]; then
+    ntfy_send "retention-cleanup" \
+        -H "Title: Retention cleanup (${RETENTION_DAYS}d)" \
+        -H "Tags: whale,broom" \
+        -H "Markdown: yes" \
+        -d "Disposable-artifact cleanup finished (dry-run=${DRY_RUN}).
+
+- Docker reclaimed: ${docker_reclaimed:-0B}
+- Transcode scratch removed: ${cache_removed:-0} file(s)
+
+Personal/library data untouched." \
+        "$NTFY_URL" || log "[WARN] ntfy notification failed — cleanup ran anyway"
+else
+    ntfy_send "retention-cleanup" \
+        -H "Title: Retention cleanup FAILED" \
+        -H "Priority: high" \
+        -H "Tags: x,whale" \
+        -d "Retention cleanup hit an error. Check ${LOG} on host." \
+        "$NTFY_URL" || log "[WARN] ntfy notification failed"
+    exit 1
+fi

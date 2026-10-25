@@ -1,0 +1,57 @@
+# MinIO S3 object-storage alerts (design 034).
+#
+# Scope is deliberately liveness + cluster-health only. MinIO shares /srv with
+# every other service, so CAPACITY is already covered by the host SrvDiskHigh/
+# Critical rules in host-saturation.yml — adding a MinIO free-bytes alert here
+# would double-page the same event (see docs/conventions / alert-discipline).
+#
+# Datasource: VictoriaMetrics (PromQL). Source: the `minio` vmagent scrape job
+# (up{job="minio"}) + the /minio/v2/metrics/cluster endpoint. Metric names were
+# verified live against minio/minio RELEASE.2025-04-22.
+#
+# Quoting: any annotation surfacing $value/printf uses single-quoted-outer /
+# escaped-inner per docs/conventions/vmalert-rule-quoting.md.
+
+groups:
+  - name: minio
+    interval: 1m
+    rules:
+
+      # ── MinIO liveness (container down OR scrape failing) ─────────────
+      # The primary notification: vmagent can't reach the S3 API metrics
+      # endpoint. With MINIO_PROMETHEUS_AUTH_TYPE=public a 200 is expected;
+      # up==0 means the container is down or the host port is unreachable.
+      - alert: MinioDown
+        expr: up{job="minio"} == 0
+        for: {{ vmalert_minio_down_for | default('5m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: "MinIO is down — S3 object storage unavailable"
+          description: "vmagent can't scrape minio:9010/minio/v2/metrics/cluster. The S3 endpoint is down, so MLflow artifacts / DVC remote / dataset reads+writes fail. Restart the container (`make minio`); check `docker logs minio` and the QLockfile-style boot issues."
+
+      # ── Cluster health degraded while still scrapeable ───────────────
+      # health_status: 1 = healthy, 0 = unhealthy (read/write quorum lost).
+      # Distinct from MinioDown — the process answers metrics but can't serve
+      # objects (e.g. the backing drive went read-only / offline).
+      - alert: MinioClusterUnhealthy
+        expr: minio_cluster_health_status == 0
+        for: {{ vmalert_minio_unhealthy_for | default('5m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: "MinIO cluster reports unhealthy"
+          description: "minio_cluster_health_status == 0 — MinIO is up but has lost read/write quorum (backing drive offline or read-only). Object operations are failing. Check the drive behind /srv/data/minio and `docker logs minio`."
+
+      # ── Backing drive offline (single-node = data unavailable) ───────
+      - alert: MinioDriveOffline
+        expr: minio_cluster_drive_offline_total > 0
+        for: {{ vmalert_minio_drive_offline_for | default('5m') }}
+        labels:
+          severity: crit
+          source: vmalert
+        annotations:
+          summary: 'MinIO has {{ '{{ $value | printf "%.0f" }}' }} drive(s) offline'
+          description: "minio_cluster_drive_offline_total > 0. On this single-node deployment an offline drive means objects are unreadable. Check the SSD mount behind /srv/data/minio and the MinIO container."

@@ -1,0 +1,31 @@
+---
+- name: Converge — render VictoriaLogs templates to tmp dir for assertion
+  hosts: localhost
+  gather_facts: false
+  vars:
+    docker_user: pi
+    timezone: Europe/Istanbul
+  pre_tasks:
+    - name: Load role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../defaults/main.yml"
+
+    - name: Override compose/data dirs to a tmp sandbox
+      ansible.builtin.set_fact:
+        victorialogs_compose_dir: /tmp/molecule-vl
+        victorialogs_data_dir: /tmp/molecule-vl/data
+
+    - name: Ensure sandbox dirs exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ victorialogs_compose_dir }}"
+        - "{{ victorialogs_data_dir }}"
+  tasks:
+    - name: Render docker-compose.yml
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../templates/docker-compose.yml.j2"
+        dest: "{{ victorialogs_compose_dir }}/docker-compose.yml"
+        mode: "0644"

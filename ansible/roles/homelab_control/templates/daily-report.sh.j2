@@ -1,0 +1,94 @@
+#!/bin/bash
+# Daily homelab status report — sent via ntfy every evening
+# Managed by Ansible — do not edit manually
+
+NTFY_URL="{{ homelab_control_ntfy_url }}"
+# Phone-resolved via split-DNS; never construct from default_ipv4 (memory rule).
+HOMEPAGE_URL="http://{{ homepage_hostname }}:{{ homepage_port | default(3001) }}"
+
+# alert-lib.sh is deployed by the `common` role. If make homelab-control is
+# run before make base on a fresh host, fall back to a curl-only ntfy_send so
+# we don't bomb with file-not-found. (Remediation #2.)
+ALERT_LIB=/usr/local/lib/homelab/alert-lib.sh
+if [ -r "$ALERT_LIB" ]; then
+    # shellcheck source=/dev/null
+    source "$ALERT_LIB"
+else
+    # Degraded mode: alert-lib is missing (e.g. `make homelab-control` ran
+    # before `make base` on a fresh host). Surface this once per invocation
+    # via journald so it shows in `journalctl -t daily-report` instead of
+    # silently swallowing every notification's HTTP code. Sprint 017 Story 4.
+    if command -v logger >/dev/null 2>&1; then
+        logger -p user.warning -t daily-report \
+            "running in degraded mode (alert-lib.sh missing — no audit trail)"
+    fi
+    ntfy_send() {
+        local _script="$1"; shift
+        curl -s -o /dev/null --max-time 10 "$@" >/dev/null 2>&1 || true
+    }
+fi
+
+# ── Gather metrics ──────────────────────────────────────────
+DISK_USAGE=$(df -h /srv | awk 'NR==2{print $3"/"$2" ("$5")"}')
+DISK_PCT=$(df /srv | awk 'NR==2{print $5}' | tr -d '%')
+MEM=$(free -h | awk '/Mem/{print $3"/"$2}')
+TEMP=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | awk '{printf "%.0f", $1/1000}')
+UPTIME=$(uptime -p | sed 's/up //')
+CONTAINERS=$(docker ps -q | wc -l)
+CONTAINERS_DOWN=$(docker ps -a --filter "status=exited" --filter "status=dead" -q | wc -l)
+
+# ── Tdarr stats ─────────────────────────────────────────────
+TDARR_STATS=$(curl -sf -X POST http://localhost:8265/api/v2/cruddb \
+  -H "Content-Type: application/json" \
+  -d '{"data":{"collection":"StatisticsJSONDB","mode":"getAll"}}' 2>/dev/null)
+
+if [ -n "$TDARR_STATS" ]; then
+  TDARR_TOTAL=$(echo "$TDARR_STATS" | python3 -c "import json,sys; print(json.load(sys.stdin)[0].get('totalFileCount',0))" 2>/dev/null)
+  TDARR_QUEUE=$(echo "$TDARR_STATS" | python3 -c "import json,sys; print(json.load(sys.stdin)[0].get('table1Count',0))" 2>/dev/null)
+  TDARR_DONE=$(echo "$TDARR_STATS" | python3 -c "import json,sys; print(json.load(sys.stdin)[0].get('table2Count',0))" 2>/dev/null)
+  TDARR_SAVED=$(echo "$TDARR_STATS" | python3 -c "import json,sys; print(f\"{json.load(sys.stdin)[0].get('sizeDiff',0)/1024:.1f}\")" 2>/dev/null)
+  TDARR_LINE="Tdarr: ${TDARR_DONE}/${TDARR_TOTAL} done, ${TDARR_QUEUE} queued, ${TDARR_SAVED}GB saved"
+else
+  TDARR_LINE="Tdarr: unavailable"
+fi
+
+# ── Build message ────────────────────────────────────────────
+MSG="Disk: ${DISK_USAGE}
+Memory: ${MEM}
+Temp: ${TEMP}C | Up: ${UPTIME}
+Containers: ${CONTAINERS} running"
+
+if [ "$CONTAINERS_DOWN" -gt 0 ]; then
+  # `tr` only does 1-to-1 char translation, so `tr '\n' ', '` was silently
+  # producing "name1,name2,name3" with no spaces. paste -sd does proper join.
+  DOWN_NAMES=$(docker ps -a --filter "status=exited" --filter "status=dead" --format "{% raw %}{{.Names}}{% endraw %}" | paste -sd, - | sed 's/,/, /g')
+  MSG="${MSG}, ${CONTAINERS_DOWN} down (${DOWN_NAMES})"
+fi
+
+MSG="${MSG}
+${TDARR_LINE}"
+
+# ── Choose priority ──────────────────────────────────────────
+PRIORITY="low"
+TAGS="clipboard,chart_with_upwards_trend"
+
+if [ "$CONTAINERS_DOWN" -gt 0 ]; then
+  PRIORITY="high"
+  TAGS="warning,chart_with_upwards_trend"
+fi
+
+if [ "$DISK_PCT" -ge 95 ]; then
+  PRIORITY="urgent"
+  TAGS="rotating_light,chart_with_upwards_trend"
+fi
+
+# ── Send ─────────────────────────────────────────────────────
+# Markdown: yes preserves newlines + lets us bold the headings on mobile.
+ntfy_send "daily-report" \
+  -H "Title: Daily Report $(date +%m/%d)" \
+  -H "Priority: ${PRIORITY}" \
+  -H "Tags: ${TAGS}" \
+  -H "Markdown: yes" \
+  -H "Actions: view, Open Dashboard, ${HOMEPAGE_URL}, clear=true" \
+  -d "$MSG" \
+  "$NTFY_URL"

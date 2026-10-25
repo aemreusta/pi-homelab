@@ -1,0 +1,11 @@
+---
+- name: Include tailscale_dns deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [tailscale_dns]
+
+- name: Include tailscale_dns split-DNS drift-check tasks
+  ansible.builtin.include_tasks: split_dns_check.yml
+  args:
+    apply:
+      tags: [tailscale_dns, monitoring]
+  tags: [tailscale_dns, monitoring]

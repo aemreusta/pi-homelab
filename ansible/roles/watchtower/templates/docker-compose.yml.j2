@@ -1,0 +1,75 @@
+---
+# Watchtower — automatic container image updates
+# Checks all running containers for new images every {{ watchtower_interval }}s (daily).
+# --cleanup removes old images after updating.
+
+services:
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ watchtower_mem_limit }}
+    pids_limit: {{ watchtower_pids_limit }}
+    read_only: {{ watchtower_read_only | lower }}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size={{ watchtower_tmpfs_size }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in watchtower_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+{% if watchtower_cap_add | length > 0 %}
+    cap_add:
+{% for cap in watchtower_cap_add %}
+      - {{ cap }}
+{% endfor %}
+{% endif %}
+    labels:
+{% for k, v in watchtower_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    healthcheck:
+      test: ["CMD", "/watchtower", "--health-check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    environment:
+      - TZ={{ watchtower_tz }}
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL={{ watchtower_interval }}
+      # These images are built locally by Ansible; no registry owns their tags.
+      - WATCHTOWER_DISABLE_CONTAINERS={{ watchtower_excluded_containers | join(',') }}
+      - DOCKER_API_VERSION=1.40
+      # Shoutrrr notifications via ntfy.
+      # REPORT=true bundles the whole scan into a single notification
+      # instead of one-per-container (less spam).
+      # The default template strips whitespace via Go-template trim syntax,
+      # collapsing every entry onto one line. We ship a custom template
+      # with explicit newline literals so the mobile notification renders
+      # properly multi-line — see the WATCHTOWER_NOTIFICATION_TEMPLATE below.
+      - WATCHTOWER_NOTIFICATIONS=shoutrrr
+      - WATCHTOWER_NOTIFICATION_URL={{ watchtower_ntfy_url }}
+      - WATCHTOWER_NOTIFICATIONS_HOSTNAME={{ watchtower_notifications_hostname }}
+      - WATCHTOWER_NOTIFICATION_REPORT=true
+      - WATCHTOWER_NOTIFICATION_TITLE_TAG=package
+{% raw %}
+      - 'WATCHTOWER_NOTIFICATION_TEMPLATE={{- if .Report -}}{{- with .Report -}}{{ len .Scanned }} scanned, {{ len .Updated }} updated, {{ len .Failed }} failed.{{"\n"}}{{ if .Updated }}{{"\n"}}Updated:{{"\n"}}{{ range .Updated }}- {{ .Name }} ({{ .ImageName }}){{"\n"}}{{ end }}{{ end }}{{ if .Failed }}{{"\n"}}Failed:{{"\n"}}{{ range .Failed }}- {{ .Name }}: {{ .Error }}{{"\n"}}{{ end }}{{ end }}{{- end -}}{{- else -}}{{ range .Entries -}}{{ .Message }}{{"\n"}}{{ end -}}{{- end -}}'
+{% endraw %}
+    # Pin ntfy.example inside the container so shoutrrr can resolve it
+    # without depending on AdGuard. Docker's embedded DNS does NOT read
+    # the host's /etc/hosts, only its upstream resolvers — so the host-side
+    # pin (roles/common/tasks/hosts.yml) doesn't propagate. extra_hosts
+    # writes a line into the container's own /etc/hosts.
+{# Docs: docs/archive/design/025-ntfy-dns-name.md #}
+    extra_hosts:
+      - "{{ ntfy_hostname }}:{{ lan_ip }}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

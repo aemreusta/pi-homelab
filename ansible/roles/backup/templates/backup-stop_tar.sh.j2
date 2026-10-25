@@ -1,0 +1,70 @@
+#!/bin/bash
+# backup-stop_tar.sh — quiesce-via-docker-stop, tar, restart.
+# Invoked by homelab-backup.sh with: $1=service_name, $2=container_name,
+# $3..N=source_paths
+#
+# Critical contract: an EXIT trap MUST restart the container even on tar
+# failure or signal. Skipping that risks leaving qBit / Tdarr / etc.
+# stopped indefinitely.
+set -uo pipefail
+
+BACKUP_ROOT="{{ backup_root }}"
+SERVICE="$1"
+CONTAINER="$2"
+shift 2
+PATHS=("$@")
+
+DATE="$(date -u +%Y-%m-%d)"
+DEST_DIR="${BACKUP_ROOT}/${SERVICE}/${DATE}"
+ARCHIVE="${DEST_DIR}/${SERVICE}.tar.gz"
+# Atomic write: build into .partial, mv to final at the end. Previous
+# snapshot stays intact until rename succeeds.
+PARTIAL="${ARCHIVE}.partial.$$"
+
+mkdir -p "$DEST_DIR"
+
+container_was_running="$(docker inspect "$CONTAINER" --format '{{ "{{" }}.State.Running{{ "}}" }}' 2>/dev/null)"
+
+restart_container() {
+    if [ "$container_was_running" = "true" ]; then
+        docker start "$CONTAINER" >/dev/null 2>&1 || true
+    fi
+    rm -f "$PARTIAL"
+}
+trap restart_container EXIT INT TERM
+
+start_ms=$(date +%s%3N)
+
+if [ "$container_was_running" = "true" ]; then
+    docker stop --time=30 "$CONTAINER" >/dev/null 2>&1 || {
+        printf '{"service":"%s","method":"stop_tar","status":"fail","bytes":0,"duration_ms":0,"error":"docker stop failed"}\n' \
+            "$SERVICE"
+        exit 1
+    }
+fi
+
+tar -czf "$PARTIAL" -C / "${PATHS[@]#/}" 2>/tmp/backup-${SERVICE}.err
+rc=$?
+
+duration_ms=$(( $(date +%s%3N) - start_ms ))
+
+if [ "$rc" -ne 0 ]; then
+    err=$(head -c 200 /tmp/backup-${SERVICE}.err 2>/dev/null | tr '\n' ' ')
+    rm -f /tmp/backup-${SERVICE}.err
+    printf '{"service":"%s","method":"stop_tar","status":"fail","bytes":0,"duration_ms":%d,"error":"%s"}\n' \
+        "$SERVICE" "$duration_ms" "$err"
+    exit 1
+fi
+
+entries=$(tar -tzf "$PARTIAL" 2>/dev/null | wc -l)
+mv -f "$PARTIAL" "$ARCHIVE"
+bytes=$(stat -c '%s' "$ARCHIVE")
+rm -f /tmp/backup-${SERVICE}.err
+
+# Container restart happens via EXIT trap. Verify health post-restart.
+# Note: trap fires after this print, so we can't include post-restart
+# state in the line — the orchestrator's per-service log entry is
+# authoritative for "did the backup work"; container-health is a
+# separate signal already monitored by Beszel.
+printf '{"service":"%s","method":"stop_tar","status":"ok","bytes":%d,"duration_ms":%d,"entries":%d}\n' \
+    "$SERVICE" "$bytes" "$duration_ms" "$entries"

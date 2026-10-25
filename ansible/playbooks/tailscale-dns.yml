@@ -1,0 +1,6 @@
+---
+- name: Deploy Tailscale DNS resolver
+  hosts: pi
+  become: true
+  roles:
+    - tailscale_dns

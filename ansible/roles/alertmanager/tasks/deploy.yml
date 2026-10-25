@@ -1,0 +1,97 @@
+---
+- name: Ensure observability docker network
+  community.docker.docker_network:
+    name: "{{ alertmanager_network }}"
+    driver: bridge
+
+- name: Create Alertmanager compose + data directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "0755"
+  loop:
+    - { path: "{{ alertmanager_compose_dir }}", owner: "{{ docker_user }}" }
+    # Alertmanager container runs as UID 65534 (nobody) — own the data dir
+    # to that UID.
+    - { path: "{{ alertmanager_data_dir }}", owner: "65534" }
+    - { path: "{{ alertmanager_compose_dir }}/bridge", owner: "{{ docker_user }}" }
+
+- name: Template Alertmanager config
+  ansible.builtin.template:
+    src: alertmanager.yml.j2
+    dest: "{{ alertmanager_compose_dir }}/alertmanager.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart alertmanager
+
+# Validate the rendered config with the SAME parser Alertmanager uses BEFORE
+# starting/restarting the container. A malformed matcher (e.g. two matchers
+# folded into one YAML scalar) otherwise ships fine and crash-loops the
+# container — config load fails at runtime, taking ALL notification delivery
+# down silently. amtool check-config calls the same config.LoadFile path, so
+# it catches inhibit_rules/route/matcher errors that --syntax-check cannot.
+# Incident 2026-06-07-alertmanager-crash-loop-folded-matcher.md.
+- name: Validate rendered Alertmanager config with amtool
+  ansible.builtin.command:
+    cmd: >-
+      docker run --rm
+      -v {{ alertmanager_compose_dir }}/alertmanager.yml:/tmp/alertmanager.yml:ro
+      --entrypoint /bin/amtool
+      {{ alertmanager_image }}
+      check-config /tmp/alertmanager.yml
+  changed_when: false
+  register: alertmanager_amtool_check
+
+- name: Template ntfy-bridge script
+  ansible.builtin.template:
+    src: ntfy-bridge.py.j2
+    dest: "{{ alertmanager_compose_dir }}/bridge/ntfy-bridge.py"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  notify: Restart alertmanager
+
+- name: Ensure alert-audit.log writable from the bridge container
+  ansible.builtin.file:
+    path: "{{ alertmanager_bridge_audit_log }}"
+    state: touch
+    owner: root
+    group: root
+    # AUTHORITATIVE owner of this file's mode. alertmanager is the PRODUCER
+    # (the ntfy-bridge container appends here), so the mode decision lives
+    # here; common/tasks/monitoring.yml only ensures the file exists early in
+    # base provisioning and explicitly defers to this task. See the file-
+    # ownership decision record in docs/operations/ops-discipline.md for why
+    # 0666 (world-writable on a zero-secret audit log) was chosen over a
+    # shared-group 0664 (the bridge runs as nobody/65534, which can't be
+    # added to a host group cleanly).
+    mode: "0666"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Template Alertmanager docker-compose
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ alertmanager_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart alertmanager
+
+- name: Deploy verify-vmalert end-to-end probe
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../scripts/verify-vmalert.sh"
+    dest: /usr/local/bin/verify-vmalert.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Start Alertmanager + ntfy-bridge containers
+  community.docker.docker_compose_v2:
+    project_src: "{{ alertmanager_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

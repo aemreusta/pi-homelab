@@ -1,0 +1,7 @@
+---
+- name: Deploy off-site backup to Google Drive (rclone)
+  hosts: pi
+  become: true
+
+  roles:
+    - gdrive_backup

@@ -1,0 +1,102 @@
+---
+# defaults file for common
+
+# Swap configuration (rpi-swap on Debian Trixie)
+common_swap_file_size_mib: 8192
+common_swap_zram_size_mib: 6144
+
+# Memory monitoring — swap-pct alert with hysteresis + cooldown.
+# Fires when swap_pct ≥ high. Silent until swap_pct ≤ low (cleared event sent),
+# then re-arms. See docs/design/024-alert-discipline.md for the taxonomy.
+common_swap_alert_high_pct: 85
+common_swap_alert_low_pct: 70
+common_swap_alert_cooldown_hours: 24
+common_alert_state_dir: /var/lib/homelab
+
+# Unhealthy-watchdog: every 5 min, scan `docker ps --filter health=unhealthy`.
+# After `threshold` consecutive unhealthy polls for the same container,
+# `docker restart` it. After `max_restarts` per rolling 24 h, stop restarting
+# and send URGENT ntfy — operator must intervene. State files live under
+# common_alert_state_dir (shared with disk-alert + memory-alert).
+# Sprint 016 Item A; closes the "broken but still running" alerting gap.
+common_watchdog_unhealthy_threshold: 3
+common_watchdog_max_restarts: 5
+# Seconds between repeat URGENT pushes once a container has exhausted its
+# restart budget. The watchdog polls every 5 min and the over-budget branch
+# is re-entered on every poll, so without this it emits 288 urgent
+# notifications/day for a single stuck container (2026-09-02 tailscale-dns:
+# ~247 pushes over 25 h, every one delivered, all ignored). 6h keeps the
+# state visible ~4×/day while vmalert's ContainerUnhealthyCritical carries
+# the durable signal.
+common_watchdog_overbudget_alert_cooldown: 21600
+common_watchdog_state_dir: "{{ common_alert_state_dir }}"
+common_watchdog_engine: go
+common_watchdog_ledger: /var/lib/homelab/watchdog/status.json
+common_watchdog_textfile: /var/lib/node_exporter/textfile/watchdog.prom
+
+# PID-budget alerting: per-container `pids.current` vs `pids.max` from
+# cgroup-v2. Today's 2026-05-21 outage would have warned at ~840/1200 PIDs
+# on byparr (~70%) about 2 h before the host wedged. Sprint 016 Item B.
+common_pid_budget_warn_pct: 70
+common_pid_budget_crit_pct: 90
+common_pid_budget_cooldown_hours: 24
+
+# CPU saturation alerting — Sprint 017 Story 1. Closes the dominant outage
+# shape on a 4-core Pi (2026-05-22 load 14.30, one *arr app at 124% CPU, all other
+# metrics green). 5-min loadavg vs nproc with same hysteresis pattern as
+# memory-alert + pid-budget-alert.
+#
+# warn raised 1.5→2.5 on 2026-05-31 (operator: "load notifications just keep
+# coming"). The Pi runs a genuinely busy media stack — a ~1.1-core *arr
+# catalog baseline + Tdarr 24x7 NFS serving keep load5 hovering 4–6, right on
+# top of the old 1.5× (=6.0) warn line. Because the alert clears + re-arms each
+# time load dips below the line, every oscillation across 6.0 fired a fresh
+# warn+recovered pair — that's the "keep coming". 2.5× (=10.0 on 4 cores) sits
+# above the normal busy range, so warn now means genuine overload, not routine
+# churn. crit stays 3× (=12.0) — SSH-at-risk territory; the 2026-05-22 outage
+# (load 14.3) would still crit-fire. Lower the warn ratio again if a real
+# saturation creep ever slips under 10.0.
+common_cpu_load_warn_ratio: 2.5
+common_cpu_load_crit_ratio: 3.0
+common_cpu_load_cooldown_hours: 24
+
+# Disk-usage alerting (disk-alert.sh cron + the gated vmalert SrvDiskHigh rule
+# share this var). Raised to 93 on 2026-05-31 (operator: "no need to worry
+# about the disk too much"). /srv sits at ~90% on the 1.8 TB SSD as the steady
+# accepted state (large media library, no-data-removal rule), so the old 75%
+# default fired permanently. 93% stops the nag at the accepted level while
+# still warning before the 95% fill exit-criterion (runbook 037). SrvDiskCritical
+# was bumped 90→95 in lockstep so warn(93) < crit(95) stays ordered.
+common_disk_alert_threshold: 93
+common_disk_alert_cooldown_hours: 24
+
+# Sprint 18: host-side cron alerts → vmalert decom toggle. Default false so
+# cron-based alerting stays active during the 1-week parallel-run soak. Once
+# vmalert has been verified at parity, flip to `true` in group_vars (or via
+# `-e common_use_vmalert=true`) to remove the cron entries. The scripts +
+# templates remain on disk for fast rollback — only cron entries get gated.
+common_use_vmalert: false
+
+# Retention cleanup — reclaim DISPOSABLE artifacts older than the window.
+# Supersedes the old unbounded weekly `docker system prune -af --volumes`.
+# Scope is age-gated and volume-safe; it NEVER touches /srv library/
+# downloads, named Docker volumes, or backups. See docs/runbooks/038-2026-05-29-retention-cleanup.md and the
+# no-data-removal hard rule. Emits a node_exporter textfile metric.
+common_retention_days: 30
+# SAFETY: leave false. Named volumes can hold service data and are not
+# disposable; `--volumes` pruning is opt-in only.
+common_retention_docker_prune_volumes: false
+common_retention_transcode_cache_dir: /srv/transcode-cache
+common_retention_log: /var/log/retention-cleanup.log
+# Set true to log intended actions without deleting anything (operator drill).
+common_retention_dry_run: false
+common_node_exporter_textfile_dir: /var/lib/node_exporter/textfile
+# journald: keep at most this much history (pairs with SystemMaxUse cap).
+common_journald_max_retention_sec: 1month
+
+# SMART disk health monitoring — daily check via smartctl.
+common_smart_device: /dev/sda
+# `auto` is the cross-host default — smartctl probes SATA/NVMe/USB transports.
+# Override per-host in group_vars/host_vars when the bridge needs a specific
+# alias (e.g. `scsi` for the prod Pi's SanDisk 0x0781:0x55bb USB3 enclosure).
+common_smart_device_type: auto

@@ -1,0 +1,91 @@
+---
+- name: Verify — assert hardening directives are present in rendered files
+  hosts: localhost
+  gather_facts: false
+  vars:
+    sandbox: /tmp/molecule-cadvisor
+  tasks:
+
+    - name: Slurp docker-compose.yml
+      ansible.builtin.slurp:
+        src: "{{ sandbox }}/docker-compose.yml"
+      register: dc
+
+    - name: Decode docker-compose
+      ansible.builtin.set_fact:
+        compose_yaml: "{{ (dc.content | b64decode) | from_yaml }}"
+        compose_text: "{{ dc.content | b64decode }}"
+
+    - name: Assert privileged is NOT set (must be replaced with cap_add list)
+      ansible.builtin.assert:
+        that:
+          - "'privileged' not in compose_yaml.services.cadvisor or not compose_yaml.services.cadvisor.privileged"
+        fail_msg: "privileged: true must be removed in favor of targeted cap_add"
+
+    - name: Assert security_opt no-new-privileges
+      ansible.builtin.assert:
+        that:
+          - "'no-new-privileges:true' in compose_yaml.services.cadvisor.security_opt"
+        fail_msg: "no-new-privileges:true missing from security_opt"
+
+    - name: Assert cap_drop ALL
+      ansible.builtin.assert:
+        that:
+          - "'ALL' in compose_yaml.services.cadvisor.cap_drop"
+        fail_msg: "cap_drop must include ALL"
+
+    - name: Assert cap_add minimal set (DAC_READ_SEARCH, SYS_PTRACE, SYS_ADMIN)
+      ansible.builtin.assert:
+        that:
+          - "'DAC_READ_SEARCH' in compose_yaml.services.cadvisor.cap_add"
+          - "'SYS_PTRACE' in compose_yaml.services.cadvisor.cap_add"
+          - "'SYS_ADMIN' in compose_yaml.services.cadvisor.cap_add"
+        fail_msg: "cap_add must include DAC_READ_SEARCH, SYS_PTRACE, SYS_ADMIN"
+
+    - name: Assert read_only true
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.cadvisor.read_only | bool
+        fail_msg: "read_only must be true"
+
+    - name: Assert tmpfs has /tmp with hardening flags
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.cadvisor.tmpfs | length > 0
+          - compose_yaml.services.cadvisor.tmpfs[0] is search('^/tmp:')
+          - compose_yaml.services.cadvisor.tmpfs[0] is search('size=')
+          - compose_yaml.services.cadvisor.tmpfs[0] is search('noexec')
+          - compose_yaml.services.cadvisor.tmpfs[0] is search('nosuid')
+          - compose_yaml.services.cadvisor.tmpfs[0] is search('nodev')
+        fail_msg: "tmpfs /tmp missing or missing hardening flags"
+
+    - name: Assert pids_limit set
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.cadvisor.pids_limit is defined
+          - compose_yaml.services.cadvisor.pids_limit | int > 0
+        fail_msg: "pids_limit missing"
+
+    - name: Assert /dev/kmsg device still present
+      ansible.builtin.assert:
+        that:
+          - "'/dev/kmsg' in compose_yaml.services.cadvisor.devices"
+        fail_msg: "device /dev/kmsg required by cAdvisor"
+
+    - name: Assert host bind mounts are read-only
+      ansible.builtin.assert:
+        that:
+          - "'/:/rootfs:ro' in compose_yaml.services.cadvisor.volumes"
+          - "'/sys:/sys:ro' in compose_yaml.services.cadvisor.volumes"
+          - "'/var/lib/docker/:/var/lib/docker:ro' in compose_yaml.services.cadvisor.volumes"
+        fail_msg: "host filesystem mounts must be read-only"
+
+    - name: Assert OCI labels present
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.cadvisor.labels['org.opencontainers.image.title'] is defined
+          - compose_yaml.services.cadvisor.labels['org.opencontainers.image.source'] is defined
+          - compose_yaml.services.cadvisor.labels['org.opencontainers.image.vendor'] is defined
+          - compose_yaml.services.cadvisor.labels['org.opencontainers.image.documentation'] is defined
+          - compose_yaml.services.cadvisor.labels['org.opencontainers.image.description'] is defined
+        fail_msg: "OCI image labels incomplete"

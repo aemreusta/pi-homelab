@@ -1,0 +1,250 @@
+---
+import Base from '../layouts/Base.astro';
+
+const stats = [
+  { value: '40', label: 'containers on one board' },
+  { value: '45', label: 'Ansible roles, no click-ops' },
+  { value: '200+', label: 'alert rules watching it' },
+  { value: '1,700+', label: 'automated tests' },
+  { value: '61', label: 'tag-gated releases' },
+  { value: '76', label: 'incident write-ups' },
+];
+
+const stacks = [
+  {
+    icon: '🎬',
+    title: 'Media',
+    text: 'A request-to-playback pipeline. Jellyfin serves direct play only, because the Pi cannot transcode. Size limits keep 30 GB disc copies off the disk.',
+    tags: ['Jellyfin', 'Sonarr', 'Radarr', 'Prowlarr', 'qBittorrent', 'Jellyseerr', 'Tdarr'],
+  },
+  {
+    icon: '🌐',
+    title: 'Network & access',
+    text: 'LAN DNS with ad blocking, a reverse proxy for every UI, single sign-on, and remote access over WireGuard. Every host port is scoped to the LAN.',
+    tags: ['AdGuard Home', 'Traefik', 'Tailscale', 'Authelia', 'UFW'],
+  },
+  {
+    icon: '📈',
+    title: 'Observability',
+    text: 'Metrics, logs and alerts for everything above, including jobs that run once a week. Alerts reach a phone through ntfy, rate-limited.',
+    tags: ['VictoriaMetrics', 'VictoriaLogs', 'vmalert', 'Alertmanager', 'Grafana', 'Fluent Bit', 'cAdvisor', 'Beszel', 'ntfy'],
+  },
+  {
+    icon: '🧪',
+    title: 'Data & ML',
+    text: 'A small experiment platform: shared PostgreSQL, S3-compatible storage, experiment tracking, audio labelling, and a speech-recognition backend that pre-annotates it.',
+    tags: ['PostgreSQL', 'MinIO', 'MLflow', 'Label Studio', 'ASR backend'],
+  },
+  {
+    icon: '🧰',
+    title: 'Platform',
+    text: 'The plumbing: a local OCI registry for images built on the Mac, a dashboard, container management and a speed-test history.',
+    tags: ['Docker', 'Zot registry', 'Homepage', 'Portainer', 'Watchtower', 'Speedtest Tracker'],
+  },
+  {
+    icon: '🤖',
+    title: 'Own runtime',
+    text: 'One static Go binary, homelab-agent, holds the decisions that scheduled jobs used to bury in shell: 20 subcommands, 18 tested packages, a checksum-pinned toolchain.',
+    tags: ['Go', 'race tests', 'differential fixtures', 'atomic state'],
+  },
+];
+
+const pipeline = [
+  { title: 'Commit', text: 'Conventional commits; pre-commit runs lint, ShellCheck, tests and secret checks.' },
+  { title: 'CI', text: 'Python, Bats and Go suites plus ansible-lint on a self-hosted runner.' },
+  { title: 'Tag', text: 'A deploy-v* tag decides when to ship. CHANGELOG and TODO move with it.' },
+  { title: 'Deep check', text: 'The Pi runs a syntax check, then a --check --diff dry run against itself.' },
+  { title: 'Apply', text: 'Only the roles that changed. Host provisioning is never auto-deployed.' },
+  { title: 'Roll back', text: 'Any failure reverts to the last good commit and pings the phone.' },
+];
+
+const principles = [
+  ['Everything is Ansible.', 'Firewall rules, cron jobs, app settings via their APIs: if it is not in a role, it does not exist.'],
+  ['Decisions live in tested code.', 'Shell only orchestrates. Diffs, transitions and "should I delete this?" live in Go or Python with tests.'],
+  ['Every scheduled job proves it ran.', 'Each cron emits a metric with an alert on it. A job that silently does nothing counts as a failure.'],
+  ['One alert per episode.', 'Rules have hysteresis, bulk events are digested under an hourly cap, and routine news waits for a morning report.'],
+  ['Write down the class, not just the incident.', 'Every painful failure gets a five-line entry, so the second occurrence triggers the structural fix.'],
+];
+
+const lessons = [
+  {
+    title: 'A dry run that bricked deployments',
+    text: "Ansible skips HTTP calls in check mode, so a task reading the skipped call's JSON crashed the deploy controller's safety check, and every release rolled itself back.",
+    fix: 'Fix: live-API phases are gated out of check mode, and a test scans every role for the pattern.',
+  },
+  {
+    title: 'Absence is not deletion',
+    text: 'When the cloud archive mount dropped, apps saw 759 archived files as deleted, and a library clean-up erased the records for all of them.',
+    fix: 'Fix: every destructive job checks an archive health canary first and treats a stale canary as unsafe.',
+  },
+  {
+    title: 'Power faults only show up over time',
+    text: 'A second bus-powered SSD passed a load test and two reboots, then vanished on the third with no warning in the logs.',
+    fix: 'Fix: a powered hub. Only elapsed time proves a marginal power budget.',
+  },
+  {
+    title: '480 notifications buried the one that mattered',
+    text: 'An outage produced one push per affected file. The alert explaining the outage was lost in the flood.',
+    fix: 'Fix: producers write to a spool, a digest sends a few messages an hour at most, and routine items go to a daily report.',
+  },
+  {
+    title: '"High CPU" was really a log flood',
+    text: 'A stale retry loop wrote about 100 errors a second for 30 hours. The only symptom was a CPU alert flapping at its threshold.',
+    fix: 'Fix: a log-rate rule names the flood directly, and CPU alerts hold one episode open instead of flapping.',
+  },
+];
+---
+
+<Base
+  title="One Raspberry Pi, forty containers — a homelab run like production"
+  description="How a single Raspberry Pi 4B runs a media stack, observability, single sign-on and a small ML platform, managed with Ansible and released from git tags."
+>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="/"><img src="/favicon.svg" alt="" />pi-homelab</a>
+      <nav class="topnav">
+        <a href="#stack">Stack</a>
+        <a href="#pipeline">Pipeline</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#lessons">Lessons</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="wrap">
+        <p class="eyebrow">Raspberry Pi 4B · 8 GB RAM · 1.8 TB SSD</p>
+        <h1>One small board.<br /><span class="accent">Run like production.</span></h1>
+        <p class="lead">
+          A credit-card-sized computer runs a home's media, DNS, single sign-on, monitoring and a small
+          machine-learning platform, with a laptop helping on the heavy lifting. Nothing was set up by
+          hand: every change is code, checked by tests and released from a git tag. The working repository
+          is private because it also runs personal services; the public one is a snapshot of its Ansible
+          layout and core roles.
+        </p>
+        <div class="hero-cta">
+          <a class="btn primary" href="https://github.com/aemreusta/pi-homelab">Public snapshot →</a>
+          <a class="btn" href="#lessons">Read the lessons</a>
+        </div>
+        <div class="stats">
+          {stats.map((s) => (
+            <div class="stat"><b>{s.value}</b><span>{s.label}</span></div>
+          ))}
+        </div>
+      </div>
+    </section>
+
+    <section id="stack">
+      <div class="wrap">
+        <p class="eyebrow">What runs on it</p>
+        <h2>Forty containers on four ARM cores</h2>
+        <p class="section-intro">
+          Memory caps are deliberately overcommitted: they contain a runaway rather than reserve RAM,
+          and zram swap absorbs bursts. The real budget is watched as working set and swap growth, not
+          as the sum of the limits.
+        </p>
+        <div class="grid">
+          {stacks.map((s) => (
+            <article class="card">
+              <span class="icon" aria-hidden="true">{s.icon}</span>
+              <h3>{s.title}</h3>
+              <p>{s.text}</p>
+              <ul class="tags">{s.tags.map((t) => <li>{t}</li>)}</ul>
+            </article>
+          ))}
+        </div>
+      </div>
+    </section>
+
+    <section id="pipeline">
+      <div class="wrap">
+        <p class="eyebrow">How changes ship</p>
+        <h2>GitOps, with a seatbelt</h2>
+        <p class="section-intro">
+          A push to <code>master</code> only runs CI. A controller on the Pi deploys the commit the newest
+          <code>deploy-v*</code> tag points at, applies just the roles that changed, and rolls the whole
+          release back if anything fails.
+        </p>
+        <ol class="flow flow-wrap">
+          {pipeline.map((p) => (
+            <li><b>{p.title}</b><span>{p.text}</span></li>
+          ))}
+        </ol>
+        <div class="split">
+          <div>
+            <h3>House rules</h3>
+            <ul class="checklist">
+              {principles.map(([head, body]) => (
+                <li><b>{head}</b> {body}</li>
+              ))}
+            </ul>
+          </div>
+          <div class="diagram mono" aria-label="Release flow">
+            <div class="box"><b>git push</b> → CI (pytest · bats · go test · ansible-lint)</div>
+            <div class="arrow">↓ tag deploy-v2026.10.20.1</div>
+            <div class="box"><b>Pi controller</b> → syntax check → --check --diff</div>
+            <div class="arrow">↓ changed roles only</div>
+            <div class="box"><b>apply</b> → verify → last-good marker</div>
+            <div class="arrow">↓ on failure</div>
+            <div class="box"><b>rollback</b> → held state → phone alert</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <div class="wrap">
+        <p class="eyebrow">Doing more with less</p>
+        <h2>The Pi orchestrates; others do the heavy work</h2>
+        <div class="split">
+          <div>
+            <h3>A laptop as a compute node</h3>
+            <p class="section-intro">
+              Video transcoding runs on a MacBook's hardware HEVC encoder through a native Tdarr node,
+              and so do preview and sprite generation, all reading the Pi's disk over NFS. The Pi only
+              coordinates. A transcode is kept only when its length still matches the source, and files
+              typically shrink by more than half. Because the laptop sleeps and travels, presence
+              detection quiets the alerts that depend on it, and its workers retry on their own.
+            </p>
+            <h3>A cloud archive at the original paths</h3>
+            <p class="section-intro">
+              Cold files move to cloud storage behind an rclone mount, and a mergerfs union keeps them at
+              their original paths, so no app notices. The design is fail-safe: if the cloud side
+              disappears, local files stay intact and archived titles are merely absent. A local copy is
+              deleted only after a checksum match. Uploads go through <b>homelab-rclone</b>, a Google Drive
+              client used only by this server for its owner's Drive; see the <a href="/privacy/">privacy policy</a>.
+            </p>
+          </div>
+          <div class="diagram mono" aria-label="Storage and compute layout">
+            <div class="box"><b>Raspberry Pi 4B</b><br />Docker · Ansible target · NFS server<br />1.8 TB SSD, one filesystem (hardlinks)</div>
+            <div class="arrow">⇅ NFS</div>
+            <div class="box"><b>MacBook (when home)</b><br />Tdarr node · HEVC via VideoToolbox<br />preview &amp; sprite workers</div>
+            <div class="arrow">⇅ rclone + mergerfs</div>
+            <div class="box"><b>Cloud archive</b><br />read-only branch of the library<br />absent ≠ deleted</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="lessons">
+      <div class="wrap">
+        <p class="eyebrow">Lessons the Pi taught</p>
+        <h2>Small hardware, real incidents</h2>
+        <p class="section-intro">
+          Each of these has an incident write-up and a structural fix in the working repository; most
+          also have a regression test.
+        </p>
+        <div class="lessons">
+          {lessons.map((l) => (
+            <article class="lesson">
+              <h3>{l.title}</h3>
+              <p>{l.text}</p>
+              <p class="fix">{l.fix}</p>
+            </article>
+          ))}
+        </div>
+      </div>
+    </section>
+  </main>
+</Base>

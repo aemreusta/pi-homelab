@@ -1,0 +1,15 @@
+---
+filebrowser_compose_dir: /home/{{ docker_user }}/docker/core/filebrowser
+filebrowser_config_dir: /home/{{ docker_user }}/docker/core/filebrowser/config
+filebrowser_tz: "{{ timezone }}"
+# Root directory exposed by FileBrowser
+filebrowser_root: /srv
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+filebrowser_mem_limit: 128M
+
+# --- Container security hardening ---
+filebrowser_pids_limit: 50
+filebrowser_cap_drop:
+  - ALL
+filebrowser_cap_add: []

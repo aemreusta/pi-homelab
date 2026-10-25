@@ -1,0 +1,13 @@
+# MLflow tracking server + the drivers its slim image omits.
+# Operator directive: no version pinning — track latest. `build: always` reinstalls
+# on every deploy. All carry arm64 wheels (psycopg, boto3, mlflow).
+mlflow
+# SQLAlchemy 2.1 maps a bare postgresql:// URI to the psycopg (v3) dialect. With
+# only psycopg2-binary, the 2026-10-03 rebuild crash-looped on
+# "No module named 'psycopg'" (tests/test_mlflow_image.py pins this).
+psycopg[binary]
+boto3
+# --expose-prometheus needs the Flask exporter (pulls prometheus-client); MLflow
+# serves /metrics on the main port via GunicornInternalPrometheusMetrics so
+# vmagent can scrape it (drives up{job="mlflow"}). Unpinned like the drivers.
+prometheus-flask-exporter

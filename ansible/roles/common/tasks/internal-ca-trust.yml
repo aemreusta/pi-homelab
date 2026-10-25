@@ -1,0 +1,26 @@
+---
+# Install the homelab internal CA root into the Pi's system trust store so any
+# host-side TLS client (curl, python, future https senders) validates
+# *.example certs. The root is generated + fetched by the traefik role into
+# roles/common/files/homelab-ca.crt. Gated on that file existing so a fresh
+# `make base` (run before traefik) simply skips until the CA exists.
+#
+# Not strictly required by the current migration (ntfy senders stay on http),
+# but correct hygiene and needed if any host script later moves to https.
+
+- name: Check whether the internal CA root has been generated yet
+  ansible.builtin.stat:
+    path: "{{ role_path }}/files/homelab-ca.crt"
+  delegate_to: localhost
+  become: false
+  register: common_homelab_ca_local
+
+- name: Install homelab internal CA into the host trust store
+  when: common_homelab_ca_local.stat.exists
+  ansible.builtin.copy:
+    src: homelab-ca.crt
+    dest: /usr/local/share/ca-certificates/homelab-ca.crt
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Update CA certificates

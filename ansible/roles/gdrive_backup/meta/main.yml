@@ -1,0 +1,9 @@
+---
+dependencies: []
+
+galaxy_info:
+  role_name: gdrive_backup
+  author: homelab
+  description: Off-site backup of /srv/backups to Google Drive via rclone (encrypted)
+  license: MIT
+  min_ansible_version: "2.14"

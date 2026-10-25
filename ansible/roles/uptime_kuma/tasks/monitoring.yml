@@ -1,0 +1,34 @@
+---
+# Config-drift detection: weekly compare of the live monitor set vs the
+# committed backup JSON. Closes the "source of truth silently diverges" gap.
+# See templates/uptime-kuma-drift.sh.j2 + the UptimeKumaConfigDrift vmalert.
+
+- name: Deploy the committed Uptime Kuma backup JSON to the Pi (drift baseline)
+  ansible.builtin.template:
+    src: uptime-kuma-backup.json.j2
+    dest: "{{ uptime_kuma_compose_dir }}/uptime-kuma-backup.json"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+
+- name: Deploy Uptime Kuma drift-check script
+  ansible.builtin.template:
+    src: uptime-kuma-drift.sh.j2
+    dest: /usr/local/bin/uptime-kuma-drift.sh
+    owner: root
+    group: root
+    mode: "0700"  # embeds the metrics API key
+
+# Daily, not weekly. Config drift genuinely is a slow signal, but this script
+# now also probes the notification target (see probe_notify_targets), and a
+# monitoring stack that cannot reach its own notifier must not stay green for
+# up to seven days — which is exactly how the dead ntfy.example host went
+# unnoticed for three weeks. The run is one curl + one sqlite read; daily is free.
+- name: Schedule daily Uptime Kuma drift + notify-target check (09:30)
+  ansible.builtin.cron:
+    name: "uptime-kuma-drift"
+    minute: "30"
+    hour: "9"
+    weekday: "*"
+    job: "/usr/local/bin/uptime-kuma-drift.sh"
+    user: root

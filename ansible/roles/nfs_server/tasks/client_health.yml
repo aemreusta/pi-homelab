@@ -1,0 +1,84 @@
+---
+- name: Provision readable NFS sentinel in each export
+  ansible.builtin.copy:
+    content: "homelab-nfs-v1\n"
+    dest: "{{ item.path }}/.homelab-nfs-probe"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0644"
+  loop: "{{ nfs_server_exports }}"
+
+- name: Install native NFS client metrics parser
+  ansible.builtin.copy:
+    src: nfs_client_metrics.py
+    dest: /usr/local/bin/nfs_client_metrics.py
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install NFS client metrics collector
+  ansible.builtin.template:
+    src: nfs-client-metrics.sh.j2
+    dest: /usr/local/bin/nfs-client-metrics.sh
+    owner: root
+    group: root
+    mode: "0755"
+    validate: /bin/bash -n %s
+
+- name: Collect native NFS read health every two minutes
+  ansible.builtin.cron:
+    name: Native Mac NFS health
+    minute: "*/2"
+    job: /usr/local/bin/nfs-client-metrics.sh
+    user: root
+
+# The presence cron execs `homelab-agent mac-presence`. Prove the installed
+# binary has that subcommand before installing a cron that depends on it (an
+# older binary prints usage and exits 1 every minute, leaving the collector
+# stale). Missing → `make homelab-runtime`. Skipped under --check: the CD's
+# deep check runs before homelab-runtime is applied in the same release.
+- name: Probe homelab-agent for mac-presence support
+  ansible.builtin.command:
+    argv:
+      - "{{ homelab_runtime_binary | default('/usr/local/bin/homelab-agent') }}"
+      - mac-presence
+      - --probe
+  register: nfs_server_mac_presence_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Fail when homelab-agent cannot run mac-presence
+  ansible.builtin.assert:
+    that:
+      - nfs_server_mac_presence_probe.rc == 0
+    fail_msg: >-
+      {{ homelab_runtime_binary | default('/usr/local/bin/homelab-agent') }} is
+      missing or predates `mac-presence` — run `make homelab-runtime` first
+      (rc={{ nfs_server_mac_presence_probe.rc }}).
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Create Mac presence state directory
+  ansible.builtin.file:
+    path: "{{ nfs_server_mac_presence_state | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Probe Mac worker presence every minute
+  ansible.builtin.cron:
+    name: Mac worker presence
+    minute: "*"
+    job: >-
+      /usr/bin/flock -n /run/lock/mac-presence.lock
+      /usr/bin/timeout 30s
+      {{ homelab_runtime_binary | default('/usr/local/bin/homelab-agent') }} mac-presence
+      --targets {{ nfs_server_mac_presence_targets | join(',') }}
+      --state {{ nfs_server_mac_presence_state }}
+      --textfile {{ nfs_server_mac_presence_textfile }}
+      --fail-threshold {{ nfs_server_mac_presence_fail_threshold }}
+      --timeout {{ nfs_server_mac_presence_timeout }}
+      >/dev/null 2>&1
+    user: root

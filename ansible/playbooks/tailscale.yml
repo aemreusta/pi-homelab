@@ -1,0 +1,6 @@
+---
+- name: Deploy Tailscale VPN
+  hosts: pi
+  become: true
+  roles:
+    - tailscale

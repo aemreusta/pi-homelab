@@ -1,0 +1,146 @@
+#!/bin/bash
+# /usr/local/bin/pid-budget-alert.sh
+# Per-container PID budget alerting via the kernel's cgroup-v2 counter
+# (`pids.current` / `pids.max` under /sys/fs/cgroup). Mirrors the
+# trajectory-toward-failure pattern that the unhealthy-watchdog and
+# memory-alert scripts use:
+#
+#   - warn when pids.current / pids.max ≥ {{ common_pid_budget_warn_pct | default(70) }} %
+#   - urgent when ≥ {{ common_pid_budget_crit_pct | default(90) }} %
+#   - 24 h cooldown per container per severity, with a clear event when
+#     usage drops back below WARN (re-arms next escalation)
+#
+# Why a separate script and not vmalert? No vmalert deployment yet; this
+# uses the same ntfy + state-file pattern as memory-alert.sh.j2 so it
+# costs ~50 lines and zero new services. Sprint 016 Item B.
+#
+# Managed by Ansible (common role) — do not edit manually.
+
+set -uo pipefail
+
+NTFY_URL="{{ ntfy_external_topic_url }}"
+WARN={{ common_pid_budget_warn_pct | default(70) }}
+CRIT={{ common_pid_budget_crit_pct | default(90) }}
+COOLDOWN_HOURS={{ common_pid_budget_cooldown_hours | default(24) }}
+STATE_DIR="{{ common_alert_state_dir | default('/var/lib/homelab') }}"
+LOG=/var/log/pid-budget-alert.log
+BESZEL_URL="http://{{ beszel_hostname }}:{{ beszel_port | default(8090) }}"
+
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+mkdir -p "$STATE_DIR"
+
+# Witness line: proves the 15-min cron fired even if all containers are
+# well under their PID budget (the common case post-2026-05-21 mitigations).
+alert_event "pid-budget-alert" run ok "warn=${WARN}" "crit=${CRIT}"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M') $*" >> "$LOG"
+}
+
+# State per container: "<last_fire_ts>\n<last_pct>\n<fired_severity>"
+# fired_severity: 0 = quiet, 1 = warned, 2 = crit. Drives clear-event logic.
+read_state() {
+    local sf="$1"
+    if [ -f "$sf" ]; then
+        cat "$sf"
+    else
+        printf "0\n0\n0\n"
+    fi
+}
+
+write_state() {
+    local sf="$1" ts="$2" pct="$3" sev="$4"
+    printf "%s\n%s\n%s\n" "$ts" "$pct" "$sev" > "$sf"
+}
+
+ntfy() {
+    local title="$1" prio="$2" tags="$3" body="$4"
+    ntfy_send "pid-budget" \
+        -H "Title: ${title}" \
+        -H "Priority: ${prio}" \
+        -H "Tags: ${tags}" \
+        -H "Actions: view, Open Beszel, ${BESZEL_URL}, clear=true" \
+        -d "${body}" \
+        "$NTFY_URL" || true
+}
+
+NOW=$(date +%s)
+
+# Iterate every running container that has a cgroup PID limit.
+docker ps --format '{{ "{{" }}.Names{{ "}}" }}' | while read -r name; do
+    [ -z "$name" ] && continue
+    cid=$(docker inspect "$name" -f '{{ "{{" }}.Id{{ "}}" }}' 2>/dev/null) || continue
+    scope="/sys/fs/cgroup/system.slice/docker-${cid}.scope"
+    [ -d "$scope" ] || continue
+
+    current=$(cat "$scope/pids.current" 2>/dev/null || echo 0)
+    max_raw=$(cat "$scope/pids.max" 2>/dev/null || echo "max")
+
+    # `max` means no limit set → skip (nothing to budget against).
+    [ "$max_raw" = "max" ] && continue
+    [ "$max_raw" -gt 0 ] 2>/dev/null || continue
+
+    pct=$(( current * 100 / max_raw ))
+    sf="$STATE_DIR/pid-budget-${name}.state"
+
+    mapfile -t s < <(read_state "$sf")
+    last_ts=${s[0]:-0}
+    last_sev=${s[2]:-0}
+    age_hours=$(( (NOW - last_ts) / 3600 ))
+
+    # Determine current severity from pct
+    if [ "$pct" -ge "$CRIT" ]; then
+        sev=2
+    elif [ "$pct" -ge "$WARN" ]; then
+        sev=1
+    else
+        sev=0
+    fi
+
+    case "$sev" in
+        2)  # CRIT path — re-fire only if escalating or cooldown expired
+            if [ "$last_sev" != "2" ] || [ "$age_hours" -ge "$COOLDOWN_HOURS" ]; then
+                ntfy "PID budget CRIT: ${name} ${pct}%" "urgent" "rotating_light,gear" \
+                    "${name} using ${current}/${max_raw} PIDs (${pct}%). Restart imminent if this climbs further."
+                write_state "$sf" "$NOW" "$pct" 2
+                log "[CRIT] ${name} ${current}/${max_raw} (${pct}%)"
+            else
+                write_state "$sf" "$last_ts" "$pct" 2
+            fi
+            ;;
+        1)  # WARN path — re-fire only if rising into warn from quiet, or cooldown
+            if [ "$last_sev" = "0" ] || [ "$age_hours" -ge "$COOLDOWN_HOURS" ]; then
+                ntfy "PID budget warn: ${name} ${pct}%" "high" "warning,gear" \
+                    "${name} using ${current}/${max_raw} PIDs (${pct}%). Trending toward limit."
+                write_state "$sf" "$NOW" "$pct" 1
+                log "[WARN] ${name} ${current}/${max_raw} (${pct}%)"
+            else
+                write_state "$sf" "$last_ts" "$pct" "$last_sev"
+            fi
+            ;;
+        0)  # Quiet path — if previously firing, send a single clear event then re-arm
+            if [ "$last_sev" != "0" ]; then
+                ntfy "PID budget recovered: ${name} ${pct}%" "low" "white_check_mark,gear" \
+                    "${name} dropped to ${current}/${max_raw} PIDs (${pct}%). Alert cleared."
+                log "[CLEARED] ${name} ${current}/${max_raw} (${pct}%) was sev=${last_sev}"
+            fi
+            write_state "$sf" "$NOW" "$pct" 0
+            ;;
+    esac
+done
+
+# State-file GC: prune state for containers that no longer exist.
+# Mirror of the same logic in unhealthy-watchdog.sh. Sprint 017 Story 2.
+mapfile -t EXISTING < <(docker ps -a --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null)
+for sf in "$STATE_DIR"/pid-budget-*.state; do
+    [ -f "$sf" ] || continue
+    name=${sf##*/pid-budget-}
+    name=${name%.state}
+    if ! printf '%s\n' "${EXISTING[@]}" | grep -qFx "$name"; then
+        log "[GC] orphaned state for ${name} (container absent) — removing"
+        rm -f "$sf"
+    fi
+done
+
+# Log rotation handled by /etc/logrotate.d/pid-budget-alert (weekly×4).

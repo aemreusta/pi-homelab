@@ -1,0 +1,65 @@
+---
+# Enforce Jellyfin's playback policy — the "direct play only" constraint that
+# CLAUDE.md has always documented and nothing has ever applied.
+#
+# Live state before this file existed (2026-09-03):
+#   EnableVideoPlaybackTranscoding = True
+# i.e. the box would happily start a software 1080p encode. It did: 16 of them
+# in 26 minutes, each OOM-killed at the container cap, each retried by the
+# client. See docs/incidents/2026-09-03-jellyfin-probe-oom-forced-transcode-loop.md.
+#
+# This is defence in depth, NOT the root-cause fix — the root cause was the
+# ffprobe OOM (see media_mem_jellyfin in defaults/main.yml). It is what keeps
+# the next unprobeable or genuinely-incompatible title from turning into a
+# multi-hour encode now that the cap is high enough for one to survive.
+#
+# Whole-file precondition: this phase is live-API only and is therefore
+# excluded from check mode by the gate in main.yml (2026-07-02 uri-skip class).
+
+- name: Wait until the Jellyfin API serves JSON
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ media_jellyfin_port }}/System/Info"
+    headers:
+      Authorization: 'MediaBrowser Token="{{ vault_jellyfin_api_key }}"'
+    timeout: 30
+  register: media_jellyfin_info
+  until: "'json' in media_jellyfin_info"
+  retries: 24
+  delay: 5
+
+- name: Read Jellyfin users and their current policies
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ media_jellyfin_port }}/Users"
+    headers:
+      Authorization: 'MediaBrowser Token="{{ vault_jellyfin_api_key }}"'
+    timeout: 30
+  register: media_jellyfin_users
+  until: "'json' in media_jellyfin_users"
+  retries: 12
+  delay: 5
+
+# POST /Users/{id}/Policy replaces the WHOLE UserPolicy object — a partial body
+# would null out every field it omits (library access, parental rating, session
+# limits, …). So merge the three managed keys onto the policy Jellyfin just
+# handed back, and only POST when at least one of them actually differs. That
+# keeps the task idempotent and keeps operator-managed policy fields intact.
+- name: Enforce direct-play playback policy for each Jellyfin user
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ media_jellyfin_port }}/Users/{{ item.Id }}/Policy"
+    method: POST
+    headers:
+      Authorization: 'MediaBrowser Token="{{ vault_jellyfin_api_key }}"'
+    body_format: json
+    body: "{{ item.Policy | combine(media_jellyfin_playback_policy) }}"
+    status_code: [200, 204]
+    timeout: 30
+  loop: "{{ media_jellyfin_users.json }}"
+  loop_control:
+    label: "{{ item.Name }}"
+  when: >-
+    item.Policy | combine(media_jellyfin_playback_policy) != item.Policy
+  vars:
+    media_jellyfin_playback_policy:
+      EnableVideoPlaybackTranscoding: "{{ media_jellyfin_enable_video_transcoding | bool }}"
+      EnableAudioPlaybackTranscoding: "{{ media_jellyfin_enable_audio_transcoding | bool }}"
+      EnablePlaybackRemuxing: "{{ media_jellyfin_enable_playback_remuxing | bool }}"

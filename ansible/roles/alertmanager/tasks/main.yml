@@ -1,0 +1,14 @@
+---
+- name: Include Alertmanager deploy tasks
+  ansible.builtin.include_tasks:
+    file: deploy.yml
+    apply:
+      tags: [alertmanager]
+  tags: [alertmanager]
+
+- name: Include Alertmanager UFW tasks
+  ansible.builtin.include_tasks:
+    file: ufw.yml
+    apply:
+      tags: [alertmanager, firewall]
+  tags: [alertmanager, firewall]

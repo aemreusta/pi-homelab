@@ -1,0 +1,6 @@
+---
+- name: Deploy Homelab Control API
+  hosts: homelab
+  become: true
+  roles:
+    - role: homelab_control

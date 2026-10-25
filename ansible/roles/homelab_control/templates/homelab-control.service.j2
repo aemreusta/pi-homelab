@@ -1,0 +1,17 @@
+[Unit]
+Description=Homelab Control API
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User={{ docker_user }}
+Group={{ docker_user }}
+ExecStart=/usr/bin/python3 {{ homelab_control_dir }}/control-api.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

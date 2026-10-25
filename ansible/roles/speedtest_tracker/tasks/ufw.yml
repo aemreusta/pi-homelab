@@ -1,0 +1,17 @@
+---
+- name: Allow Speedtest Tracker through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ speedtest_tracker_port }}"
+    proto: tcp
+    from_ip: "{{ lan_subnet }}"
+    comment: Speedtest Tracker
+
+# One-time reconciliation of the pre-2026-07-14 Anywhere rule (see media role
+# ufw.yml). Idempotent no-op once removed.
+- name: Remove superseded Anywhere rule (migrated to LAN scope, Phase 0)
+  community.general.ufw:
+    rule: allow
+    port: "{{ speedtest_tracker_port }}"
+    proto: tcp
+    delete: true

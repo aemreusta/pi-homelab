@@ -1,0 +1,56 @@
+#!/bin/bash
+# alert-lib.sh — Shared notification audit helpers for host-side cron alert scripts.
+# Managed by Ansible (common role) — do not edit manually.
+#
+# Provides:
+#   ntfy_send <script_name> [curl_args...]
+#       Wraps curl to ntfy. Logs ok|fail to ALERT_LOG with HTTP code.
+#       Returns 0 for 2xx, 1 otherwise. All curl args are passed through.
+#
+#   alert_event <script_name> <step> <status> [k=v ...]
+#       Writes a structured logfmt line to ALERT_LOG. No stdout.
+#
+# Env vars:
+#   ALERT_LOG (default /var/log/alert-audit.log)
+
+: "${ALERT_LOG:=/var/log/alert-audit.log}"
+
+alert_event() {
+    local script="${1:-unknown}" step="${2:-unknown}" status="${3:-unknown}"
+    shift 3 2>/dev/null || true
+    local ts kv=""
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    for arg in "$@"; do
+        kv="${kv} ${arg}"
+    done
+    local line="${ts} script=${script} step=${step} status=${status}${kv}"
+    if [ -w "$ALERT_LOG" ] || { [ ! -e "$ALERT_LOG" ] && [ -w "$(dirname "$ALERT_LOG")" ]; }; then
+        echo "$line" >> "$ALERT_LOG"
+    else
+        # Cron's stderr goes to root's mail (which isn't configured here), so
+        # without this fallback the audit line vanishes. Use logger so it
+        # lands in journald: `journalctl -t alert-lib` to recover.
+        if command -v logger >/dev/null 2>&1; then
+            logger -p user.err -t alert-lib "cannot write $ALERT_LOG: $line"
+        else
+            echo "alert-lib: cannot write $ALERT_LOG: $line" >&2
+        fi
+    fi
+}
+
+ntfy_send() {
+    # Usage: ntfy_send <script_name> [curl_args...]
+    # All curl args (headers, -d, URL) are passed through after script_name.
+    # NOTE: do NOT pass -f to curl — it masks the HTTP code on >=400 with curl
+    # exit code 22, defeating the audit log. We branch on the real HTTP code.
+    local script="$1"; shift
+    local http_code="000"
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$@" 2>/dev/null) || true
+    if [ "$http_code" -ge 200 ] 2>/dev/null && [ "$http_code" -lt 300 ] 2>/dev/null; then
+        alert_event "$script" ntfy_send ok "http=${http_code}"
+        return 0
+    else
+        alert_event "$script" ntfy_send fail "http=${http_code}"
+        return 1
+    fi
+}

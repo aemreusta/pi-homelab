@@ -1,0 +1,57 @@
+---
+storage_owner: pi
+storage_group: pi
+
+# Enforce the single-filesystem invariant across /srv/downloads and /srv/media
+# (required for Sonarr/Radarr hardlinks; cross-device links fail with EXDEV).
+storage_enforce_single_fs: true
+storage_hardlink_paths:
+  - /srv/downloads
+  - /srv/media
+
+storage_directories:
+  - /srv/docker
+  - /srv/media
+  - /srv/media/movies
+  - /srv/media/series
+  - /srv/downloads
+  - /srv/downloads/incomplete
+  - /srv/backups
+  - /srv/transcode-cache
+
+# Empty/legacy paths to remove on every run. /srv/downloads/complete was a
+# qBittorrent default that's not referenced by any current category
+# (qbittorrent-categories.json maps radarr→/data/downloads/movies,
+# sonarr→/data/downloads/series). qBit auto-creates per-category dirs as torrents land,
+# so pre-creating them is unnecessary.
+storage_obsolete_directories:
+  - /srv/downloads/complete
+
+# --- Second data disk: Kingston XS1000, 931 GiB, USB 2.0 (design 042) ---
+# Capacity relief for a root filesystem sitting at 97%. Mounted by UUID and
+# bind-mounted into /srv so container paths are unaffected.
+#
+# DISABLED 2026-08-02 after FIVE outages. The Pi cannot power two bus-powered
+# USB SSDs — not on USB3, not on USB2, not at boot, not under sustained load.
+# The drive now lives on the Mac. See docs/conventions/pi4-usb-power-budget.md.
+#
+# `false` is an active teardown, not just a skip: ssd2.yml unbinds /srv/backups,
+# unmounts /mnt/ssd2 and REMOVES both fstab entries. That matters — a leftover
+# fstab entry would silently remount the drive the moment it was plugged back
+# in, which is exactly how this Pi gets taken down.
+#
+# Flip back to true ONLY behind a powered USB3 hub, and move backup_root +
+# backup_require_mountpoint back with it.
+storage_ssd2_enabled: false
+storage_ssd2_uuid: e0a84509-3df7-4cc5-9ecf-52e82c579899
+storage_ssd2_mount: /mnt/ssd2
+storage_ssd2_fstype: ext4
+# device-timeout caps how long boot waits for a drive that may not be there.
+storage_ssd2_opts: defaults,noatime,nofail,x-systemd.device-timeout=30
+
+# Subdirectories on ssd2, bind-mounted into /srv. Phase 2 ships backups only;
+# phases 3-4 (media + downloads together — they are welded by the hardlink
+# invariant — then library overflow) extend this list. See design 042 §3.
+storage_ssd2_binds:
+  - src: backups
+    dest: /srv/backups

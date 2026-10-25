@@ -1,0 +1,116 @@
+#!/bin/bash
+# Weekly speedtest summary — managed by Ansible (speedtest_tracker role).
+# Queries VictoriaMetrics for the {{ speedtest_tracker_report_window | default('7d') }} avg/min/max of
+# download/upload/ping (from the speedtest_tracker_* Prometheus series) and pushes
+# an ntfy summary. Emits a node_exporter textfile metric (silent-cron hard rule).
+#
+# Anomaly DETECTION (slow/degraded/high-ping) lives in vmalert rules
+# (observability-services.yml) — this script is the human-readable weekly digest,
+# not an alerter. If the VM query fails or returns no data it logs a failure and
+# SKIPS the push (never reports a misleading "0 Mbps").
+
+set -uo pipefail
+
+NTFY_URL="{{ ntfy_external_topic_url }}"
+VM_URL="{{ speedtest_tracker_vm_url | default('http://127.0.0.1:8428') }}"
+WINDOW="{{ speedtest_tracker_report_window | default('7d') }}"
+TEXTFILE_DIR="{{ common_node_exporter_textfile_dir | default('/var/lib/node_exporter/textfile') }}"
+TEXTFILE="${TEXTFILE_DIR}/speedtest_weekly_report.prom"
+
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+
+# Query VM for every stat. Prints "key value" lines (Mbps / ms) on success;
+# exits 1 (empty stdout) on any HTTP error or empty result set.
+raw=$(VM_URL="$VM_URL" WINDOW="$WINDOW" python3 - <<'PY'
+import json, os, sys, urllib.parse, urllib.request
+
+vm = os.environ["VM_URL"].rstrip("/")
+window = os.environ["WINDOW"]
+
+
+def query(expr):
+    url = vm + "/api/v1/query?query=" + urllib.parse.quote(expr)
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        doc = json.load(resp)
+    if doc.get("status") != "success":
+        raise RuntimeError("query status != success")
+    result = doc.get("data", {}).get("result", [])
+    if not result:
+        raise RuntimeError("empty result")
+    return float(result[0]["value"][1])
+
+
+metrics = (
+    ("download", "speedtest_tracker_download_bits", 1e6),  # bits/s -> Mbps
+    ("upload", "speedtest_tracker_upload_bits", 1e6),
+    ("ping", "speedtest_tracker_ping_ms", 1.0),
+)
+try:
+    lines = []
+    for name, metric, divisor in metrics:
+        for agg in ("avg", "min", "max"):
+            value = query(f"{agg}_over_time({metric}[{window}])") / divisor
+            lines.append(f"{name}_{agg} {value:.2f}")
+    lines.append("samples %d" % int(query(f"count_over_time(speedtest_tracker_download_bits[{window}])")))
+    sys.stdout.write("\n".join(lines) + "\n")
+except Exception as exc:  # noqa: BLE001 - any failure means "skip the push"
+    sys.stderr.write(f"speedtest weekly query failed: {exc}\n")
+    sys.exit(1)
+PY
+) || {
+    alert_event "speedtest-weekly-report" query fail "vm=${VM_URL}"
+    exit 0
+}
+
+# Parse "key value" lines into an associative array.
+declare -A S
+while read -r key value; do
+    [ -n "$key" ] && S["$key"]="$value"
+done <<< "$raw"
+
+alert_event "speedtest-weekly-report" query ok \
+    "dl_avg=${S[download_avg]:-?}" "ul_avg=${S[upload_avg]:-?}" "ping_avg=${S[ping_avg]:-?}" "samples=${S[samples]:-0}"
+
+msg="**${WINDOW} average**
+↓ ${S[download_avg]:-?} Mbps  (min ${S[download_min]:-?} / max ${S[download_max]:-?})
+↑ ${S[upload_avg]:-?} Mbps  (min ${S[upload_min]:-?} / max ${S[upload_max]:-?})
+ping ${S[ping_avg]:-?} ms  (max ${S[ping_max]:-?})
+
+${S[samples]:-0} tests this period."
+
+ntfy_send "speedtest-weekly-report" \
+    -H "Title: Weekly Internet Speed" \
+    -H "Tags: bar_chart,satellite" \
+    -H "Markdown: yes" \
+    -d "$msg" \
+    "$NTFY_URL" || alert_event "speedtest-weekly-report" ntfy fail
+
+# ── Observability: atomic textfile emit (silent-cron hard rule) ──────────
+numeric() { case "$1" in ''|*[!0-9.]*) echo 0 ;; *) echo "$1" ;; esac; }
+if [ -d "$TEXTFILE_DIR" ]; then
+    tmp="${TEXTFILE}.$$"
+    if {
+        echo "# HELP speedtest_weekly_report_last_run_unix_seconds Unix time of the last weekly report run."
+        echo "# TYPE speedtest_weekly_report_last_run_unix_seconds gauge"
+        echo "speedtest_weekly_report_last_run_unix_seconds $(date +%s)"
+        echo "# HELP speedtest_weekly_report_download_avg_mbps ${WINDOW} average download (Mbps)."
+        echo "# TYPE speedtest_weekly_report_download_avg_mbps gauge"
+        echo "speedtest_weekly_report_download_avg_mbps $(numeric "${S[download_avg]:-0}")"
+        echo "# HELP speedtest_weekly_report_upload_avg_mbps ${WINDOW} average upload (Mbps)."
+        echo "# TYPE speedtest_weekly_report_upload_avg_mbps gauge"
+        echo "speedtest_weekly_report_upload_avg_mbps $(numeric "${S[upload_avg]:-0}")"
+        echo "# HELP speedtest_weekly_report_ping_avg_ms ${WINDOW} average ping (ms)."
+        echo "# TYPE speedtest_weekly_report_ping_avg_ms gauge"
+        echo "speedtest_weekly_report_ping_avg_ms $(numeric "${S[ping_avg]:-0}")"
+        echo "# HELP speedtest_weekly_report_samples Tests counted in the window."
+        echo "# TYPE speedtest_weekly_report_samples gauge"
+        echo "speedtest_weekly_report_samples $(numeric "${S[samples]:-0}")"
+    } > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$TEXTFILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+fi
+
+exit 0

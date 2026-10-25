@@ -1,0 +1,70 @@
+---
+- name: Assert PostgreSQL superuser password is set and strong
+  ansible.builtin.assert:
+    that:
+      - postgresql_postgres_password | length >= 12
+    fail_msg: >-
+      vault_postgres_password is unset or too short (>= 12 chars required).
+      Generate one: openssl rand -hex 16
+      Add it to ansible/inventory/group_vars/all/vault.yml. See vault.yml.example.
+    quiet: true
+
+- name: Assert all per-service DB passwords are set
+  ansible.builtin.assert:
+    that:
+      - item.password | length >= 8
+    fail_msg: >-
+      Password for database '{{ item.name }}' user '{{ item.user }}' is unset or
+      too short. Add vault_{{ item.name }}_db_password to vault.yml.
+    quiet: true
+  loop: "{{ postgresql_databases }}"
+  no_log: true
+
+- name: Ensure mlstack_net Docker bridge network
+  community.docker.docker_network:
+    name: "{{ postgresql_network }}"
+    driver: bridge
+
+- name: Create PostgreSQL compose directory
+  ansible.builtin.file:
+    path: "{{ postgresql_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create PostgreSQL data directory (owned by postgres UID 999)
+  # Postgres image runs the daemon as UID 999 (`postgres` user). Data dir must be
+  # owned by 999 before first start — otherwise the container tries CHOWN which
+  # fails with cap_drop ALL.
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: directory
+    owner: "{{ postgresql_puid }}"
+    group: "{{ postgresql_pgid }}"
+    mode: "0700"
+
+- name: Copy PostgreSQL docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ postgresql_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart postgresql
+
+- name: Start PostgreSQL container
+  community.docker.docker_compose_v2:
+    project_src: "{{ postgresql_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"
+
+- name: Wait for PostgreSQL to accept connections
+  ansible.builtin.command:
+    cmd: docker exec postgresql pg_isready -U postgres -d postgres
+  register: postgresql_ready
+  until: postgresql_ready.rc == 0
+  retries: 12
+  delay: 5
+  changed_when: false

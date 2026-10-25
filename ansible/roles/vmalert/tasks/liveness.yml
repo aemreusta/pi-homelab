@@ -1,0 +1,24 @@
+---
+# vmalert liveness check — queries /api/v1/rules + /health, emits textfile
+# metrics. Covers the "process alive but evaluation wedged" gap that docker
+# healthchecks and the dead-man's-switch don't reach.
+
+- name: Deploy vmalert liveness check script
+  ansible.builtin.template:
+    src: vmalert-liveness.sh.j2
+    dest: /usr/local/bin/vmalert-liveness.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule vmalert liveness check
+  ansible.builtin.cron:
+    name: "vmalert-liveness"
+    # Stagger slot 1 — see homelab_cron_stagger_* in group_vars/all.
+    minute: "{{ homelab_cron_stagger_slot_1 }}"
+    hour: "*"
+    day: "*"
+    month: "*"
+    weekday: "*"
+    job: "/usr/local/bin/vmalert-liveness.sh"
+    user: "{{ docker_user }}"

@@ -1,0 +1,54 @@
+---
+- name: Ensure observability docker network
+  community.docker.docker_network:
+    name: "{{ vmalert_network }}"
+    driver: bridge
+
+- name: Create vmalert compose + rules directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  loop:
+    - "{{ vmalert_compose_dir }}"
+    - "{{ vmalert_rules_dir }}"
+    - "{{ vmalert_metrics_rules_dir }}"
+    - "{{ vmalert_logs_rules_dir }}"
+
+- name: Template vmalert metric rule files (PromQL → VictoriaMetrics)
+  ansible.builtin.template:
+    src: "rules/{{ item }}.j2"
+    dest: "{{ vmalert_metrics_rules_dir }}/{{ item }}"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  loop: "{{ vmalert_metric_rule_files }}"
+  notify: Restart vmalert
+
+- name: Template vmalert log rule files (LogsQL → VictoriaLogs)
+  ansible.builtin.template:
+    src: "rules/{{ item }}.j2"
+    dest: "{{ vmalert_logs_rules_dir }}/{{ item }}"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  loop: "{{ vmalert_log_rule_files }}"
+  notify: Restart vmalert
+
+- name: Template vmalert docker-compose
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ vmalert_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart vmalert
+
+- name: Start vmalert containers (metrics + logs)
+  community.docker.docker_compose_v2:
+    project_src: "{{ vmalert_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

@@ -1,0 +1,97 @@
+---
+# vmalert — Rule evaluator. Two instances per the official "one datasource
+# per process" architecture: vmalert-metrics queries VictoriaMetrics
+# (PromQL); vmalert-logs queries VictoriaLogs (LogsQL). Both write state to
+# VictoriaMetrics and fire alerts to the shared Alertmanager.
+# https://docs.victoriametrics.com/vmalert.html
+
+x-vmalert-common: &vmalert-common
+  image: {{ vmalert_image }}
+  restart: unless-stopped
+  init: true
+  mem_limit: {{ vmalert_mem_limit }}
+  pids_limit: {{ vmalert_pids_limit }}
+  read_only: {{ vmalert_read_only | lower }}
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size={{ vmalert_tmpfs_size }}
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+{% for cap in vmalert_cap_drop %}
+    - {{ cap }}
+{% endfor %}
+{% if vmalert_cap_add | length > 0 %}
+  cap_add:
+{% for cap in vmalert_cap_add %}
+    - {{ cap }}
+{% endfor %}
+{% endif %}
+  networks:
+    - {{ vmalert_network }}
+  environment:
+    - TZ={{ vmalert_tz }}
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  vmalert:
+    <<: *vmalert-common
+    container_name: vmalert
+    labels:
+{% for k, v in vmalert_oci_labels.items() %}
+      {{ k }}: "{{ v }}-metrics"
+{% endfor %}
+    ports:
+      - "{{ vmalert_metrics_port }}:8880"
+    volumes:
+      - {{ vmalert_metrics_rules_dir }}:/etc/vmalert/rules:ro
+    command:
+      - --datasource.url={{ vmalert_metrics_datasource_url }}
+      - --remoteWrite.url={{ vmalert_remote_write_url }}
+      - --remoteRead.url={{ vmalert_remote_read_url }}
+      - --notifier.url={{ vmalert_notifier_url }}
+      - --rule=/etc/vmalert/rules/*.yml
+      - --evaluationInterval={{ vmalert_evaluation_interval }}
+      - --httpListenAddr=:8880
+      - --external.url={{ vmalert_metrics_external_url }}
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8880/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  vmalert-logs:
+    <<: *vmalert-common
+    container_name: vmalert-logs
+    labels:
+{% for k, v in vmalert_oci_labels.items() %}
+      {{ k }}: "{{ v }}-logs"
+{% endfor %}
+    ports:
+      - "{{ vmalert_logs_port }}:8880"
+    volumes:
+      - {{ vmalert_logs_rules_dir }}:/etc/vmalert/rules:ro
+    command:
+      - --datasource.url={{ vmalert_logs_datasource_url }}
+      - --remoteWrite.url={{ vmalert_remote_write_url }}
+      - --remoteRead.url={{ vmalert_remote_read_url }}
+      - --notifier.url={{ vmalert_notifier_url }}
+      - --rule=/etc/vmalert/rules/*.yml
+      - --rule.defaultRuleType=vlogs
+      - --evaluationInterval={{ vmalert_evaluation_interval }}
+      - --httpListenAddr=:8880
+      - --external.url={{ vmalert_logs_external_url }}
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8880/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  {{ vmalert_network }}:
+    external: true

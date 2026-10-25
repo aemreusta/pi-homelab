@@ -1,0 +1,36 @@
+---
+ntfy_compose_dir: /home/{{ docker_user }}/docker/core/ntfy
+ntfy_data_dir: /home/{{ docker_user }}/docker/core/ntfy/data
+ntfy_tz: "{{ timezone }}"
+
+# ntfy_port, ntfy_topic, ntfy_hostname, ntfy_external_base_url and
+# ntfy_shoutrrr_url are defined in group_vars/all/main.yml so every role
+# (common, homelab_control, watchtower, beszel, …) sees the same values.
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+ntfy_mem_limit: 128M
+
+# --- Container security hardening ---
+
+ntfy_pids_limit: 200
+ntfy_read_only: true
+ntfy_tmpfs_size: 32m
+
+# ntfy binds port 80 inside the container; with cap_drop ALL we need NET_BIND_SERVICE.
+ntfy_cap_drop:
+  - ALL
+ntfy_cap_add:
+  - NET_BIND_SERVICE
+
+# ntfy joins media_media_net so pipeline scripts (import hooks,
+# qbit-cleanup) can reach ntfy via http://ntfy:80 instead of host IP +
+# hairpin NAT. External network is created by the `media` role.
+ntfy_media_network_name: media_media_net
+
+ntfy_oci_labels:
+  org.opencontainers.image.title: ntfy
+  org.opencontainers.image.description: "ntfy — self-hosted push notification service"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/ntfy/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://ntfy.sh"

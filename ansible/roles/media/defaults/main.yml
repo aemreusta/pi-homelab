@@ -1,0 +1,186 @@
+---
+media_compose_dir: /home/{{ docker_user }}/docker/media
+media_config_dir: /home/{{ docker_user }}/docker/media/config
+
+# Container user/group — must match host user for volume permissions
+media_puid: "1000"
+media_pgid: "1000"
+media_tz: "{{ timezone }}"
+
+# Host paths — all on same filesystem for hardlinks
+media_downloads_path: /srv/downloads
+
+# qBittorrent WebUI port (used by cleanup scripts and other roles)
+media_qbittorrent_ui_port: 8181
+
+# qBittorrent Queue Management (Memory Control)
+# Limits concurrent torrents to prevent memory exhaustion on Pi 4B (8GB RAM)
+# qBittorrent 5's --profile=/config places configuration in this nested path.
+media_qbittorrent_config_dir: "{{ media_config_dir }}/qbittorrent/qBittorrent/config"
+# Preserve the live, operator-selected queue limits (verified 2026-10-11).
+media_qbittorrent_max_active_torrents: 50
+media_qbittorrent_max_active_downloads: 30
+media_qbittorrent_max_active_uploads: 20
+media_qbittorrent_global_max_connections: 500
+media_qbittorrent_max_connections_per_torrent: 100
+
+# Keys the role owns in qBittorrent.conf, with the section each one is inserted
+# under when missing. One list feeds both the drift probe and the edit, so the
+# role stops qBittorrent only when one of these actually differs.
+media_qbittorrent_managed_settings:
+  - {key: 'WebUI\LocalHostAuth', value: 'false', after: '^WebUI\\Port='}
+  - {key: 'WebUI\AuthSubnetWhitelistEnabled', value: 'true', after: '^WebUI\\Port='}
+  - {key: 'WebUI\AuthSubnetWhitelist', value: '127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10', after: '^WebUI\\Port='}
+  - {key: 'WebUI\CSRFProtection', value: 'false', after: '^WebUI\\Port='}
+  - {key: 'WebUI\HostHeaderValidation', value: 'false', after: '^WebUI\\Port='}
+  - {key: 'WebUI\SecureCookie', value: 'false', after: '^WebUI\\Port='}
+  - {key: 'WebUI\SessionTimeout', value: '604800', after: '^WebUI\\Port='}
+  - {key: 'Session\QueueingSystemEnabled', value: 'true', after: '^\[BitTorrent\]'}
+  - {key: 'Session\MaxActiveTorrents', value: "{{ media_qbittorrent_max_active_torrents }}", after: '^\[BitTorrent\]'}
+  - {key: 'Session\MaxActiveDownloads', value: "{{ media_qbittorrent_max_active_downloads }}", after: '^\[BitTorrent\]'}
+  - {key: 'Session\MaxActiveUploads', value: "{{ media_qbittorrent_max_active_uploads }}", after: '^\[BitTorrent\]'}
+  - {key: 'Session\IgnoreSlowTorrentsForQueueing', value: 'true', after: '^\[BitTorrent\]'}
+  - {key: 'Connection\GlobalMaxConnections', value: "{{ media_qbittorrent_global_max_connections }}", after: '^\[Network\]'}
+  - {key: 'Connection\MaxConnectionsPerTorrent', value: "{{ media_qbittorrent_max_connections_per_torrent }}", after: '^\[Network\]'}
+
+# Observe application health and one real browser request; never reset backoff.
+media_indexer_health_enabled: true
+media_indexer_health_prowlarr_url: http://127.0.0.1:9696
+media_indexer_health_byparr_url: http://192.0.2.102:8191
+media_indexer_health_target_url: https://example.com/
+media_indexer_health_timeout: 35s
+media_indexer_health_config: "{{ media_config_dir }}/prowlarr/config.xml"
+media_indexer_health_state: /var/lib/homelab/indexer-health/status.json
+media_indexer_health_textfile: /var/lib/node_exporter/textfile/indexer_health.prom
+media_indexer_health_cron_minute: "9-59/10"
+
+# Container memory limits (requires kernel cgroup_enable=memory)
+# These are enforced by Docker when the memory cgroup controller is available.
+# qBittorrent cap is a CONTAINMENT ceiling, not a working-set reservation:
+# libtorrent RSS scales with active-torrent count (piece-hash + peer/DHT
+# tables), and this box runs hundreds of torrents. Live baseline is ~230 MiB,
+# but the cap is sized — like the other heavy *arr caps — so Docker
+# OOM-kills + `restart: unless-stopped` recovers in ~30 s if it ever runs away,
+# rather than the kernel swap-thrashing the host. Shrink only with that in
+# mind. See docs/conventions/container-mem-limits.md.
+media_mem_qbittorrent: 3072M
+media_mem_sonarr: 512M
+media_mem_radarr: 512M
+media_mem_prowlarr: 512M
+# media_mem_byparr removed 2026-07-13 — byparr moved to the Mac worker
+# (mac-worker/docker-compose.yml). It could not solve Cloudflare on the Pi 4B.
+# Jellyfin's cap is sized by its ffprobe PROBE, not by playback. On library
+# scan Jellyfin shells out to `ffprobe -analyzeduration 200M -probesize 1G`,
+# which buffers up to 1 GiB before it emits a byte of JSON. At 512M the probe
+# of a large remux was OOM-killed by the cgroup (exit 137, empty stdout), and
+# Jellyfin — which parses that stdout as JSON — swallowed the resulting
+# `JsonException` and persisted the item with ZERO MediaStreams. An item with
+# no streams has no direct-play decision to make, so every client fell through
+# to the `live.m3u8` path, where the server emits an HLS command with no `-map`
+# and no codec args: ffmpeg default-encodes h264+aac, i.e. a full software
+# transcode on a box that has no business doing one. 2026-09-03: 16 such
+# transcodes in 26 min, all exit 137, OOMKilled + ContainerMemoryHeadroomCritical.
+# Measured on the live container (32.8 GB / 38 Mbps H.264 remux):
+#   probesize 50M/100M/200M/400M -> exit 0, 56 KB of valid JSON
+#   probesize 1G (what Jellyfin uses) -> exit 137, 0 bytes, memory.peak 512 MiB
+# 2048M = the 1 GiB probe buffer + server heap + headroom. This is one
+# container against its OWN cap — exactly what ContainerMemoryHeadroomCritical
+# says to fix — not a ceiling-sum argument. Idle working set is ~38 MiB, so the
+# steady-state RAM cost of the raise is nil.
+# See docs/incidents/2026-09-03-jellyfin-probe-oom-forced-transcode-loop.md.
+media_mem_jellyfin: 2048M
+
+# --- Jellyfin playback policy (enforced in configure-jellyfin.yml) ---
+# CLAUDE.md's "No transcoding — the Pi lacks hardware transcoding capability"
+# was documentation only until 2026-09-03: nothing set it, and the live user
+# policy had EnableVideoPlaybackTranscoding=True. At 512M a stray transcode
+# died fast; at 2048M it would instead peg all four cores at ~0.1x realtime,
+# which is the worse failure. So the raise above and this policy ship together.
+# Video: never re-encode — the client gets an immediate "no compatible stream"
+#   instead of a Pi-melting encode. Costs burned-in subtitles (they are a video
+#   transcode); flip to true if you ever want those back.
+# Remuxing + audio: KEEP ENABLED. Remux is `-c copy` into another container and
+#   audio (e.g. DTS-HD MA -> AAC) is cheap on this box; together they are what
+#   makes "direct stream" work at all. Disabling them would break more than the
+#   transcode ever did.
+media_jellyfin_enable_video_transcoding: false
+media_jellyfin_enable_audio_transcoding: true
+media_jellyfin_enable_playback_remuxing: true
+
+# Jellyfin HTTP port (host + container; the compose template still hardcodes it)
+media_jellyfin_port: 8096
+
+# Release size selection for Radarr/Sonarr (MB per minute of runtime). Jellyfin
+# here only direct-plays, so a REMUX or full-bitrate BluRay buys nothing but
+# disk: on 2026-10-15 the unbounded Bluray/Remux definitions picked 22-27 GB
+# releases for ordinary films and would have pulled ~2 GB per 22-min sitcom
+# episode. Preferred steers the pick, max rejects outright.
+#   Radarr 35/75  → ~4 GB preferred, ≤9 GB for a 2 h film.
+#   Sonarr 20/50  → ~440 MB preferred / ≤1.1 GB per 22 min; ≤3 GB per hour.
+media_arr_quality_targets:
+  - name: radarr
+    port: 7878
+    # Variable NAME, not the key: a failed loop item is printed verbatim.
+    api_key_var: vault_radarr_api_key
+    sizes:
+      WEBDL-1080p: {min: 0, preferred: 35, max: 75}
+      WEBRip-1080p: {min: 0, preferred: 35, max: 75}
+      Bluray-1080p: {min: 0, preferred: 35, max: 75}
+      HDTV-1080p: {min: 0, preferred: 35, max: 75}
+    # Switched off in the in-use profile only: other profiles may use a Remux
+    # quality as their cutoff, which the API refuses to disallow.
+    profile: HD-1080p
+    disallowed: [Remux-1080p]
+    # 1 = "First": a new grab goes to the top of qBittorrent's queue. At 0
+    # ("Last") every requested film waited behind 100+ queued grabs.
+    # Both fields: "recent" covers only titles released in the last few weeks;
+    # every catalogue film is an "older" grab.
+    priority_fields: [recentMoviePriority, olderMoviePriority]
+  - name: sonarr
+    port: 8989
+    api_key_var: vault_sonarr_api_key
+    sizes:
+      WEBDL-1080p: {min: 4, preferred: 20, max: 50}
+      WEBRip-1080p: {min: 4, preferred: 20, max: 50}
+      Bluray-1080p: {min: 4, preferred: 20, max: 50}
+      HDTV-1080p: {min: 4, preferred: 20, max: 50}
+    profile: HD-1080p
+    disallowed: [Bluray-1080p Remux]
+    priority_fields: [recentTvPriority, olderTvPriority]
+
+# --- Container security hardening ---
+
+# PID limits per service. The *arrs and qBittorrent fork moderate numbers of
+# workers; Jellyfin spawns many threads for media scans + clients.
+# qBittorrent + libtorrent can run hundreds of threads under heavy peer load.
+media_pids_qbittorrent: 500
+media_pids_sonarr: 300
+media_pids_radarr: 300
+media_pids_prowlarr: 300
+media_pids_jellyfin: 600
+
+# Linux capabilities for LinuxServer.io containers (qbittorrent/sonarr/radarr/prowlarr/jellyfin).
+# The s6-overlay init runs as root, then drops to PUID:PGID. It needs the
+# minimum caps below to chown /config, drop privileges, and supervise children.
+# Without these, the container crashloops on init.
+media_lscr_cap_drop:
+  - ALL
+media_lscr_cap_add:
+  - CHOWN          # chown /config to PUID during init
+  - DAC_OVERRIDE   # bypass perm checks while bootstrapping
+  - FOWNER         # treat as file owner for chmod/chown
+  - SETGID         # drop to PGID
+  - SETUID         # drop to PUID
+  - KILL           # s6 supervision signals
+
+# NOTE: read_only is intentionally NOT enabled for the media stack. s6-overlay
+# (used by all linuxserver.io images) needs to write to /run, /var/run, /var/log/s6
+# and several other paths during init. Enabling read_only requires a fragile set
+# of tmpfs mounts that has historically broken LSIO containers across minor version
+# bumps. We rely on PUID/PGID 1000 + cap_drop ALL for runtime isolation instead.
+
+# OCI image labels per service.
+media_oci_base:
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/media/README.md"
+  org.opencontainers.image.vendor: "homelab"

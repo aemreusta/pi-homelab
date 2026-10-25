@@ -1,0 +1,36 @@
+---
+- name: Converge — render Portainer templates to tmp dir for assertion
+  hosts: localhost
+  gather_facts: false
+  vars:
+    docker_user: pi
+    timezone: Europe/Istanbul
+    # Intentionally NOT setting vault_portainer_password: password_hash('bcrypt')
+    # randomizes the salt each render which would break the idempotence test.
+    # The production template's password branch is exercised by integration
+    # deploys, not by Molecule.
+    vault_portainer_password: ""
+  pre_tasks:
+    - name: Load role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../defaults/main.yml"
+
+    - name: Override compose/data dirs to a tmp sandbox
+      ansible.builtin.set_fact:
+        portainer_compose_dir: /tmp/molecule-portainer
+        portainer_data_dir: /tmp/molecule-portainer/data
+
+    - name: Ensure sandbox dirs exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ portainer_compose_dir }}"
+        - "{{ portainer_data_dir }}"
+  tasks:
+    - name: Render docker-compose.yml
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../templates/docker-compose.yml.j2"
+        dest: "{{ portainer_compose_dir }}/docker-compose.yml"
+        mode: "0644"

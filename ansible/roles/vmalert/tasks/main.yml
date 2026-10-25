@@ -1,0 +1,12 @@
+---
+- name: Include vmalert deploy tasks
+  ansible.builtin.include_tasks:
+    file: deploy.yml
+
+- name: Include vmalert liveness tasks
+  ansible.builtin.include_tasks:
+    file: liveness.yml
+
+- name: Include vmalert UFW tasks
+  ansible.builtin.include_tasks:
+    file: ufw.yml

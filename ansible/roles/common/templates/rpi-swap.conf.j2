@@ -1,0 +1,13 @@
+# rpi-swap configuration — managed by Ansible
+# See: dpkg -L rpi-swap, swap.conf(5)
+
+[Main]
+Mechanism=auto
+
+[File]
+Path=/var/swap
+FixedSizeMiB={{ common_swap_file_size_mib }}
+Priority=10
+
+[Zram]
+FixedSizeMiB={{ common_swap_zram_size_mib }}

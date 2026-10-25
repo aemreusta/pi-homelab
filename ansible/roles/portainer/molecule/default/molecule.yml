@@ -1,0 +1,45 @@
+---
+# Check-mode-only scenario — no DinD, no actual container launch.
+# Strategy: render templates to a temp dir on localhost, assert hardening directives.
+
+dependency:
+  name: galaxy
+
+driver:
+  name: default
+  options:
+    managed: false
+    ansible_connection_options:
+      ansible_connection: local
+
+platforms:
+  - name: localhost
+    groups:
+      - localhost
+
+provisioner:
+  name: ansible
+  inventory:
+    host_vars:
+      localhost:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  config_options:
+    defaults:
+      stdout_callback: ansible.builtin.default
+      result_format: yaml
+      gathering: explicit
+  playbooks:
+    converge: converge.yml
+    verify: verify.yml
+
+scenario:
+  name: default
+  test_sequence:
+    - dependency
+    - converge
+    - idempotence
+    - verify
+
+verifier:
+  name: ansible

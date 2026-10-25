@@ -1,0 +1,87 @@
+#!/bin/bash
+# vmalert liveness check — managed by Ansible (vmalert role).
+# Queries the vmalert-metrics /api/v1/rules endpoint and /health to verify
+# rule evaluation is alive. Emits node_exporter textfile metrics so we can
+# detect "vmalert is running but rule evaluation stopped" — a gap not
+# covered by docker healthchecks (which only verify the HTTP server).
+#
+# The dead-man's-switch (healthchecks.io) provides external coverage for
+# Pi-level failures; this covers the "process alive but evaluation wedged"
+# case. Runs every 5 min.
+#
+# Follows the atomic textfile emit pattern.
+
+set -uo pipefail
+
+# Use direct port (not the Traefik HTTPS route) — this script runs ON the Pi,
+# so bypassing Traefik avoids TLS CA verification issues.
+VMALERT_URL="http://127.0.0.1:{{ vmalert_metrics_port }}"
+TEXTFILE_DIR="{{ common_node_exporter_textfile_dir | default('/var/lib/node_exporter/textfile') }}"
+TEXTFILE="${TEXTFILE_DIR}/vmalert_liveness.prom"
+
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+
+# --- Health check (HTTP server alive) ---
+_health=$(curl -sf --connect-timeout 5 --max-time 10 "${VMALERT_URL}/health" 2>/dev/null)
+if [ "$_health" != "OK" ]; then
+    _health_ok=0
+else
+    _health_ok=1
+fi
+
+# --- Rule evaluation check (rules endpoint reachable) ---
+# Returns {"status":"success","data":{"groups":[...]}} when healthy.
+# On timeout/wedge, curl returns empty or non-200.
+_api=$(curl -sf --connect-timeout 5 --max-time 15 "${VMALERT_URL}/api/v1/rules" 2>/dev/null)
+if [ -z "$_api" ]; then
+    _api_ok=0
+    _rule_count=0
+else
+    # Extract rule count from the JSON response.
+    _rule_count=$(echo "$_api" | python3 -c "
+import sys, json
+try:
+    doc = json.load(sys.stdin)
+    groups = doc.get(\"data\", {}).get(\"groups\", [])
+    total = sum(len(g.get(\"rules\", [])) for g in groups)
+    print(total)
+except Exception:
+    print(0)
+" 2>/dev/null)
+    if [ -n "$_rule_count" ] && [ "$_rule_count" -gt 0 ] 2>/dev/null; then
+        _api_ok=1
+    else
+        _api_ok=0
+        _rule_count=0
+    fi
+fi
+
+alert_event "vmalert-liveness" check ok \
+    "health=${_health_ok}" "api=${_api_ok}" "rules=${_rule_count}"
+
+# ── Observability: atomic textfile emit (silent-cron hard rule) ──────────
+now=$(date +%s)
+if [ -d "$TEXTFILE_DIR" ]; then
+    tmp="${TEXTFILE}.$$"
+    if {
+        echo "# HELP vmalert_liveness_last_run_unix_seconds Unix time of the last vmalert liveness check run."
+        echo "# TYPE vmalert_liveness_last_run_unix_seconds gauge"
+        echo "vmalert_liveness_last_run_unix_seconds ${now}"
+        echo "# HELP vmalert_health_ok 1 if vmalert /health returned OK, 0 otherwise."
+        echo "# TYPE vmalert_health_ok gauge"
+        echo "vmalert_health_ok ${_health_ok}"
+        echo "# HELP vmalert_api_ok 1 if /api/v1/rules returned rules, 0 otherwise."
+        echo "# TYPE vmalert_api_ok gauge"
+        echo "vmalert_api_ok ${_api_ok}"
+        echo "# HELP vmalert_rules_loaded Number of rules returned by /api/v1/rules."
+        echo "# TYPE vmalert_rules_loaded gauge"
+        echo "vmalert_rules_loaded ${_rule_count}"
+    } > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$TEXTFILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+fi
+
+exit 0

@@ -1,0 +1,41 @@
+---
+- name: Fail fast if Speedtest Tracker APP_KEY is missing
+  ansible.builtin.fail:
+    msg: |
+      vault_speedtest_app_key is empty. Generate one with:
+        docker run --rm lscr.io/linuxserver/speedtest-tracker:latest \
+          php artisan key:generate --show
+      Then add it to ansible/inventory/group_vars/all/vault.yml.
+  when: speedtest_tracker_app_key | length == 0
+
+- name: Create Speedtest Tracker compose directory
+  ansible.builtin.file:
+    path: "{{ speedtest_tracker_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create Speedtest Tracker config directory
+  ansible.builtin.file:
+    path: "{{ speedtest_tracker_config_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Copy Speedtest Tracker docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ speedtest_tracker_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart speedtest_tracker
+
+- name: Start Speedtest Tracker container
+  community.docker.docker_compose_v2:
+    project_src: "{{ speedtest_tracker_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

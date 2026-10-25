@@ -1,0 +1,130 @@
+---
+- name: Create media compose directory
+  ansible.builtin.file:
+    path: "{{ media_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create media config directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  loop:
+    - "{{ media_config_dir }}/qbittorrent"
+    - "{{ media_config_dir }}/qbittorrent-init.d"
+    - "{{ media_config_dir }}/sonarr"
+    - "{{ media_config_dir }}/radarr"
+    - "{{ media_config_dir }}/prowlarr"
+    - "{{ media_config_dir }}/jellyfin"
+
+# qBit 5.x with --profile=/config stores torrents in data/BT_backup (not BT_backup/).
+# Pre-create the directory so qBit can write to it immediately on start.
+- name: Create qBittorrent 5.x profile data directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  loop:
+    - "{{ media_config_dir }}/qbittorrent/qBittorrent/data"
+    - "{{ media_config_dir }}/qbittorrent/qBittorrent/data/BT_backup"
+    - "{{ media_config_dir }}/qbittorrent/qBittorrent/config"
+
+# qBit 5.2.0 in the current LSIO image silently exits when started via the
+# default run script (no --profile). This script patches the run file at
+# container init time to pass --profile=/config explicitly. See template
+# header for the full diagnosis.
+- name: Render qBittorrent profile-fix init script
+  ansible.builtin.template:
+    src: qbittorrent-profile-fix.sh.j2
+    dest: "{{ media_config_dir }}/qbittorrent-init.d/01-profile-fix.sh"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  notify: Restart media stack
+
+# A recreated container or a SIGKILL'd nox leaves a lockfile whose stored
+# hostname no longer matches; QLockFile then refuses it and nox silently exits
+# in a respawn loop (qBit outage 2026-05-29). This init hook clears the stale
+# lock before s6 starts qbittorrent. See template header.
+- name: Render qBittorrent stale-lock cleanup init script
+  ansible.builtin.template:
+    src: qbittorrent-clear-stale-lock.sh.j2
+    dest: "{{ media_config_dir }}/qbittorrent-init.d/02-clear-stale-lock.sh"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  notify: Restart media stack
+
+- name: Create download category directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0775"
+  loop:
+    - "{{ media_downloads_path }}/movies"
+    - "{{ media_downloads_path }}/series"
+
+- name: Copy media stack docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ media_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart media stack
+
+- name: Start media stack containers
+  community.docker.docker_compose_v2:
+    project_src: "{{ media_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"
+
+# qBittorrent 5 has one active configuration under --profile=/config.
+# Configure only while stopped, then verify the running API contract.
+- name: Include qBittorrent configuration
+  ansible.builtin.include_tasks:
+    file: qbittorrent.yml
+    apply:
+      tags: [media, qbittorrent]
+  tags: [media, qbittorrent]
+
+# NOTE: DisabledLocalAddress causes a DryIoc crash in Sonarr v4.0.16 / Radarr v5 / Prowlarr v1
+# when AuthenticationMethod=Forms. Blocked until upstream fix.
+# Tracked as an open TODO — "LAN Auth: *arr DisabledLocalAddress blocked"
+
+# ── byparr decommission (moved to Mac worker 2026-07-13) ──
+# byparr ran on the Pi with a weekly restart cron to contain the Camoufox/
+# Playwright PID leak. It could never solve Cloudflare within Prowlarr's proxy
+# timeout on the Pi 4B (a 200s direct solve of a protected site returned nothing),
+# so it was moved to the Mac worker (mac-worker/docker-compose.yml, container
+# `homelab-byparr`). These tasks remove the now-obsolete Pi container, cron,
+# script, and textfile metric. Safe to delete this whole block once no Pi is
+# still carrying the old artifacts. See mac-worker/README.md "byparr".
+- name: Remove obsolete Pi byparr container
+  community.docker.docker_container:
+    name: byparr
+    state: absent
+
+- name: Remove obsolete weekly byparr restart cron job
+  ansible.builtin.cron:
+    name: "byparr-weekly-restart"
+    state: absent
+    user: "{{ docker_user }}"
+
+- name: Remove obsolete byparr restart script + textfile metric
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /usr/local/bin/byparr-weekly-restart.sh
+    - /var/lib/node_exporter/textfile/byparr_restart.prom

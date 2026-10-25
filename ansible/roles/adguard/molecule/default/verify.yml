@@ -1,0 +1,99 @@
+---
+- name: Verify — assert hardening directives are present in rendered files
+  hosts: localhost
+  gather_facts: false
+  vars:
+    sandbox: /tmp/molecule-adguard
+  tasks:
+
+    - name: Slurp docker-compose.yml
+      ansible.builtin.slurp:
+        src: "{{ sandbox }}/docker-compose.yml"
+      register: dc
+
+    - name: Decode docker-compose
+      ansible.builtin.set_fact:
+        compose_yaml: "{{ (dc.content | b64decode) | from_yaml }}"
+        compose_text: "{{ dc.content | b64decode }}"
+
+    - name: Assert security_opt no-new-privileges
+      ansible.builtin.assert:
+        that:
+          - "'no-new-privileges:true' in compose_yaml.services.adguard.security_opt"
+        fail_msg: "no-new-privileges:true missing from security_opt"
+
+    - name: Assert cap_drop ALL
+      ansible.builtin.assert:
+        that:
+          - "'ALL' in compose_yaml.services.adguard.cap_drop"
+        fail_msg: "cap_drop must include ALL"
+
+    - name: Assert cap_add NET_BIND_SERVICE (port 53/80 inside container)
+      ansible.builtin.assert:
+        that:
+          - "'NET_BIND_SERVICE' in compose_yaml.services.adguard.cap_add"
+        fail_msg: "cap_add must include NET_BIND_SERVICE — AdGuard binds 53 and 80 inside the container"
+
+    - name: Assert read_only true
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.adguard.read_only | bool
+        fail_msg: "read_only must be true"
+
+    - name: Assert tmpfs has /tmp with hardening flags
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.adguard.tmpfs | length > 0
+          - compose_yaml.services.adguard.tmpfs[0] is search('^/tmp:')
+          - compose_yaml.services.adguard.tmpfs[0] is search('size=')
+          - compose_yaml.services.adguard.tmpfs[0] is search('noexec')
+          - compose_yaml.services.adguard.tmpfs[0] is search('nosuid')
+          - compose_yaml.services.adguard.tmpfs[0] is search('nodev')
+        fail_msg: "tmpfs /tmp missing or missing hardening flags"
+
+    - name: Assert pids_limit set and reasonable
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.adguard.pids_limit is defined
+          - compose_yaml.services.adguard.pids_limit | int > 0
+          - compose_yaml.services.adguard.pids_limit | int <= 1000
+        fail_msg: "pids_limit missing or out of range"
+
+    - name: Assert mem_limit set
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.adguard.mem_limit is defined
+        fail_msg: "mem_limit must be set"
+
+    - name: Assert healthcheck present (wget on port 80)
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.adguard.healthcheck is defined
+          - "'wget' in compose_yaml.services.adguard.healthcheck.test"
+        fail_msg: "healthcheck must use wget"
+
+    - name: Assert OCI labels present
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.adguard.labels['org.opencontainers.image.title'] is defined
+          - compose_yaml.services.adguard.labels['org.opencontainers.image.source'] is defined
+          - compose_yaml.services.adguard.labels['org.opencontainers.image.vendor'] is defined
+          - compose_yaml.services.adguard.labels['org.opencontainers.image.documentation'] is defined
+          - compose_yaml.services.adguard.labels['org.opencontainers.image.description'] is defined
+        fail_msg: "OCI image labels incomplete"
+
+    - name: Assert volume paths are absolute (no relative ./data/...)
+      ansible.builtin.assert:
+        that:
+          - compose_text is not search('- \\./data/work:')
+          - compose_text is not search('- \\./data/conf:')
+          - compose_text is search('/work:/opt/adguardhome/work')
+          - compose_text is search('/conf:/opt/adguardhome/conf')
+        fail_msg: "data volumes must use absolute paths, not relative ./data/..."
+
+    - name: Assert DNS port 53 published (TCP + UDP)
+      ansible.builtin.assert:
+        that:
+          - compose_text is search(':53:53/tcp')
+          - compose_text is search(':53:53/udp')
+        fail_msg: "DNS port 53 (tcp+udp) must be published"

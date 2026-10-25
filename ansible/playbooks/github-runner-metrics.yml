@@ -1,0 +1,6 @@
+---
+- name: Deploy github_runner_metrics (Pi-side emitter for the Mac CI runner)
+  hosts: pi
+  become: true
+  roles:
+    - github_runner_metrics

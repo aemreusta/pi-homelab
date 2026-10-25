@@ -1,0 +1,78 @@
+---
+- name: Create Fluent Bit directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  loop:
+    - "{{ fluentbit_compose_dir }}"
+    - "{{ fluentbit_data_dir }}"
+    - "{{ fluentbit_config_dir }}"
+
+- name: Ensure pipeline events log directory exists on host
+  # Fluent Bit tails {{ fluentbit_pipeline_log_path }} which is written by
+  # the media pipeline scripts. Creating the dir here decouples deploy
+  # order: fluentbit can start before those scripts exist without erroring.
+  ansible.builtin.file:
+    path: "{{ fluentbit_pipeline_log_path | dirname }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Ensure pipeline events log file exists
+  # Empty file so Fluent Bit's tail starts cleanly. Read_From_Head=False
+  # means only NEW lines after Fluent Bit starts are ingested.
+  ansible.builtin.file:
+    path: "{{ fluentbit_pipeline_log_path }}"
+    state: touch
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Render Fluent Bit parsers config
+  ansible.builtin.template:
+    src: parsers.conf.j2
+    dest: "{{ fluentbit_config_dir }}/parsers.conf"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart fluentbit
+
+- name: Render Fluent Bit config
+  ansible.builtin.template:
+    src: fluent-bit.conf.j2
+    dest: "{{ fluentbit_config_dir }}/fluent-bit.conf"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart fluentbit
+
+- name: Render Fluent Bit Lua enrichment script
+  ansible.builtin.template:
+    src: enrich.lua.j2
+    dest: "{{ fluentbit_config_dir }}/enrich.lua"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart fluentbit
+
+- name: Copy Fluent Bit docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ fluentbit_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart fluentbit
+
+- name: Start Fluent Bit container
+  community.docker.docker_compose_v2:
+    project_src: "{{ fluentbit_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

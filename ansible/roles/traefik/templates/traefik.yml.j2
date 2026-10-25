@@ -1,0 +1,59 @@
+# Traefik static configuration
+# Managed by Ansible — do not edit manually
+
+entryPoints:
+  web:
+    address: ":{{ traefik_http_port }}"
+{% if traefik_force_https_redirect | default(false) %}
+    # Redirect all plaintext HTTP to HTTPS at the entrypoint (one place, every
+    # host). The redirect response carries no HSTS — correct per RFC 6797 §7.2.
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+{% endif %}
+  websecure:
+    address: ":{{ traefik_https_port }}"
+  traefik:
+    address: ":{{ traefik_dashboard_port }}"
+
+api:
+  dashboard: true
+  insecure: true
+
+ping: {}
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+log:
+  level: INFO
+
+{% if traefik_access_log_enabled | default(true) %}
+# Access log → container stdout (JSON) so every proxied request reaches central
+# logging (fluentbit → VictoriaLogs). Traefik is the box all *.example traffic
+# flows through, but with access logging off it emitted ~1 line/day and the
+# TraefikErrorRateHigh alert (a 5xx grep) could never fire — the same
+# operational-stream-not-reaching-central-logging class seen with other app
+# consoles. JSON so VictoriaLogs can field-match the status
+# code. Request/response headers are dropped — they carry cookies, Authorization,
+# and API keys that must not land in the log store.
+accessLog:
+  format: {{ traefik_access_log_format | default('json') }}
+  fields:
+    defaultMode: keep
+    headers:
+      defaultMode: drop
+{% endif %}
+
+# Prometheus metrics endpoint — vmagent scrapes /metrics on the dashboard port.
+metrics:
+  prometheus:
+    addRoutersLabels: true
+    addServicesLabels: true
+    addEntryPointsLabels: true
+    entryPoint: traefik

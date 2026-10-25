@@ -1,0 +1,87 @@
+---
+- name: Ensure observability docker network
+  community.docker.docker_network:
+    name: "{{ grafana_network }}"
+    driver: bridge
+
+- name: Create Grafana directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "472"  # Grafana container UID
+    group: "472"
+    mode: "0755"
+  loop:
+    - "{{ grafana_compose_dir }}"
+    - "{{ grafana_data_dir }}"
+    - "{{ grafana_provisioning_dir }}/datasources"
+    - "{{ grafana_provisioning_dir }}/dashboards"
+    - "{{ grafana_dashboards_dir }}"
+
+- name: Render Grafana datasources provisioning
+  ansible.builtin.template:
+    src: datasources.yml.j2
+    dest: "{{ grafana_provisioning_dir }}/datasources/datasources.yml"
+    owner: "472"
+    group: "472"
+    mode: "0644"
+  notify: Restart grafana
+
+- name: Render Grafana dashboard provider
+  ansible.builtin.template:
+    src: dashboards.yml.j2
+    dest: "{{ grafana_provisioning_dir }}/dashboards/dashboards.yml"
+    owner: "472"
+    group: "472"
+    mode: "0644"
+  notify: Restart grafana
+
+- name: Download official Grafana dashboards (best-effort)
+  ansible.builtin.get_url:
+    url: "https://grafana.com/api/dashboards/{{ item.id }}/revisions/{{ item.revision }}/download"
+    dest: "{{ grafana_dashboards_dir }}/{{ item.slug }}.json"
+    owner: "472"
+    group: "472"
+    mode: "0644"
+    timeout: 30
+  loop: "{{ grafana_dashboards }}"
+  loop_control:
+    label: "{{ item.slug }} (id={{ item.id }})"
+  failed_when: false  # grafana.com geçici offline olsa bile playbook devam etsin
+  register: grafana_dashboard_download
+
+- name: Warn on dashboard download failures
+  ansible.builtin.debug:
+    msg: "Dashboard {{ item.item.slug }} download failed — re-run later or fetch manually."
+  loop: "{{ grafana_dashboard_download.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.slug }}"
+  when: item.failed | default(false)
+  changed_when: false
+
+- name: Sync local Grafana dashboard JSONs
+  # Dashboards committed in ansible/roles/grafana/files/dashboards/*.json
+  # are copied verbatim to the Grafana container's provisioning dir. These
+  # are homelab-specific (e.g. container-log-errors) and not from grafana.com.
+  ansible.builtin.copy:
+    src: "dashboards/"
+    dest: "{{ grafana_dashboards_dir }}/"
+    owner: "472"
+    group: "472"
+    mode: "0644"
+
+- name: Copy Grafana docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ grafana_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart grafana
+
+- name: Start Grafana container
+  community.docker.docker_compose_v2:
+    project_src: "{{ grafana_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

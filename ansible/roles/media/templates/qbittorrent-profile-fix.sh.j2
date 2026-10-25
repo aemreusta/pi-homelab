@@ -1,0 +1,31 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# Patch the s6 svc-qbittorrent run script to pass --profile=/config explicitly.
+#
+# Why: In qBittorrent v5.2.0 the linuxserver.io image's run script invokes
+# `s6-setuidgid abc /app/qbittorrent-nox --webui-port=N`. Without an explicit
+# --profile, qBit silently exits (SIGTERM 1s after start), even though
+# $HOME/$XDG_CONFIG_HOME are correctly set to /config. Adding --profile=/config
+# makes qBit pick up the existing config and bind the WebUI port normally.
+#
+# Verified on lscr.io/linuxserver/qbittorrent:5.2.0_v2.0.12-ls454 image
+# (pulled 2026-05-09).
+
+set -euo pipefail
+
+RUN_FILE=/run/s6-rc/servicedirs/svc-qbittorrent/run
+
+if [[ ! -f "$RUN_FILE" ]]; then
+  echo "[qbit-profile-fix] $RUN_FILE missing — nothing to patch"
+  exit 0
+fi
+
+if grep -q -- '--profile=/config' "$RUN_FILE"; then
+  echo "[qbit-profile-fix] already patched"
+  exit 0
+fi
+
+# Insert --profile=/config before --webui-port on the s6-setuidgid line.
+sed -i 's|/app/qbittorrent-nox --webui-port=|/app/qbittorrent-nox --profile=/config --webui-port=|g' "$RUN_FILE"
+
+echo "[qbit-profile-fix] patched $RUN_FILE"

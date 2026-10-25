@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.homelab.github-runner</string>
+
+    <!-- Re-assert the supervisor at login AND every 15 min (StartInterval).
+         This used to be a login-only one-shot on the assumption that
+         restart:unless-stopped would keep it up. On 2026-09-28 the Mac
+         (a MacBook, not an always-on box) slept/hibernated; on resume the
+         supervisor's NFS volume mount timed out once, the one-shot exited 0,
+         and CI stayed offline 19h. Same class as an earlier 26-day worker
+         outage — every Mac compose agent now shares the
+         tested mac-worker/ensure-compose.sh (tests/test_mac_ensure_compose.bats,
+         guard: tests/test_mac_launchagents.py). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/Users/operator/.orbstack/bin</string>
+        <key>HOME</key>
+        <string>/Users/operator</string>
+    </dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/operator/GitHub/raspi-homelab/mac-worker/ensure-compose.sh</string>
+        <string>/Users/operator/GitHub/raspi-homelab/mac-worker/github-runner</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Idempotent re-assert: a no-op while the supervisor runs, the recovery
+         when it does not. Bounds a post-sleep outage to ~15 min. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/operator/GitHub/raspi-homelab/mac-worker/github-runner/logs/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/operator/GitHub/raspi-homelab/mac-worker/github-runner/logs/launchd.log</string>
+</dict>
+</plist>

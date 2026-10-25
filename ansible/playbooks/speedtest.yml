@@ -1,0 +1,6 @@
+---
+- name: Deploy Speedtest Tracker
+  hosts: pi
+  become: true
+  roles:
+    - speedtest_tracker

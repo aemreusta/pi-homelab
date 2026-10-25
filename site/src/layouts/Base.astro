@@ -1,0 +1,43 @@
+---
+import '../styles/global.css';
+
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="canonical" href={canonical} />
+    <meta name="generator" content={Astro.generator} />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonical} />
+    <meta name="theme-color" content="#0e1014" />
+    <!-- Personal page: keep it out of search results and caches. -->
+    <meta name="robots" content="noindex, nofollow, noarchive, nosnippet" />
+  </head>
+  <body>
+    <slot />
+    <footer class="site-footer">
+      <div class="wrap footer-row">
+        <span>© {new Date().getFullYear()} aemreusta · a personal homelab</span>
+        <nav>
+          <a href="https://github.com/aemreusta/pi-homelab">Public snapshot on GitHub</a>
+          <a href="/privacy/">Privacy policy</a>
+        </nav>
+      </div>
+    </footer>
+  </body>
+</html>

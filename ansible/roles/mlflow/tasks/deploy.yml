@@ -1,0 +1,127 @@
+---
+- name: Assert MLflow backend secret is set
+  ansible.builtin.assert:
+    that:
+      - mlflow_db_password | length > 0
+      - mlflow_minio_access_key | length > 0
+      - mlflow_minio_secret_key | length > 0
+    fail_msg: >-
+      vault_mlflow_db_password / vault_minio_mlflow_access_key /
+      vault_minio_mlflow_secret_key are unset. Deploy the postgresql role and add
+      the MinIO scoped-key secrets to vault first (see vault.yml.example).
+    quiet: true
+
+- name: Create MLflow compose directory
+  ansible.builtin.file:
+    path: "{{ mlflow_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Copy MLflow build context (Dockerfile + requirements)
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ mlflow_compose_dir }}/{{ item }}"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  loop:
+    - Dockerfile
+    - requirements.txt
+  notify: Restart mlflow
+
+- name: Copy MLflow docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ mlflow_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart mlflow
+
+- name: Build + start MLflow
+  community.docker.docker_compose_v2:
+    project_src: "{{ mlflow_compose_dir }}"
+    state: present
+    build: always
+  become: true
+  become_user: "{{ docker_user }}"
+
+# `build: always` above pulls the newest MLflow on EVERY deploy (deliberate —
+# see the no-pinning directive in files/requirements.txt). MLflow refuses to
+# start when its schema version is ahead of the database's, so "track latest"
+# without a migration step is an incoherent pair: any release that bumps the
+# schema turns the next deploy into a crash loop. That is not hypothetical —
+# 2026-09-07, `Detected out-of-date database schema (found 6f8d9c3b2a1e,
+# expected b7e2c1a4d9f3)`, 30 failed health probes, three CD attempts and a
+# fleet rollback. The role had tracked latest since PRD-004 with no migration.
+#
+# Change detection reads the schema version out of the database rather than
+# parsing the upgrade's output. `mlflow db upgrade` logs
+# "Updating database tables" unconditionally — verified on a no-op run — so a
+# log-text match reports `changed` on every deploy and fires the restart handler
+# every time. Branching on human-readable prose when a machine-readable fact is
+# available is the exact contract this repo spent 2026-09-05 removing from a
+# media import path; do not reintroduce it here.
+- name: Read the MLflow schema version before migrating
+  ansible.builtin.command:
+    cmd: >-
+      docker exec {{ mlflow_db_host }} psql -U {{ mlflow_db_user }}
+      -d {{ mlflow_db_name }} -tAc "select version_num from alembic_version"
+  become: true
+  become_user: "{{ docker_user }}"
+  register: mlflow_schema_before
+  changed_when: false
+  # A first-ever deploy has no alembic_version table yet. That is not an error,
+  # it is the "everything is about to be created" case, and an empty stdout
+  # compares correctly against the post-migration version below.
+  failed_when: false
+  when: not ansible_check_mode
+
+# Runs in a throwaway container rather than `docker exec`, because at this point
+# the server may be crash-looping against the old schema and there is nothing to
+# exec into. The URI comes from the container's own environment so the password
+# never reaches a command line — the same reason the compose file injects
+# MLFLOW_BACKEND_STORE_URI instead of passing --backend-store-uri.
+- name: Migrate the MLflow database schema to match the freshly built image
+  ansible.builtin.command:
+    cmd: >-
+      docker compose run --rm --no-deps --entrypoint sh mlflow
+      -c 'mlflow db upgrade "$MLFLOW_BACKEND_STORE_URI"'
+    chdir: "{{ mlflow_compose_dir }}"
+  become: true
+  become_user: "{{ docker_user }}"
+  changed_when: false  # decided by the version comparison below
+  when: not ansible_check_mode
+
+- name: Read the MLflow schema version after migrating
+  ansible.builtin.command:
+    cmd: >-
+      docker exec {{ mlflow_db_host }} psql -U {{ mlflow_db_user }}
+      -d {{ mlflow_db_name }} -tAc "select version_num from alembic_version"
+  become: true
+  become_user: "{{ docker_user }}"
+  register: mlflow_schema_after
+  # THE change signal for the whole migration block, and the restart trigger.
+  # If the schema moved, the server was started against the old one and is
+  # crash-looping; if it did not, the server is fine and must not be bounced.
+  changed_when: >-
+    (mlflow_schema_after.stdout | default('') | trim)
+    != (mlflow_schema_before.stdout | default('') | trim)
+  when: not ansible_check_mode
+  notify: Restart mlflow
+
+# The restart has to land before we start probing health, not at end-of-play.
+- name: Apply the restart before probing health
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for the MLflow health endpoint
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ mlflow_port }}/health"
+    status_code: 200
+  register: mlflow_health
+  until: mlflow_health.status == 200
+  retries: 30
+  delay: 6
+  when: not ansible_check_mode

@@ -1,0 +1,6 @@
+---
+- name: Deploy vmalert (rule evaluator for VictoriaMetrics + VictoriaLogs)
+  hosts: pi
+  become: true
+  roles:
+    - vmalert

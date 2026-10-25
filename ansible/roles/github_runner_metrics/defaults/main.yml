@@ -1,0 +1,35 @@
+---
+# github_runner_metrics — Pi-side textfile emitter for the Mac GitHub Actions
+# runner supervisor. Reads the supervisor's NFS heartbeat + status.json and
+# emits gh_runner.prom for node_exporter. See docs/design/039-mac-ci-runner.md.
+
+# The Mac supervisor writes here over NFS; on the Pi this is the export SOURCE
+# (a plain local dir), so the emitter just reads local files. Subdir gh-runner/
+# under the existing shared Mac-worker export.
+github_runner_metrics_generated_dir: "/home/{{ docker_user }}/docker/mac-worker/shared/gh-runner"
+github_runner_metrics_status_file: "{{ github_runner_metrics_generated_dir }}/status.json"
+github_runner_metrics_heartbeat_file: "{{ github_runner_metrics_generated_dir }}/heartbeat"
+# Written by the Mac launchd rebuild job (rebuild-runner-image.sh). Absent until
+# that automation is installed → the emitter reports zeros (state, not silence).
+github_runner_metrics_rebuild_status_file: "{{ github_runner_metrics_generated_dir }}/rebuild-status.json"
+
+# node_exporter textfile collector dir (owned by the node_exporter role).
+github_runner_metrics_textfile_dir: /var/lib/node_exporter/textfile
+
+# Where the renderer module is deployed.
+github_runner_metrics_bin_dir: /usr/local/bin
+
+github_runner_metrics_log_file: /var/log/gh-runner-metrics.log
+
+# Heartbeat staleness threshold. The supervisor writes every ~60s; 600s (10 min)
+# tolerates a few missed writes / an NFS hiccup but catches a real freeze. The
+# vmalert GHRunnerSupervisorDown rule keys off gh_runner_heartbeat_stale.
+github_runner_metrics_heartbeat_stale_seconds: 600
+
+# Cron cadence (every 5 min — matches the other Mac-offload readers).
+# Stagger slot 2 (was "*/5") — see homelab_cron_stagger_* in group_vars/all.
+github_runner_metrics_cron_minute: "2-57/5"
+
+# Python is retained as an explicit rollback engine during the pilot.
+github_runner_metrics_engine: go
+github_runner_metrics_go_binary: /usr/local/bin/homelab-agent

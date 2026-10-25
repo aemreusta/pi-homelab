@@ -1,0 +1,51 @@
+#!/bin/bash
+# gh-runner-metrics.sh — Pi-side emitter for the Mac GitHub Actions runner.
+# Reads the supervisor's heartbeat + status.json (written over NFS into the
+# shared Mac-worker `gh-runner/` dir, which is local on the Pi as the export
+# source) and writes gh_runner.prom for node_exporter's textfile collector.
+#
+# Orchestration ONLY (flock + atomic mv). All rendering/threshold logic lives in
+# the tested Go runtime (Python retained for rollback). See
+# docs/design/039-mac-ci-runner.md.
+#
+# MANAGED BY ANSIBLE — role github_runner_metrics. Edit the template, not the Pi.
+set -uo pipefail
+
+STATUS_FILE="{{ github_runner_metrics_status_file }}"
+HEARTBEAT_FILE="{{ github_runner_metrics_heartbeat_file }}"
+REBUILD_STATUS_FILE="{{ github_runner_metrics_rebuild_status_file }}"
+STALE_SECONDS="{{ github_runner_metrics_heartbeat_stale_seconds }}"
+ENGINE="{{ github_runner_metrics_engine | default('python') }}"
+if [ "$ENGINE" = "go" ]; then
+    RENDERER=("{{ github_runner_metrics_go_binary | default('/usr/local/bin/homelab-agent') }}" runner-metrics)
+else
+    RENDERER=(python3 "{{ github_runner_metrics_bin_dir }}/gh_runner_metrics.py")
+fi
+TEXTFILE_DIR="{{ github_runner_metrics_textfile_dir }}"
+TEXTFILE_PATH="$TEXTFILE_DIR/gh_runner.prom"
+LOG_FILE="{{ github_runner_metrics_log_file }}"
+LOCK_FILE="/run/lock/gh-runner-metrics.lock"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
+
+# Single-flight — a slow NFS read mustn't let two runs overlap.
+exec 9>"$LOCK_FILE"
+flock -n 9 || { log "another run in progress — skipping"; exit 0; }
+
+# Skip silently if the collector dir is missing (node-exporter not yet deployed).
+[ -d "$TEXTFILE_DIR" ] || { log "textfile dir $TEXTFILE_DIR missing — skipping"; exit 0; }
+
+NOW="$(date +%s)"
+TMP="$TEXTFILE_PATH.$$"
+
+# Render → temp → atomic publish. The renderer always emits valid output (even
+# on a missing/garbage status.json: stale=1 + zeros), so a clean exit means we
+# have a full metric set. A non-zero exit (renderer crash) leaves the previous
+# .prom in place and GHRunnerMetricsStale catches a persistently-broken emitter.
+if "${RENDERER[@]}" "$STATUS_FILE" "$HEARTBEAT_FILE" "$STALE_SECONDS" "$NOW" "$REBUILD_STATUS_FILE" > "$TMP" 2>>"$LOG_FILE"; then
+    mv "$TMP" "$TEXTFILE_PATH" || { rm -f "$TMP"; log "mv failed"; exit 1; }
+else
+    rm -f "$TMP"
+    log "renderer failed — kept previous $TEXTFILE_PATH"
+    exit 1
+fi

@@ -1,0 +1,15 @@
+---
+# Control API binds 127.0.0.1 only — external access via Traefik reverse proxy.
+# No UFW rules needed for port 9099. Previous LAN/Docker-bridge allow rules were
+# removed when the bind address changed from 0.0.0.0 to 127.0.0.1 (defense-in-depth).
+- name: Remove stale UFW rules for homelab control API (now loopback-only)
+  community.general.ufw:
+    rule: allow
+    port: "{{ homelab_control_port | string }}"
+    proto: tcp
+    from_ip: "{{ item }}"
+    delete: true
+  become: true
+  loop:
+    - "{{ lan_subnet }}"
+    - "172.16.0.0/12"

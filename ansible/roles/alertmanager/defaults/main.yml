@@ -1,0 +1,63 @@
+---
+# Alertmanager — Routes vmalert-fired alerts to receivers.
+# https://prometheus.io/docs/alerting/latest/alertmanager/
+
+alertmanager_compose_dir: /home/{{ docker_user }}/docker/observability/alertmanager
+alertmanager_data_dir: /home/{{ docker_user }}/docker/observability/alertmanager/data
+alertmanager_tz: "{{ timezone }}"
+
+alertmanager_image: prom/alertmanager:latest
+alertmanager_port: 9093
+
+# Split-DNS hostname for absolute links in AM-rendered notifications.
+# Sprint 17 mobile-reachability rule: NEVER construct from default_ipv4.
+alertmanager_hostname: "alertmanager.{{ homelab_internal_domains[0] }}"
+# https now that *.example is served over trusted HTTPS via Traefik (doc 033).
+alertmanager_external_url: "https://{{ alertmanager_hostname }}"
+
+# Webhook bridge: a tiny shim container that receives Alertmanager webhooks
+# and POSTs to ntfy + writes a structured line to /var/log/alert-audit.log.
+# Closes G-F notification-delivery proof gap.
+alertmanager_bridge_image: python:3.13-alpine
+alertmanager_bridge_port: 9097
+
+# Where the bridge writes its audit-log line. Bind-mounted so it shares
+# the same logfmt stream as the host-side alert-lib scripts.
+alertmanager_bridge_audit_log: /var/log/alert-audit.log
+
+# Routing — all alerts (severity=warn|crit) go to the ntfy bridge. Future:
+# add a `critical-only` receiver if we want to split phone-buzz vs email.
+alertmanager_route_default_receiver: ntfy-bridge
+alertmanager_group_wait: 30s
+alertmanager_group_interval: 5m
+alertmanager_repeat_interval: 4h
+
+# Sustained-state alerts (chronic conditions that are the known steady state, not
+# recurring incidents) get a longer re-notify cadence so they page once/day
+# instead of every alertmanager_repeat_interval — see the child route in
+# alertmanager.yml.j2 + docs/design/024-alert-discipline.md. Pattern is hoisted
+# here so adding a future sustained-state alert is a defaults edit, not a
+# template edit. SrvDisk* only — SwapUsageHigh stays on the 4h default (swap is
+# ~27% steady-state, so an 85% breach is actionable, not chronic).
+# LibraryFilesTruncated / QbitCompletedNotImported (2026-09-29): states that
+# wait on an operator decision (re-acquire a file, decide an import in the UI)
+# cannot change on their own, so a 4h [ONGOING] repeat carries no new info.
+alertmanager_sustained_repeat_interval: 24h
+alertmanager_sustained_alert_pattern: "SrvDiskHigh|SrvDiskFillRateHigh|MacWorkerAwayLong|LibraryFilesTruncated|QbitCompletedNotImported"
+
+alertmanager_network: observability
+alertmanager_mem_limit: 128M
+alertmanager_pids_limit: 64
+alertmanager_read_only: true
+alertmanager_tmpfs_size: 32m
+
+alertmanager_cap_drop:
+  - ALL
+alertmanager_cap_add: []
+
+alertmanager_oci_labels:
+  org.opencontainers.image.title: alertmanager
+  org.opencontainers.image.description: "Alertmanager — fan-out for vmalert"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://prometheus.io/docs/alerting/latest/alertmanager/"

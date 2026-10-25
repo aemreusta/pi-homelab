@@ -1,0 +1,47 @@
+---
+# Fluent Bit — Docker container log collector → VictoriaLogs
+# Host network mode so it can reach VL on 127.0.0.1 (DOCKER-USER chain
+# blocks bridge→host traffic; same fix as vmagent).
+
+services:
+  fluentbit:
+    image: {{ fluentbit_image }}
+    container_name: fluentbit
+    restart: unless-stopped
+    init: true
+    mem_limit: {{ fluentbit_mem_limit }}
+    pids_limit: {{ fluentbit_pids_limit }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for cap in fluentbit_cap_drop %}
+      - {{ cap }}
+{% endfor %}
+{% if fluentbit_cap_add | length > 0 %}
+    cap_add:
+{% for cap in fluentbit_cap_add %}
+      - {{ cap }}
+{% endfor %}
+{% endif %}
+    network_mode: host
+    volumes:
+      - {{ fluentbit_docker_root }}/containers:{{ fluentbit_docker_root }}/containers:ro
+      - {{ fluentbit_config_dir }}/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - {{ fluentbit_config_dir }}/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - {{ fluentbit_config_dir }}/enrich.lua:/fluent-bit/etc/enrich.lua:ro
+      - {{ fluentbit_data_dir }}:/data
+      # Media pipeline events tail. /srv/logs must exist on host
+      # (created by this role's deploy); same path inside container for clarity.
+      - {{ fluentbit_pipeline_log_path | dirname }}:{{ fluentbit_pipeline_log_path | dirname }}:ro
+    environment:
+      - TZ={{ fluentbit_tz }}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Fluent Bit ships as a scratch/distroless image — no /bin/sh, no wget, no curl.
+    # CMD-SHELL above never worked since the image lacked /bin/sh. The HTTP health
+    # endpoint at :2020/api/v1/health is still scraped by vmagent; alert there if needed.
+    healthcheck:
+      disable: true

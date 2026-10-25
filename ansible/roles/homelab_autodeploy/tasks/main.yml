@@ -1,0 +1,128 @@
+---
+# homelab_autodeploy — deploy the GitOps CD controller (module + orchestrator +
+# cron). DISABLED unless homelab_autodeploy_enabled. The Pi prerequisites (repo
+# checkout, ansible, vault password) are operator-owned — see defaults/main.yml.
+
+# cron runs root with a bare PATH (/usr/bin:/bin); the uv-installed
+# ansible-playbook lives in /usr/local/bin (NOT on that PATH). The orchestrator
+# exports a full PATH itself, but a rollback to a commit predating that export
+# re-bricks deploys ("ansible-playbook: command not found") — and the rollback
+# can never recover because IT needs ansible-playbook too (2026-06-30, autodeploy
+# 851b921→0c00ac7 brick loop). Symlinking into /usr/bin (which IS on cron's bare
+# PATH) makes ansible-playbook resolvable regardless of the script's PATH line,
+# and persists across rollbacks since old role versions never remove it.
+# The CD checkout must be able to materialise LFS-tracked binaries. Without
+# git-lfs, `git reset --hard` leaves every *.jpg/*.png (see .gitattributes) as
+# 132-byte pointer TEXT, ansible's copy: ships that text as the image, and the
+# dashboard renders with no background and no logo — HTTP 200 the whole way, so
+# nothing alerts. Found 2026-09-03.
+- name: Install git-lfs so the CD checkout can materialise LFS assets
+  ansible.builtin.apt:
+    name: git-lfs
+    state: present
+  when: homelab_autodeploy_enabled
+
+- name: Initialise the git-lfs smudge/clean filters for root
+  ansible.builtin.command: git lfs install --skip-repo
+  register: homelab_autodeploy_lfs_install
+  changed_when: "'Updated' in homelab_autodeploy_lfs_install.stdout"
+  when: homelab_autodeploy_enabled
+
+# Materialise now rather than waiting for the next CD cycle — the checkout is
+# already sitting on real commits whose assets are still pointers.
+- name: Materialise LFS objects in the CD checkout
+  ansible.builtin.command: git lfs pull
+  args:
+    chdir: "{{ homelab_autodeploy_repo_dir }}"
+  register: homelab_autodeploy_lfs_pull
+  changed_when: false
+  failed_when: false
+  when: homelab_autodeploy_enabled
+
+- name: Make ansible-playbook resolvable on cron's bare PATH (rollback-proof)
+  ansible.builtin.file:
+    src: /usr/local/bin/ansible-playbook
+    dest: /usr/bin/ansible-playbook
+    state: link
+    force: true
+  when: homelab_autodeploy_enabled
+
+- name: Deploy homelab_autodeploy decision module
+  ansible.builtin.copy:
+    src: homelab_autodeploy.py
+    dest: "{{ homelab_autodeploy_bin_dir }}/homelab_autodeploy.py"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy homelab-autodeploy orchestrator
+  ansible.builtin.template:
+    src: homelab-autodeploy.sh.j2
+    dest: "{{ homelab_autodeploy_bin_dir }}/homelab-autodeploy.sh"
+    owner: root
+    group: root
+    mode: "0700"   # holds the CI token (if any) — root-only
+
+# Deny-list drift baseline: record the CONTROL NODE's (this Mac's) repo HEAD —
+# not the Pi's separate /opt/homelab checkout — because that's the commit whose
+# role files (files/homelab_autodeploy.py, the template above) were JUST pushed
+# to the Pi via this play. check_mode: false so the value is populated even
+# during the deep --check --diff safety gate (the documented command/.stdout
+# check-mode-skip class — see ops-discipline §6); read-only, so running it for
+# real under --check is safe.
+- name: Read control-node repo HEAD (deny-list drift baseline)
+  ansible.builtin.command: git rev-parse HEAD
+  args:
+    chdir: "{{ playbook_dir }}/.."
+  delegate_to: localhost
+  become: false
+  register: homelab_autodeploy_deployed_sha
+  changed_when: false
+  check_mode: false
+  when: homelab_autodeploy_enabled
+
+- name: Record deny-list drift baseline for homelab-autodeploy
+  ansible.builtin.copy:
+    dest: "{{ homelab_autodeploy_denylist_state_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {"homelab-autodeploy": "{{ homelab_autodeploy_deployed_sha.stdout }}"}
+  when: homelab_autodeploy_enabled
+
+- name: Ensure state dir exists
+  ansible.builtin.file:
+    path: "{{ homelab_autodeploy_state_file | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Seed empty controller state if absent
+  ansible.builtin.copy:
+    dest: "{{ homelab_autodeploy_state_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {"seen_sha": "", "failed_sha": "", "fail_count": 0}
+    force: false
+
+- name: Ensure controller log file exists
+  ansible.builtin.file:
+    path: "{{ homelab_autodeploy_log_file }}"
+    state: touch
+    owner: root
+    group: root
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Schedule homelab-autodeploy controller (root)
+  ansible.builtin.cron:
+    name: "homelab-autodeploy"
+    minute: "{{ homelab_autodeploy_cron_minute }}"
+    job: "{{ homelab_autodeploy_bin_dir }}/homelab-autodeploy.sh"
+    user: root
+    state: "{{ 'present' if homelab_autodeploy_enabled else 'absent' }}"

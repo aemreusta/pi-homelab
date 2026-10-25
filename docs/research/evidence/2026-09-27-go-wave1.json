@@ -1,0 +1,364 @@
+{
+  "date": "2026-09-27",
+  "implementation_commit": "adf65c1",
+  "optimization_commit": "5b06db1",
+  "runtime_id": "9e8b8ef3a701c0ea0a7d15bcc17edbc667a97f0368a4cdec91d86e3c129da0c3",
+  "retained_initial_runtime_id": "66c0f479dcf2532234fc5c8e2be876ef0534d32a763d286e6a5288d612d7941f",
+  "benchmarks": {
+    "typical": {
+      "python": {
+        "iterations": 30,
+        "median_ms": 143.3053169748746,
+        "p95_ms": 189.2411820590496,
+        "max_rss_kib": 10664.0,
+        "mean_cpu_seconds": 0.12233333333333334
+      },
+      "go": {
+        "iterations": 30,
+        "median_ms": 16.696961014531553,
+        "p95_ms": 34.07991805579513,
+        "max_rss_kib": 3148.0,
+        "mean_cpu_seconds": 0.001
+      },
+      "metric_parity": true,
+      "scope": "fixed current supervisor snapshot; startup+read+render, warm filesystem cache, sequential runs"
+    },
+    "small": {
+      "python": {
+        "iterations": 30,
+        "median_ms": 137.07546901423484,
+        "p95_ms": 161.11174097750336,
+        "max_rss_kib": 10728.0,
+        "mean_cpu_seconds": 0.11566666666666667
+      },
+      "go": {
+        "iterations": 30,
+        "median_ms": 9.95118252467364,
+        "p95_ms": 14.325735974125564,
+        "max_rss_kib": 3080.0,
+        "mean_cpu_seconds": 0.0006666666666666666
+      },
+      "metric_parity": true,
+      "scope": "missing inputs"
+    },
+    "large": {
+      "python": {
+        "iterations": 30,
+        "median_ms": 166.81189800146967,
+        "p95_ms": 228.10625098645687,
+        "max_rss_kib": 11896.0,
+        "mean_cpu_seconds": 0.13966666666666666
+      },
+      "go": {
+        "iterations": 30,
+        "median_ms": 36.8340284912847,
+        "p95_ms": 52.799382945522666,
+        "max_rss_kib": 5836.0,
+        "mean_cpu_seconds": 0.022
+      },
+      "metric_parity": true,
+      "scope": "synthetic 1000-repository input"
+    }
+  },
+  "initial_large_input_finding": {
+    "python": {
+      "iterations": 30,
+      "median_ms": 155.53398651536554,
+      "p95_ms": 212.39099698141217,
+      "max_rss_kib": 11896.0,
+      "mean_cpu_seconds": 0.138
+    },
+    "go": {
+      "iterations": 30,
+      "median_ms": 155.9876319952309,
+      "p95_ms": 222.46202104724944,
+      "max_rss_kib": 13660.0,
+      "mean_cpu_seconds": 0.14733333333333334
+    },
+    "metric_parity": true,
+    "scope": "synthetic 1000-repository input"
+  },
+  "rclone_local_backend_smoke": {
+    "rclone_rc": 0,
+    "observer_rc": 0,
+    "summary": {
+      "bytes": 118784,
+      "errors": 0
+    },
+    "bytes_equal": true,
+    "progress_final": "# HELP gdrive_backup_progress_timestamp_seconds Last observer update.\n# TYPE gdrive_backup_progress_timestamp_seconds gauge\ngdrive_backup_progress_timestamp_seconds 1790523572\n# HELP gdrive_backup_running 1 while the observer is receiving sync output.\n# TYPE gdrive_backup_running gauge\ngdrive_backup_running 0\n# HELP gdrive_backup_progress_bytes Bytes transferred in the current or last sync.\n# TYPE gdrive_backup_progress_bytes gauge\ngdrive_backup_progress_bytes 118784\n# HELP gdrive_backup_progress_total_bytes Known total bytes in the sync.\n# TYPE gdrive_backup_progress_total_bytes gauge\ngdrive_backup_progress_total_bytes 118784\n# HELP gdrive_backup_progress_errors Errors observed in the sync.\n# TYPE gdrive_backup_progress_errors gauge\ngdrive_backup_progress_errors 0\n# HELP gdrive_backup_progress_bytes_per_second Latest transfer rate.\n# TYPE gdrive_backup_progress_bytes_per_second gauge\ngdrive_backup_progress_bytes_per_second 0\n",
+    "log_lines": 3
+  },
+  "validation": {
+    "python_tests_passed": 1008,
+    "python_tests_skipped": 1,
+    "python_subtests_passed": 1012,
+    "bats_tests_passed": 15,
+    "go_race_vet": "passed",
+    "arm64_builds": [
+      "linux",
+      "darwin"
+    ],
+    "after_optimization": "Go race/vet, 7 Python-Go integration tests, ARM64 builds and commit hooks passed"
+  },
+  "limits": [
+    "30 sequential runs per renderer per workload on the live Pi; warm filesystem cache; ambient host load was not held constant.",
+    "GNU time CPU accounting has 0.01-second resolution; do not infer sub-millisecond process CPU precision from its average.",
+    "These are per-process startup/read/render measurements, not aggregate host savings, cold-cache I/O measurements or seven-day soak evidence.",
+    "The real rclone smoke used temporary local directories, not the production cloud backup."
+  ],
+  "control_cold": {
+    "health": {
+      "ms": 67.13,
+      "cached": null,
+      "refreshing": null,
+      "error": null,
+      "scan_error": null,
+      "directory_count": 0
+    },
+    "concurrent_storage": [
+      {
+        "ms": 7.71,
+        "cached": false,
+        "refreshing": true,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 0
+      },
+      {
+        "ms": 13.95,
+        "cached": false,
+        "refreshing": true,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 0
+      },
+      {
+        "ms": 20.62,
+        "cached": false,
+        "refreshing": true,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 0
+      },
+      {
+        "ms": 13.5,
+        "cached": false,
+        "refreshing": true,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 0
+      },
+      {
+        "ms": 10.46,
+        "cached": false,
+        "refreshing": true,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 0
+      },
+      {
+        "ms": 13.02,
+        "cached": false,
+        "refreshing": true,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 0
+      },
+      {
+        "ms": 18.23,
+        "cached": false,
+        "refreshing": true,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 0
+      },
+      {
+        "ms": 6.27,
+        "cached": false,
+        "refreshing": true,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 0
+      },
+      {
+        "ms": 14.17,
+        "cached": false,
+        "refreshing": true,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 0
+      },
+      {
+        "ms": 11.0,
+        "cached": false,
+        "refreshing": true,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 0
+      }
+    ]
+  },
+  "control_warm": {
+    "health": {
+      "ms": 111.87,
+      "cached": null,
+      "refreshing": null,
+      "error": null,
+      "scan_error": null,
+      "directory_count": 0
+    },
+    "concurrent_storage": [
+      {
+        "ms": 12.44,
+        "cached": true,
+        "refreshing": false,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 14
+      },
+      {
+        "ms": 25.26,
+        "cached": true,
+        "refreshing": false,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 14
+      },
+      {
+        "ms": 16.72,
+        "cached": true,
+        "refreshing": false,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 14
+      },
+      {
+        "ms": 22.46,
+        "cached": true,
+        "refreshing": false,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 14
+      },
+      {
+        "ms": 25.11,
+        "cached": true,
+        "refreshing": false,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 14
+      },
+      {
+        "ms": 18.77,
+        "cached": true,
+        "refreshing": false,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 14
+      },
+      {
+        "ms": 25.16,
+        "cached": true,
+        "refreshing": false,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 14
+      },
+      {
+        "ms": 22.15,
+        "cached": true,
+        "refreshing": false,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 14
+      },
+      {
+        "ms": 23.55,
+        "cached": true,
+        "refreshing": false,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 14
+      },
+      {
+        "ms": 20.91,
+        "cached": true,
+        "refreshing": false,
+        "error": null,
+        "scan_error": null,
+        "directory_count": 14
+      }
+    ]
+  },
+  "fallback_exercise": {
+    "scope": "installed runner shell, isolated state/log/lock/textfile paths, fixed live input snapshot",
+    "engines": [
+      "go",
+      "python"
+    ],
+    "metric_parity": true,
+    "line_count": 71
+  },
+  "live_verification": {
+    "observed_at_utc": "2026-09-27T15:48:05.742173+00:00",
+    "runtime_version": "9e8b8ef3a701c0ea0a7d15bcc17edbc667a97f0368a4cdec91d86e3c129da0c3",
+    "control_active": "active",
+    "failed_units": "",
+    "containers": {
+      "running": 40,
+      "not_running": [],
+      "unhealthy": []
+    },
+    "rules": {
+      "metrics": {
+        "count": 161,
+        "errors": [],
+        "progress_alert_present": true
+      },
+      "logs": {
+        "count": 10,
+        "errors": [],
+        "progress_alert_present": false
+      }
+    },
+    "runner_metrics": {
+      "gh_runner_metrics_last_run_unix_seconds": 1790524022.0,
+      "gh_runner_heartbeat_stale": 0.0,
+      "collector_age_seconds": 68.04437685012817
+    },
+    "backup_deployed": {
+      "go_stream_observer": true,
+      "json_log": true,
+      "pipe_exit_codes": true,
+      "last_success": true
+    },
+    "cd_runtime_mapping": true,
+    "cd_state": {
+      "seen_sha": "0caa6899d8905f5e6aeda1873204270f3207d5a6",
+      "failed_sha": "",
+      "fail_count": 13,
+      "last_good_sha": "0caa6899d8905f5e6aeda1873204270f3207d5a6",
+      "last_deploy_sha": "0caa6899d8905f5e6aeda1873204270f3207d5a6",
+      "last_deploy_ts": 1790455845,
+      "last_deploy_result": "ok"
+    },
+    "cd_baseline": {
+      "homelab-autodeploy": "5b06db1fcef3aa18b32454893e08ee0ee86d8385"
+    }
+  },
+  "deployment_recaps": {
+    "runner": "homelab                    : ok=19   changed=5    unreachable=0    failed=0    skipped=2    rescued=0    ignored=0",
+    "gdrive-backup": "homelab                    : ok=22   changed=5    unreachable=0    failed=0    skipped=8    rescued=0    ignored=0",
+    "homelab-control": "homelab                    : ok=20   changed=2    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0",
+    "vmalert": "homelab                    : ok=14   changed=2    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0",
+    "homelab-autodeploy": "homelab                    : ok=13   changed=2    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0"
+  },
+  "remote_ci": {
+    "sha": "0caa6899d8905f5e6aeda1873204270f3207d5a6",
+    "status": "completed",
+    "conclusion": "success",
+    "url": "https://github.com/aemreusta/raspi-homelab/actions/runs/36265284762",
+    "scope": "previous release; new local commits not pushed/tagged"
+  }
+}

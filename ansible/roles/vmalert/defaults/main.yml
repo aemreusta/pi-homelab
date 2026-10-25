@@ -1,0 +1,244 @@
+---
+# vmalert — Alerting rule evaluator for VictoriaMetrics + VictoriaLogs.
+# https://docs.victoriametrics.com/vmalert.html
+#
+# vmalert v1.x has ONE -datasource.url per process. Mixed PromQL + LogsQL
+# rule sets therefore require two processes:
+#   - vmalert-metrics  → datasource=VictoriaMetrics  (host-saturation rules)
+#   - vmalert-logs     → datasource=VictoriaLogs     (container-error-rate)
+# Both fire alerts to the same Alertmanager. See docs:
+#   https://docs.victoriametrics.com/victorialogs/vmalert/#how-to-use-one-vmalert
+# Sprint 18 fix-up follow-up after PM review.
+
+vmalert_compose_dir: /home/{{ docker_user }}/docker/observability/vmalert
+vmalert_rules_dir: /home/{{ docker_user }}/docker/observability/vmalert/rules
+vmalert_metrics_rules_dir: "{{ vmalert_rules_dir }}/metrics"
+vmalert_logs_rules_dir: "{{ vmalert_rules_dir }}/logs"
+vmalert_tz: "{{ timezone }}"
+
+vmalert_image: victoriametrics/vmalert:latest
+
+# Two HTTP ports — one per instance. Both expose /api/v1/rules + /-/healthy.
+vmalert_metrics_port: 8880
+vmalert_logs_port: 8881
+
+# Datasources (container DNS — all on observability net).
+vmalert_metrics_datasource_url: "http://victoriametrics:8428/"
+vmalert_logs_datasource_url: "http://victorialogs:9428/"
+
+# State persistence (alert state machine) goes to VictoriaMetrics for both
+# instances, keyed by the alertname/labels — there's no collision.
+vmalert_remote_write_url: "http://victoriametrics:8428/"
+vmalert_remote_read_url: "http://victoriametrics:8428/"
+
+# Alertmanager target.
+vmalert_notifier_url: "http://alertmanager:9093/"
+
+vmalert_evaluation_interval: 1m
+
+# Host load thresholds as multiples of the core count. Owned here: the old
+# template read common_cpu_load_*_ratio, which the vmalert play cannot see,
+# so it silently fell back to its defaults. 1.5x sustained 30m backtests to
+# heavy days only (10-05..10-13: just the 10-09 saturation day).
+vmalert_cpu_load_warn_ratio: 1.5
+vmalert_cpu_load_crit_ratio: 3.0
+
+# External URL used by Alertmanager's "view source" links and by vmalert's
+# own UI for absolute links. Hostname is the split-DNS reachable name.
+# Sprint 17 mobile-reachability rule: NEVER construct from default_ipv4.
+vmalert_metrics_hostname: "vmalert.{{ homelab_internal_domains[0] }}"
+vmalert_logs_hostname: "vmalert-logs.{{ homelab_internal_domains[0] }}"
+# https now that *.example is served over trusted HTTPS via Traefik (doc 033).
+vmalert_metrics_external_url: "https://{{ vmalert_metrics_hostname }}"
+vmalert_logs_external_url: "https://{{ vmalert_logs_hostname }}"
+
+vmalert_network: observability
+vmalert_mem_limit: 192M
+vmalert_pids_limit: 128
+vmalert_read_only: true
+vmalert_tmpfs_size: 32m
+
+vmalert_cap_drop:
+  - ALL
+vmalert_cap_add: []
+
+# Rule files split by datasource type. Each list is the basename of a
+# template under ansible/roles/vmalert/templates/rules/.
+vmalert_metric_rule_files:
+  - beszel.yml               # Independent agent sample freshness
+  - authelia.yml             # SSO forward-auth gate liveness (gated services fail without it)
+  - host-saturation.yml      # PromQL — CPU, PID, disk, memory
+  - nfs-client.yml           # Bounded native Mac reads + independent collector liveness
+  - mac-worker.yml           # Mac presence — inhibition source for mac_dependent alerts
+  - indexer-health.yml       # Prowlarr health plus a bounded real Byparr browser request
+  - watchdog.yml            # Watchdog liveness, failed restarts and exhausted budgets
+  - observability-services.yml  # Sprint 020 — speedtest/uptime-kuma + host SMART check
+  - minio.yml                # design 034 — MinIO liveness + cluster health
+  - mlflow.yml               # PRD-004 — MLflow tracking server liveness
+  - homepage-probe.yml       # homepage synthetic probe — pageload/latency + liveness
+  - zot.yml                  # PRD 013 — Zot local OCI registry liveness
+  - gh-runner.yml            # design 039 — Mac GitHub Actions runner + image SLO
+  - homelab-autodeploy.yml   # design 039 — Pi-side homelab GitOps CD controller
+  - backup.yml               # Sprint 10 local backup — the FAST restore path (added 2026-08-03)
+  - gdrive-backup.yml        # design 043 — off-site backup to Google Drive (rclone)
+  - tailscale-split-dns.yml  # 2026-08-05 — tailnet split-DNS routes (control-plane state Ansible cannot converge)
+
+# Predictive disk-fill rule (host-saturation.yml.j2 — PM review O4/B2).
+# floor = free-space ratio the 7d projection must stay above; fires when the
+# last-24h trend predicts free space dropping below it. 0.05 = 5% free (95%
+# full). `for:` debounces a single noisy 24h subquery sample.
+vmalert_srv_disk_fill_rate_floor: 0.05
+vmalert_srv_disk_fill_rate_for: "2h"
+
+# Container memory headroom vs each container's OWN mem_limit
+# (host-saturation.yml.j2). Added 2026-08-02: 41 containers carried a
+# mem_limit and nothing observed any of them; six sat at >=99% of their cap
+# for a 20-day window with zero OOM kills — surviving on boundary reclaim,
+# not on margin.
+#
+# Thresholds are deliberately NOT tight. Measured 20d peaks put mlflow,
+# homepage, tdarr and byparr at 100%, minio at 99.5% and jellyseerr at 99.1%,
+# so 85/95 will fire on real state the day it deploys — that is the finding,
+# not a misconfiguration. Resolve each by raising THAT container's limit
+# against its observed working set. If a service is legitimately bursty and
+# cannot be sized, exclude it explicitly here rather than blunting the
+# threshold for everything.
+#
+# `for:` soaks matter more than the percentages: working set spikes on a Tdarr
+# scan or an mlflow run and a no-soak rule would page on noise, get muted, and
+# reproduce the SrvDiskHigh alert-fatigue failure.
+vmalert_container_mem_warn_pct: 85
+vmalert_container_mem_crit_pct: 95
+vmalert_container_mem_for: "30m"
+vmalert_container_mem_crit_for: "10m"
+
+# Host restart detection (host-saturation.yml.j2). node_boot_time_seconds is
+# an absolute timestamp, so changes() over a window is what marks a restart.
+# The `for:` MUST stay well below the window — changes(...[1h]) drops back to
+# 0 an hour after the boot, so a soak >= the window can never complete and the
+# rule would be structurally dead. 2m is enough to
+# ride out a scrape hiccup without racing the window.
+vmalert_host_reboot_window: "1h"
+vmalert_host_reboot_for: "2m"
+
+# ContainerUnhealthy / ContainerUnhealthyCritical (host-saturation.yml).
+# Source metric is cAdvisor's `container_health_state` (0 = unhealthy).
+# Tiers mirror unhealthy-watchdog's escalation so the two agree instead of
+# double-paging: the watchdog restarts after 3 consecutive 5-min polls
+# (~15m), and spends its 5-restart/24h budget in roughly 75-90 min. So warn
+# at 15m == "a restart did not fix it", crit at 2h == "self-healing is
+# exhausted, a human is required". Raising the crit tier below ~90m would
+# fire while the watchdog is still legitimately retrying.
+vmalert_container_unhealthy_for: "15m"
+vmalert_container_unhealthy_critical_for: "2h"
+
+# Sprint 020 observability-services rules (observability-services.yml.j2).
+vmalert_speedtest_scrape_down_for: "10m"
+vmalert_uptime_kuma_down_for: "5m"
+vmalert_ntfy_down_for: "5m"
+
+# ntfy-bridge delivery health (observability-services.yml.j2). Added
+# 2026-08-02 after 10 alerts were lost in 24h with no signal anywhere except
+# container stderr. The failure counter only increments once BOTH the
+# bridge's 6-attempt retry (~62s) and Alertmanager's own retry have given up,
+# so any firing is a genuinely undelivered notification — hence crit and a
+# short soak. The 1h increase() window keeps it a rate, not a latch: the
+# counter never resets except on container restart, so a level check would
+# stay firing forever after a single bad night.
+vmalert_ntfy_bridge_failures_window: "1h"
+vmalert_ntfy_bridge_failures_for: "5m"
+vmalert_ntfy_bridge_down_for: "10m"
+# Persistent subscriptions do not establish iOS/APNS delivery. Enable only
+# when the deployment actually requires a continuously connected client.
+# This homelab's Android client uses a persistent subscription. Deployments
+# using APNS/upstream polling can opt out explicitly.
+vmalert_ntfy_live_subscribers_required: true
+vmalert_ntfy_no_subscribers_for: "30m"
+# vmagent self-monitoring — watch the scraper so we know when ALL scrape-based
+# alerting is blind. vmalert queries VM directly so this can fire even when
+# vmagent is down (the fundamental property that makes it useful).
+# NodeTextfileScrapeError — the meta-guard for every cron-emitted gauge. A
+# rejected .prom is skipped ENTIRELY by node_exporter while still looking fresh
+# and correct on disk, so every rule reading it silently never fires. Added
+# 2026-08-03 after finding the gauge already at 1: mediacover_reap.prom had a
+# duplicate HELP line (14 gauges never ingested) and homepage_probe.prom
+# carried client-side timestamps. 15m rides out a torn non-atomic write.
+vmalert_node_textfile_scrape_error_for: "15m"
+vmalert_vmagent_scrape_down_for: "5m"
+vmalert_vmagent_remote_write_fail_for: "10m"
+# SmartCheckStale: daily cron (05:00) → stale if no run in >2 days.
+vmalert_smart_check_stale_seconds: 172800
+# SpeedtestStale (silent-zero): freshness is inferred from a per-run gauge
+# changing between hourly runs (speedtest-tracker exposes no last-run timestamp).
+# Set to the verified per-run series; clearing it disables the rule (defensive).
+vmalert_speedtest_freshness_metric: "speedtest_tracker_download_bits"
+vmalert_speedtest_stale_window: "3h"
+# Speedtest result liveness (textfile metric path — independent of vmagent).
+# speedtest-result-liveness.sh runs every 5 min and queries SQLite directly.
+vmalert_speedtest_last_result_failed_for: "15m"
+vmalert_speedtest_liveness_stale_seconds: 7200   # 2h — one missed cycle + slack
+vmalert_speedtest_liveness_stale_for: "30m"
+# SpeedtestStaleV2: staleness via the SQLite-sourced timestamp gauge from
+# speedtest-result-liveness.sh. 6h gives generous slack for two missed hourly
+# tests + the cron's own 5 min interval. Replaces the fragile metric-delta
+# SpeedtestStale (both stay active as belt-and-suspenders).
+vmalert_speedtest_stale_v2_seconds: 21600    # 6h
+vmalert_speedtest_stale_v2_for: "10m"
+
+# Speedtest throughput anomaly rules (metric is bits/s; ~107e6 = ~107 Mbps).
+# Two-pronged: absolute floor tied to the plan rate (catches slow decline +
+# "paying for 100, getting 40" that a relative ratio never sees) AND a relative
+# drop vs an OFFSET baseline (so a sustained brownout can't self-mask its own
+# avg and clear). count guard kills first-week cold-start noise.
+# Floors ≈ 50% of the contracted plan (TurkNet ~100/20; live 2026-05-31: ↓109/↑22).
+# Update both if the plan changes — the floor is what catches slow ISP decline.
+vmalert_speedtest_download_floor_bits: 50000000   # 50 Mbps ≈ 50% of the ~100 Mbps down plan
+vmalert_speedtest_upload_floor_bits: 10000000     # 10 Mbps ≈ 50% of the ~20 Mbps up plan
+vmalert_speedtest_degraded_ratio: 0.5             # fire below 50% of the offset 7d baseline
+vmalert_speedtest_baseline_offset: "6h"           # excludes the live dip from its own baseline
+vmalert_speedtest_anomaly_for: "90m"              # ~2 hourly tests — one bad result won't trip
+vmalert_speedtest_min_samples: 24                 # require ≥24 samples in 7d before relative rules arm
+vmalert_ping_floor_ms: 50                         # absolute ping floor (ignore tiny-baseline noise)
+vmalert_ping_ratio: 3                             # fire when ping > 3× the offset baseline
+
+# gh-runner rules (gh-runner.yml.j2 — design 039). Hoisted for the
+# pending→firing soak drill (override via -e) and so the thresholds are
+# discoverable here, not only inline in the template.
+# SupervisorDown: heartbeat_stale=1 sustained → the runner system is offline.
+vmalert_gh_runner_supervisor_down_for: "15m"
+# MetricsStale: gh_runner.prom mtime older than this → Pi emitter (every 5 min) dead.
+vmalert_gh_runner_metrics_stale_seconds: 1800
+vmalert_gh_runner_metrics_stale_for: "30m"
+# NoIdle: supervisor up, nothing busy, but no idle runner kept ready.
+vmalert_gh_runner_no_idle_for: "30m"
+# QueuedTooLong: a homelab-build job queued (GitHub holds ~24h silently).
+vmalert_gh_runner_queued_too_long_for: "15m"
+# GitHubAuthFailure: PAT 401/403 — a revoked/expired token else looks "offline".
+vmalert_gh_runner_auth_failure_for: "5m"
+# ImageStale (the 30-day --disableupdate SLO): warn 21d / crit 28d.
+vmalert_gh_runner_image_stale_warn_seconds: 1814400   # 21d
+vmalert_gh_runner_image_stale_crit_seconds: 2419200   # 28d
+vmalert_gh_runner_image_stale_for: "1h"
+# JobFailuresBurst: ≥N non-zero job exits in 1h = CI or runner env broken.
+vmalert_gh_runner_job_failures_burst: 3
+vmalert_gh_runner_job_failures_for: "10m"
+
+# homelab-autodeploy rules (homelab-autodeploy.yml.j2 — design 039). Pi-side
+# GitOps CD controller (root cron */5) that auto-deploys changed roles + rolls back.
+vmalert_homelab_autodeploy_stale_seconds: 1800
+vmalert_homelab_autodeploy_stale_for: "30m"
+vmalert_homelab_autodeploy_rolledback_for: "5m"
+vmalert_homelab_autodeploy_run_fail_for: "20m"
+vmalert_homelab_autodeploy_fail_burst: 3
+vmalert_homelab_autodeploy_fail_burst_for: "10m"
+vmalert_homelab_autodeploy_denylist_drift_for: "2h"  # a never_auto target has undeployed repo changes
+
+vmalert_log_rule_files:
+  - container-error-rate.yml # LogsQL — Sonarr/Radarr/Prowlarr/Traefik/Jellyseerr
+
+vmalert_oci_labels:
+  org.opencontainers.image.title: vmalert
+  org.opencontainers.image.description: "vmalert — VictoriaMetrics rule evaluator"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://docs.victoriametrics.com/vmalert.html"

@@ -1,0 +1,14 @@
+# Grafana dashboard provider — managed by Ansible
+# Loads JSON dashboards from /var/lib/grafana/dashboards on container startup.
+
+apiVersion: 1
+
+providers:
+  - name: homelab-default
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 60
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

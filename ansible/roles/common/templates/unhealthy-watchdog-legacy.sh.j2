@@ -1,0 +1,184 @@
+#!/bin/bash
+# /usr/local/bin/unhealthy-watchdog.sh
+# Every 5 min: scan containers reporting health=unhealthy. After
+# {{ common_watchdog_unhealthy_threshold | default(3) }} consecutive
+# unhealthy polls for the same container, `docker restart` it and ntfy.
+# After {{ common_watchdog_max_restarts | default(5) }} restarts within
+# 24 h, stop restarting that container and send URGENT ntfy — manual
+# intervention required.
+#
+# State files in {{ common_watchdog_state_dir | default('/var/lib/homelab') }}/watchdog-<name>.state:
+#   <consecutive_unhealthy>\n<restart_count_24h>\n<last_restart_ts_epoch>\n<last_overbudget_alert_ts>
+#
+# The 4th field was added 2026-09-03. Before it, the OVER-BUDGET branch
+# sent an URGENT ntfy on EVERY 5-min poll for as long as the container
+# stayed unhealthy — the code comment claimed "re-alert at most once per
+# cooldown window" but no cooldown was ever implemented. On 2026-09-02
+# tailscale-dns went netless and sat unhealthy for 25 h; the watchdog spent
+# its 5 restarts (which could never help — the container's docker network
+# was gone, and `docker restart` does not recreate one) and then pushed
+# ~247 URGENT notifications at 5-min intervals, all delivered http=200.
+# That is not an alert, it is a denial-of-service on the operator's
+# attention, and it is why the outage ran 25 h unnoticed. Files missing the
+# 4th line (written by the previous version) read as 0 and simply alert
+# once immediately, so the upgrade needs no state migration.
+#
+# Managed by Ansible (common role) — do not edit manually.
+
+set -uo pipefail
+
+NTFY_URL="{{ ntfy_external_topic_url }}"
+THRESHOLD={{ common_watchdog_unhealthy_threshold | default(3) }}
+MAX_RESTARTS={{ common_watchdog_max_restarts | default(5) }}
+# Minimum seconds between two OVER-BUDGET urgent pushes for the SAME
+# container. vmalert's ContainerUnhealthyCritical is the durable signal for
+# this state; this ntfy is the fast-path nudge, so it only needs to repeat
+# often enough not to be forgotten.
+ALERT_COOLDOWN={{ common_watchdog_overbudget_alert_cooldown | default(21600) }}
+STATE_DIR="{{ common_watchdog_state_dir | default('/var/lib/homelab') }}"
+LOG=/var/log/unhealthy-watchdog.log
+
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+mkdir -p "$STATE_DIR"
+
+# Witness line: proves the 5-min cron fired even when all containers are
+# healthy (the common case). Without it, a silently-broken watchdog leaves
+# no trace in the audit log.
+alert_event "unhealthy-watchdog" run ok "threshold=${THRESHOLD}" "max_restarts=${MAX_RESTARTS}"
+exec >>"$LOG" 2>&1
+echo "--- $(date -Is) scan ---"
+
+# Read state: emits "consecutive restart_count last_restart_ts" on stdout.
+# All values default to 0 if file missing.
+read_state() {
+    local sf="$1"
+    if [ -f "$sf" ]; then
+        cat "$sf"
+    else
+        printf "0\n0\n0\n0\n"
+    fi
+}
+
+write_state() {
+    local sf="$1" cons="$2" rc="$3" lrts="$4" lats="$5"
+    printf "%s\n%s\n%s\n%s\n" "$cons" "$rc" "$lrts" "$lats" > "$sf"
+}
+
+ntfy() {
+    local title="$1" prio="$2" tags="$3" body="$4"
+    ntfy_send "watchdog" \
+        -H "Title: ${title}" \
+        -H "Priority: ${prio}" \
+        -H "Tags: ${tags}" \
+        -d "${body}" \
+        "$NTFY_URL" || true
+}
+
+# Containers currently in unhealthy state (from docker's own health probe).
+mapfile -t UNHEALTHY < <(docker ps --filter health=unhealthy --format '{{ "{{" }}.Names{{ "}}" }}')
+
+# First, clear state for any container that's currently healthy but had a
+# rolling consecutive count from a previous bad spell. Decay restart_count
+# only after 24 h since last_restart_ts.
+NOW=$(date +%s)
+for sf in "$STATE_DIR"/watchdog-*.state; do
+    [ -f "$sf" ] || continue
+    name=${sf##*/watchdog-}
+    name=${name%.state}
+    mapfile -t s < <(read_state "$sf")
+    cons=${s[0]:-0}
+    rc=${s[1]:-0}
+    lrts=${s[2]:-0}
+    lats=${s[3]:-0}
+
+    # If this container is NOT in the current unhealthy list, reset consecutive.
+    # Also clear the over-budget alert stamp so a container that recovers and
+    # later breaks again pages immediately instead of serving out a stale
+    # cooldown from the previous incident.
+    if ! printf '%s\n' "${UNHEALTHY[@]}" | grep -qFx "$name"; then
+        if [ "$cons" -gt 0 ]; then
+            echo "$NOW $name recovered (was cons=$cons)"
+        fi
+        cons=0
+        lats=0
+    fi
+
+    # Decay rolling 24 h restart count once 24 h has elapsed since last restart.
+    if [ "$rc" -gt 0 ] && [ "$((NOW - lrts))" -ge 86400 ]; then
+        echo "$NOW $name restart-budget reset (was rc=$rc)"
+        rc=0
+    fi
+
+    write_state "$sf" "$cons" "$rc" "$lrts" "$lats"
+done
+
+# Now process the unhealthy list.
+for name in "${UNHEALTHY[@]}"; do
+    [ -z "$name" ] && continue
+    sf="$STATE_DIR/watchdog-${name}.state"
+    mapfile -t s < <(read_state "$sf")
+    cons=$((${s[0]:-0} + 1))
+    rc=${s[1]:-0}
+    lrts=${s[2]:-0}
+    lats=${s[3]:-0}
+
+    echo "$NOW $name unhealthy (cons=$cons rc=$rc)"
+
+    if [ "$cons" -lt "$THRESHOLD" ]; then
+        # Not yet at threshold — just bump the count.
+        write_state "$sf" "$cons" "$rc" "$lrts" "$lats"
+        continue
+    fi
+
+    if [ "$rc" -ge "$MAX_RESTARTS" ]; then
+        # Exhausted budget — stop trying. Re-alert at most once per
+        # ALERT_COOLDOWN. This branch is reached on EVERY 5-min poll for as
+        # long as the container stays broken, so an ungated ntfy here means
+        # 288 urgent pushes a day about one container (see header note).
+        if [ "$((NOW - lats))" -ge "$ALERT_COOLDOWN" ]; then
+            echo "$NOW $name OVER-BUDGET (rc=$rc) — alerting, no restart"
+            ntfy "Watchdog: ${name} stuck unhealthy" "urgent" "rotating_light,docker" \
+                "Restarted ${rc}× in 24 h and still unhealthy for ~$(( (cons * 5) / 60 ))h. Manual intervention required. Repeat suppressed for $((ALERT_COOLDOWN / 3600))h. A restart loop that never converges usually means the container's environment changed (missing docker network, vanished bind-mount, distroless image broke an exec healthcheck) — check State.Health.Log and NetworkSettings.Networks, not just the app."
+            lats=$NOW
+        else
+            echo "$NOW $name OVER-BUDGET (rc=$rc) — no restart, alert suppressed ($((NOW - lats))s < ${ALERT_COOLDOWN}s)"
+        fi
+        # Keep climbing cons: it is the only record of how long this has been
+        # broken, and the alert body derives the duration from it.
+        write_state "$sf" "$cons" "$rc" "$lrts" "$lats"
+        continue
+    fi
+
+    # At threshold, under budget — restart and notify.
+    if docker restart "$name" >/dev/null 2>&1; then
+        rc=$((rc + 1))
+        echo "$NOW $name RESTARTED (rc=$rc/$MAX_RESTARTS)"
+        ntfy "Watchdog: restarted ${name}" "default" "wrench,docker" \
+            "Unhealthy ${cons}× in a row → docker restart. Budget ${rc}/${MAX_RESTARTS} in 24 h."
+        write_state "$sf" 0 "$rc" "$NOW" "$lats"
+    else
+        echo "$NOW $name RESTART FAILED"
+        ntfy "Watchdog: restart failed for ${name}" "urgent" "warning,docker" \
+            "Was unhealthy ${cons}× in a row; docker restart returned non-zero. Check dockerd."
+        write_state "$sf" "$cons" "$rc" "$lrts" "$lats"
+    fi
+done
+
+# State-file GC: prune state for containers that no longer exist
+# (renamed, removed, or replaced). Without this, stale state files
+# accumulate forever — e.g. renaming `sonarr` → `sonarr-v4`
+# leaves an orphan watchdog-sonarr.state that's never touched again.
+# Sprint 017 Story 2.
+mapfile -t EXISTING < <(docker ps -a --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null)
+for sf in "$STATE_DIR"/watchdog-*.state; do
+    [ -f "$sf" ] || continue
+    name=${sf##*/watchdog-}
+    name=${name%.state}
+    if ! printf '%s\n' "${EXISTING[@]}" | grep -qFx "$name"; then
+        echo "$NOW $name GC (state file orphaned — container absent)"
+        rm -f "$sf"
+    fi
+done
+
+# Log rotation handled by /etc/logrotate.d/unhealthy-watchdog (weekly×4).

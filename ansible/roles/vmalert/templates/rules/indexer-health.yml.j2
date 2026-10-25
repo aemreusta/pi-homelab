@@ -1,0 +1,63 @@
+# Collector owned by the media role; credentials and page contents are not metrics.
+{% if media_indexer_health_enabled | default(true) %}
+groups:
+  - name: indexer-health
+    interval: 1m
+    rules:
+      - alert: IndexerHealthCollectorStale
+        expr: >-
+          (time() - indexer_health_last_run_timestamp_seconds > 1800)
+          or absent(indexer_health_last_run_timestamp_seconds)
+        for: 10m
+        labels:
+          severity: warn
+          service: prowlarr
+          source: vmalert
+        annotations:
+          summary: 'Indexer health collector stopped publishing'
+          description: 'The 10-minute Go observer is missing or stale. Check the root cron, installed indexer-health subcommand and /var/lib/homelab/indexer-health/status.json. An absent collector does not establish healthy indexers.'
+      - alert: ProwlarrHealthUnreadable
+        expr: (indexer_health_prowlarr_read_success == 0) or (indexer_health_status_read_success == 0)
+        for: 15m
+        labels:
+          severity: warn
+          service: prowlarr
+          source: vmalert
+        annotations:
+          summary: 'Authenticated Prowlarr health or backoff cannot be read'
+          description: 'Check local API availability and config.xml credentials. Error categories are in /var/lib/homelab/indexer-health/status.json; secrets and API messages are intentionally excluded.'
+      - alert: ProwlarrProxyUnhealthy
+        expr: indexer_health_proxy_problems > 0
+        for: 15m
+        labels:
+          severity: warn
+          service: prowlarr
+          source: vmalert
+          mac_dependent: "true"
+        annotations:
+          summary: 'Prowlarr reports an unavailable indexer proxy'
+          description: 'Prowlarr health reports a proxy warning/error. Inspect its native proxy test and Byparr logs after the Mac wakes. This alert is inhibited while the Mac is away or settling; it does not reset backoff.'
+      - alert: ByparrBrowserRequestFailed
+        expr: indexer_health_browser_success == 0
+        for: 15m
+        labels:
+          severity: warn
+          service: byparr
+          source: vmalert
+          mac_dependent: "true"
+        annotations:
+          summary: 'Byparr fails a bounded real browser request'
+          description: 'A /docs 200 is insufficient: the canary requires a successful response envelope and nonempty 2xx page content. Inspect the private diagnostic. Mac absence inhibits this alert. A successful public canary does not prove protected search or torrent downloads.'
+      - alert: ProwlarrIndexerUnhealthy
+        expr: (indexer_health_indexer_problems > 0) or (indexer_health_indexers_in_backoff > 0)
+        for: 30m
+        labels:
+          severity: warn
+          service: prowlarr
+          source: vmalert
+        annotations:
+          summary: 'Prowlarr reports persistent indexer problems'
+          description: 'Native health reports warnings/errors or at least one indexer remains in backoff. The condition must persist for 30 minutes. Check provider cooldown and request limits in Prowlarr; do not force-save, delete queues or reset backoff to hide them.'
+{% else %}
+groups: []
+{% endif %}

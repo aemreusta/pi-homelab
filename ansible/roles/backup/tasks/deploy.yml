@@ -1,0 +1,66 @@
+---
+# Ensure state-file dir exists. /srv/backups itself is created by the
+# storage role (storage_path) — do NOT recreate it here.
+#
+# owner is `docker_user`, NOT root, even though everything THIS role writes
+# here runs as root (2026-08-04). /var/lib/homelab is shared state — another
+# role declares it `{{ docker_user }}` for its emitter/reconciler state — and the two
+# claims were silently fighting: whichever role deployed last set the owner.
+# root writing into a docker_user-owned directory works; the reverse does not,
+# so the least-privileged writer has to win. Getting this backwards on
+# /opt/homelab/control froze six watcher state files for two days and produced
+# 74 duplicate pushes a day. Guarded by tests/test_shared_path_ownership.py.
+- name: Ensure homelab state directory exists
+  ansible.builtin.file:
+    path: "{{ backup_state_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  become: true
+
+- name: Ensure backup log file exists
+  ansible.builtin.file:
+    path: "{{ backup_log }}"
+    state: touch
+    owner: root
+    group: root
+    mode: "0644"
+    modification_time: preserve
+    access_time: preserve
+  become: true
+
+- name: Template per-method backup scripts
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/usr/local/bin/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - homelab-backup.sh
+    - backup-tar.sh
+    - backup-stop_tar.sh
+    - backup-sqlite.sh
+    - backup-pg_dump.sh
+    - backup-pg_globals.sh
+  become: true
+
+- name: Install logrotate config for backup log
+  ansible.builtin.template:
+    src: logrotate-homelab-backup.j2
+    dest: /etc/logrotate.d/homelab-backup
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+
+- name: Schedule weekly backup cron
+  ansible.builtin.cron:
+    name: "homelab-backup"
+    minute: "{{ backup_schedule_minute }}"
+    hour: "{{ backup_schedule_hour }}"
+    weekday: "{{ backup_schedule_weekday }}"
+    job: "/usr/local/bin/homelab-backup.sh >> {{ backup_log }} 2>&1"
+    user: root
+  become: true

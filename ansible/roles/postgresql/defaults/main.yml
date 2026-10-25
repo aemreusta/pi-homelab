@@ -1,0 +1,115 @@
+---
+# PostgreSQL — shared relational backend for the ML stack (PRD-004, Faz-1).
+# Serves: MLflow (experiment tracking), and future Langfuse/Prefect consumers.
+# PostgreSQL is NOT exposed to the LAN — only loopback (host admin psql) and
+# the mlstack_net bridge (container-to-container service-name resolution).
+
+postgresql_compose_dir: /home/{{ docker_user }}/docker/data/postgresql
+# Data lives on the SSD, isolated from the compose dir — a compose-dir wipe
+# (e.g. re-template) never touches the database files.
+postgresql_data_dir: /srv/data/postgres
+postgresql_tz: "{{ timezone }}"
+
+# postgres:16-alpine is multi-arch (arm64 included), officially maintained,
+# and Alpine-small. Pin the major version; minor upgrades are compatible in-place.
+# Bump deliberately — Postgres data-format upgrades require pg_upgrade, not just
+# pulling a new tag.
+postgresql_image: "postgres:16-alpine"
+
+# Loopback-only host binding — no LAN exposure. ML services reach Postgres via
+# the shared mlstack_net bridge using service-name resolution (postgresql:5432).
+# The host binding is retained for admin psql from the Pi (maintenance, migrations).
+postgresql_port: 5432
+
+# Shared bridge that all ML-stack containers join. This role creates the network;
+# MLflow and future consumers declare `external: true` so they can connect via
+# service name (postgresql:5432, minio:9000) without hairpinning through the LAN IP.
+postgresql_network: mlstack_net
+
+# PostgreSQL runs the `postgres` daemon as UID 999 (the `postgres` system user).
+# Data dir is pre-owned 999:999 so cap_drop ALL works without CHOWN.
+postgresql_puid: 999
+postgresql_pgid: 999
+
+# Superuser credentials. The superuser is never used by ML services directly —
+# each service gets its own unprivileged user (see postgresql_databases below).
+# vault_postgres_password must be >= 12 chars (role asserts this).
+postgresql_postgres_password: "{{ vault_postgres_password | default('') }}"
+
+# Databases to provision. Each entry creates a user + database, idempotently.
+# Add Langfuse/Prefect entries here when those services are deployed.
+# Passwords must be supplied in vault (see vault.yml.example).
+postgresql_databases:
+  - name: mlflow
+    user: mlflow
+    password: "{{ vault_mlflow_db_password | default('') }}"
+  # Label Studio (Django) — native Postgres backend. Data migrated from SQLite
+  # via `manage.py dumpdata -e django_rq | loaddata`.
+  - name: label_studio
+    user: label_studio
+    password: "{{ vault_label_studio_db_password | default('') }}"
+  # Authelia (SSO / OIDC provider) — storage backend (sessions, OIDC tokens,
+  # user prefs). The user identity itself is a file (users_database.yml); Postgres
+  # is the storage backend, not a user directory. SSO Phase 1 (research 036).
+  - name: authelia
+    user: authelia
+    password: "{{ vault_authelia_db_password | default('') }}"
+
+# Container memory limit. Raised 384M → 1G (2026-07-07) to host a large *arr
+# DB (~400K rows) + Label Studio alongside MLflow. Still a runaway-containment
+# ceiling, not a reservation — Postgres default shared_buffers is 128M; the extra
+# headroom is page cache + per-connection work_mem for the *arr refresh workload.
+postgresql_mem_limit: 1G
+
+# /dev/shm for Postgres POSIX dynamic shared memory (parallel VACUUM / hash-agg
+# workers). Docker's 64 MB default throws "could not resize shared memory
+# segment" on a ~400K-row *arr database; 256M fixes it with ample headroom under
+# the 1G mem_limit (shm is charged against the container's memory).
+postgresql_shm_size: 256M
+
+# --- Server config (postgres -c flags) ---
+# pg_stat_statements: cluster-wide "which queries burn the most total time"
+# lens — the operational baseline for every later perf decision (*arr
+# refresh + MLflow + Label Studio all share this one cluster). Loaded via
+# shared_preload_libraries, which requires a full restart (handled by the
+# template→Restart-postgresql handler). The extension itself is created per-DB
+# in configure.yml. Query it with:
+#   docker exec postgresql psql -U postgres -d postgres -c \
+#     "SELECT queryid, calls, round(total_exec_time::numeric,1) AS total_ms, \
+#             round(mean_exec_time::numeric,2) AS mean_ms, \
+#             left(query,80) AS query FROM pg_stat_statements \
+#      ORDER BY total_exec_time DESC LIMIT 20;"
+postgresql_shared_preload_libraries: pg_stat_statements
+postgresql_server_conf:
+  - "pg_stat_statements.max=10000"        # distinct normalized statements tracked
+  - "pg_stat_statements.track=all"        # incl. nested statements (fn bodies)
+  # track_utility=off: utility/DDL statements are NOT normalized, so tracking
+  # them stores literals — including the `ALTER ROLE ... PASSWORD '<secret>'`
+  # the idempotent rotation task issues every deploy, which would then sit in
+  # the world-readable-to-superuser pg_stat_statements view. We only care about
+  # DML query time here, so drop utility tracking entirely (also avoids VACUUM/
+  # CHECKPOINT noise). NB: a one-time `SELECT pg_stat_statements_reset()` purges
+  # any secret captured before this flag landed — do NOT bake a reset into the
+  # role (it runs every deploy and would wipe the cumulative stats).
+  - "pg_stat_statements.track_utility=off"
+
+# Database in which to CREATE EXTENSION pg_stat_statements. The view reads the
+# cluster-wide shared-memory counters, so the admin `postgres` DB sees every
+# database's statements from one place.
+postgresql_stat_statements_db: postgres
+
+# --- Container security hardening ---
+postgresql_pids_limit: 200
+# postgres:16-alpine listens on port 5432 (>1024, no NET_BIND_SERVICE), writes to
+# /var/lib/postgresql/data (owned by 999, no DAC_OVERRIDE), forks workers (no
+# special caps). cap_drop ALL is viable once the data dir is pre-owned correctly.
+postgresql_cap_drop:
+  - ALL
+
+postgresql_oci_labels:
+  org.opencontainers.image.title: postgresql
+  org.opencontainers.image.description: "PostgreSQL — shared relational backend for the ML stack (MLflow, Langfuse, Prefect)"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/postgresql/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://hub.docker.com/_/postgres"

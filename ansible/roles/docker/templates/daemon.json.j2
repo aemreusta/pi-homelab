@@ -1,0 +1,9 @@
+{
+  "data-root": "{{ docker_data_root }}",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "{{ docker_log_max_size }}",
+    "max-file": "{{ docker_log_max_file }}"
+  }{% if docker_dns_servers | default([]) | length > 0 %},
+  "dns": {{ docker_dns_servers | to_json }}{% endif %}
+}

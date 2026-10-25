@@ -1,0 +1,6 @@
+---
+- name: Deploy MLflow experiment tracking server
+  hosts: pi
+  become: true
+  roles:
+    - mlflow

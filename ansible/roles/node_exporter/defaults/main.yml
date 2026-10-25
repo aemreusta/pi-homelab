@@ -1,0 +1,35 @@
+---
+# Prometheus node_exporter — host hardware metrics
+# https://github.com/prometheus/node_exporter
+# (verified by the homelab GitOps CD self-deploy path, 2026-06-26)
+
+node_exporter_compose_dir: /home/{{ docker_user }}/docker/observability/node-exporter
+node_exporter_tz: "{{ timezone }}"
+
+node_exporter_image: prom/node-exporter:latest
+node_exporter_port: 9100
+
+# host network mode kullanılıyor — Pi sıcaklık/CPU/network sayaçlarına direkt erişim için.
+node_exporter_mem_limit: 64M
+
+# Textfile collector directory. Producers (tdarr-summary.sh, kernel-io-scan.sh,
+# …) write *.prom here; the container reads it through the /:/host:ro mount,
+# hence the /host prefix in the compose --collector.textfile.directory flag.
+node_exporter_textfile_dir: /var/lib/node_exporter/textfile
+
+# --- Kernel storage-fault scanner (2026-08-01 USB root-dropout) ---
+# Classifies kernel log lines into fault classes and emits gauges so the
+# UAS-abort / USB-reset precursor window is observable BEFORE ext4 gives up
+# and remounts read-only. See
+# docs/incidents/2026-08-01-usb-ssd-root-dropout-readonly.md and roles/node_exporter/files/kernel_io_scan.py.
+node_exporter_kernel_io_scan_enabled: true
+node_exporter_scan_script_dir: /usr/local/bin
+# Every 5 min: cheap (a journalctl read + a regex pass), and a link that is
+# flapping wants sub-alert-interval resolution.
+node_exporter_kernel_io_scan_cron_minute: "*/5"
+
+# --- Container security hardening ---
+node_exporter_pids_limit: 50
+node_exporter_cap_drop:
+  - ALL
+node_exporter_cap_add: []

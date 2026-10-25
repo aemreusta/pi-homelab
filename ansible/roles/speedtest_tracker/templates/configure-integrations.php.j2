@@ -1,0 +1,38 @@
+<?php
+// Speedtest Tracker integration config — managed by Ansible, do not edit.
+// Idempotently sets the Prometheus integration enable flag in the settings
+// DB (spatie/laravel-settings, group=dataintegration). Run via:
+//   docker exec speedtest-tracker php /config/{{ speedtest_tracker_configure_script }}
+// Prints CHANGED if it modified a value, OK if already in the desired state,
+// so the Ansible task can report changed_when correctly. The Prometheus
+// endpoint is exposed at /prometheus (prefix speedtest_tracker_*) once enabled;
+// see roles/vmagent for the scrape job that consumes it.
+
+$desired = {{ speedtest_tracker_prometheus_enabled | bool | ternary('true', 'false') | to_json }}; // "true"/"false" (DB payload is JSON)
+
+try {
+    $db = new PDO('sqlite:/config/database.sqlite');
+    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (Exception $e) {
+    fwrite(STDERR, "DB not ready: " . $e->getMessage() . "\n");
+    exit(1);
+}
+
+$sel = $db->prepare('SELECT payload FROM settings WHERE "group" = ? AND name = ?');
+$sel->execute(['dataintegration', 'prometheus_enabled']);
+$cur = $sel->fetchColumn();
+
+if ($cur === false) {
+    fwrite(STDERR, "setting row missing (migrations not complete?)\n");
+    exit(1);
+}
+
+if ($cur === $desired) {
+    echo "OK\n";
+    exit(0);
+}
+
+$upd = $db->prepare('UPDATE settings SET payload = ? WHERE "group" = ? AND name = ?');
+$upd->execute([$desired, 'dataintegration', 'prometheus_enabled']);
+echo "CHANGED\n";
+exit(0);

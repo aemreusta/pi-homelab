@@ -1,0 +1,27 @@
+---
+jellyseerr_compose_dir: /home/{{ docker_user }}/docker/media/jellyseerr
+jellyseerr_config_dir: /home/{{ docker_user }}/docker/media/jellyseerr/config
+jellyseerr_tz: "{{ timezone }}"
+jellyseerr_port: "5055"
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+jellyseerr_mem_limit: 256M
+
+# --- Container security hardening ---
+
+jellyseerr_pids_limit: 300
+jellyseerr_read_only: true
+jellyseerr_tmpfs_size: 64m
+
+# Jellyseerr image runs as `node` user (UID 1000) by default. cap_drop ALL safe.
+jellyseerr_cap_drop:
+  - ALL
+jellyseerr_cap_add: []
+
+jellyseerr_oci_labels:
+  org.opencontainers.image.title: jellyseerr
+  org.opencontainers.image.description: "Jellyseerr — Netflix-style media request system"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/jellyseerr/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://github.com/Fallenbagel/jellyseerr"

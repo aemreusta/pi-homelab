@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.homelab.github-runner-rebuild</string>
+
+    <!-- Rebuild + re-push the runner image on the 1st and 15th at 04:00, so the
+         image never drifts toward GitHub's 30-day disableupdate cliff by hand.
+         Max age between runs ~15 days — comfortably under the 21d ImageStale warn.
+         NOT RunAtLoad: a rebuild on every login would waste minutes and could
+         disrupt an in-flight CI job when it recreates the supervisor. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/operator</string>
+    </dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/operator/GitHub/raspi-homelab/mac-worker/github-runner/scripts/rebuild-runner-image.sh</string>
+    </array>
+
+    <!-- DAILY, not twice-monthly. The old Day-1 + Day-15 trigger missed both
+         2026-08-15 and 2026-09-01 (laptop asleep/off), and with only two
+         chances a month there is no slack: the image aged to 33 days, past
+         GitHub's 30-day disableupdate cliff where it stops being sent jobs
+         entirely. The ~biweekly CADENCE now lives in the script's age guard
+         (REBUILD_MIN_AGE_DAYS, default 14), so a daily trigger is cheap — it
+         exits in well under a second unless the image is actually old. Many
+         chances to catch the Mac awake; still only ~2 real builds a month. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key><integer>4</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/operator/GitHub/raspi-homelab/mac-worker/github-runner/logs/rebuild.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/operator/GitHub/raspi-homelab/mac-worker/github-runner/logs/rebuild.log</string>
+</dict>
+</plist>

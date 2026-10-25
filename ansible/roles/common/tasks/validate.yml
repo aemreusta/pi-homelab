@@ -1,0 +1,46 @@
+---
+# Pre-flight validation — catch misconfigurations before they reach the Pi.
+# Included early in base playbook so failures happen fast.
+
+- name: Validate required infrastructure variables
+  ansible.builtin.assert:
+    that:
+      - docker_user is defined
+      - docker_user | length > 0
+      - timezone is defined
+      - lan_subnet is defined
+    fail_msg: >-
+      Missing required infrastructure variables.
+      Check inventory/group_vars/all/main.yml
+    quiet: true
+  tags: [common, validate]
+
+- name: Validate required vault variables
+  ansible.builtin.assert:
+    that:
+      - vault_qbittorrent_username is defined
+      - vault_qbittorrent_password is defined
+      - vault_homelab_control_token is defined
+    fail_msg: >-
+      Missing required vault variables.
+      Check inventory/group_vars/all/vault.yml
+    quiet: true
+  tags: [common, validate]
+
+- name: Check available disk space (minimum 1GB free on /)
+  ansible.builtin.assert:
+    that:
+      - item.size_available >= 1073741824
+    fail_msg: "Insufficient disk space on {{ item.mount }} ({{ (item.size_available / 1048576) | int }}MB free)"
+    quiet: true
+  loop: "{{ ansible_facts['mounts'] }}"
+  when: item.mount == "/"
+  tags: [common, validate]
+
+- name: Check available memory (minimum 512MB)
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['memfree_mb'] >= 512 or ansible_facts['memory_mb']['swap']['free'] >= 512
+    fail_msg: "Low memory: {{ ansible_facts['memfree_mb'] }}MB free RAM, {{ ansible_facts['memory_mb']['swap']['free'] }}MB free swap"
+    quiet: true
+  tags: [common, validate]

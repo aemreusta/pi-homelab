@@ -1,0 +1,75 @@
+#!/bin/bash
+# backup-pg_globals.sh — pg_dumpall --globals-only via docker exec.
+#
+# WHY THIS EXISTS (gap found 2026-08-02): `pg_dump <db>` dumps a database's
+# schema and data but NOT the cluster's globals — roles, their passwords, and
+# grants. Restoring the existing per-database dumps onto a fresh cluster fails
+# immediately: every object references an owner (authelia, mlflow,
+# label_studio) that does not exist, and even after hand-creating the roles
+# every service would be locked out because its password is gone.
+#
+# So this is not an extra nicety; without it the other pg_dump snapshots are
+# not restorable. Restore order is: globals first, then the per-database dumps.
+#
+# Invoked by homelab-backup.sh with:
+#   $1=service_name  $2=container_name
+set -uo pipefail
+
+BACKUP_ROOT="{{ backup_root }}"
+SERVICE="$1"
+CONTAINER="$2"
+
+DATE="$(date -u +%Y-%m-%d)"
+DEST_DIR="${BACKUP_ROOT}/${SERVICE}/${DATE}"
+PARTIAL="${DEST_DIR}/${SERVICE}.sql.gz.partial.$$"
+FINAL="${DEST_DIR}/${SERVICE}.sql.gz"
+
+mkdir -p "$DEST_DIR"
+
+cleanup_partial() { rm -f "$PARTIAL"; }
+trap cleanup_partial EXIT INT TERM
+
+if ! docker exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then
+    printf '{"service":"%s","method":"pg_globals","status":"fail","bytes":0,"duration_ms":0,"error":"pg_isready failed for %s"}\n' \
+        "$SERVICE" "$CONTAINER"
+    exit 1
+fi
+
+start_ms=$(date +%s%3N)
+
+# --globals-only: roles, tablespaces and grants, no database contents.
+# `set -o pipefail` (top of file) makes $? the rightmost non-zero status in the
+# pipeline, so a single rc covers both pg_dumpall and gzip. Do NOT reach for
+# ${PIPESTATUS[1]} here: reading PIPESTATUS[0] first resets the array, and
+# under `set -u` the second read aborts the script — which is exactly how this
+# recipe failed its first live run.
+docker exec "$CONTAINER" pg_dumpall -U postgres --globals-only \
+    2>/tmp/backup-${SERVICE}.err | gzip -c > "$PARTIAL"
+rc=$?
+end_ms=$(date +%s%3N)
+duration=$((end_ms - start_ms))
+
+if [ "$rc" -ne 0 ]; then
+    err=$(head -c 200 /tmp/backup-${SERVICE}.err 2>/dev/null | tr '\n' ' ')
+    rm -f /tmp/backup-${SERVICE}.err
+    printf '{"service":"%s","method":"pg_globals","status":"fail","bytes":0,"duration_ms":%d,"error":"%s"}\n' \
+        "$SERVICE" "$duration" "${err:-pg_dumpall rc=$rc}"
+    exit 1
+fi
+rm -f /tmp/backup-${SERVICE}.err
+
+# A globals dump that contains no CREATE ROLE is a silent failure: pg_dumpall
+# can exit 0 and emit only a header if it cannot read pg_authid. Empty output
+# here would mean believing we have a restorable cluster when we do not.
+if ! gzip -dc "$PARTIAL" 2>/dev/null | grep -q "CREATE ROLE"; then
+    printf '{"service":"%s","method":"pg_globals","status":"fail","bytes":0,"duration_ms":%d,"error":"dump contains no CREATE ROLE"}\n' \
+        "$SERVICE" "$duration"
+    exit 1
+fi
+
+bytes=$(stat -c %s "$PARTIAL")
+mv "$PARTIAL" "$FINAL"
+trap - EXIT INT TERM
+
+printf '{"service":"%s","method":"pg_globals","status":"ok","bytes":%d,"duration_ms":%d}\n' \
+    "$SERVICE" "$bytes" "$duration"

@@ -1,0 +1,38 @@
+---
+# VictoriaLogs — LogsQL-queryable log database
+# https://docs.victoriametrics.com/victorialogs/
+
+victorialogs_compose_dir: /home/{{ docker_user }}/docker/observability/victorialogs
+victorialogs_data_dir: /home/{{ docker_user }}/docker/observability/victorialogs/data
+victorialogs_tz: "{{ timezone }}"
+
+victorialogs_image: victoriametrics/victoria-logs:latest
+victorialogs_port: 9428
+
+# 30 günlük log retention. SSD'de ~15 GB tahmin.
+victorialogs_retention_period: 30d
+
+# Container memory limit (kernel cgroup_enable=memory gerekli)
+victorialogs_mem_limit: 768M
+
+# Shared docker bridge network used by the observability stack so
+# vmagent/grafana can reach VL/VM by container name.
+victorialogs_network: observability
+
+# --- Container security hardening ---
+
+victorialogs_pids_limit: 200
+victorialogs_read_only: true
+victorialogs_tmpfs_size: 64m
+
+victorialogs_cap_drop:
+  - ALL
+victorialogs_cap_add: []
+
+victorialogs_oci_labels:
+  org.opencontainers.image.title: victorialogs
+  org.opencontainers.image.description: "VictoriaLogs — LogsQL-queryable log database"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/victorialogs/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://docs.victoriametrics.com/victorialogs/"

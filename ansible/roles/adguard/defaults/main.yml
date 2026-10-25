@@ -1,0 +1,152 @@
+---
+adguard_compose_dir: /home/{{ docker_user }}/docker/network/adguard
+adguard_data_dir: /home/{{ docker_user }}/docker/network/adguard/data
+adguard_tz: "{{ timezone }}"
+
+# DNS upstream servers
+# ── Encrypted transports (2026-09-03) ────────────────────────────────────────
+# Measured from the Pi, 15 queries each: plain UDP/53 succeeded 6/15 to
+# 1.1.1.1, 9/15 to 9.9.9.9, 8/15 to 8.8.8.8 — while ICMP to the SAME 1.1.1.1
+# lost only 10%. A transport that fails 60% where ping fails 10% is being
+# filtered, not congested, and this ISP filters UDP/53 hardest. TCP/443 to the
+# same networks tested 7/8-8/8 in the same window, so the fix is to change
+# TRANSPORT, not to shop for a different resolver IP.
+#
+# What this does and does not fix: it removes ~2,271 upstream retries per 30 min
+# (measured) and the tail latency they cause. It does NOT fix the ISP's
+# filtering, and it was NOT fixing a user-visible outage — see the note below on
+# why the absorption layer was still holding.
+#
+# 1.1.1.1 is deliberately absent as an upstream: it is the single most
+# interfered-with address on this ISP (its :853 was refused outright while
+# 9.9.9.9:853 handshook 10/10). It stays in bootstrap, where it is used rarely
+# and only to resolve the hostnames below.
+adguard_upstream_dns:
+  - "tls://dns.quad9.net"
+  - "https://cloudflare-dns.com/dns-query"
+
+# Bootstrap DNS — MUST stay plain IPs: these resolve the DoT/DoH hostnames
+# above, so they cannot themselves be hostnames (chicken-and-egg). Used once
+# per upstream and then cached, so the UDP loss barely matters here.
+adguard_bootstrap_dns:
+  - "9.9.9.9"
+  - "8.8.8.8"
+
+# ── Upstream resilience (added 2026-08-02 after a measured 12–15% failure rate) ──
+# Symptom: ~250 queries/hour returned SERVFAIL to LAN clients after a 20 s hang
+# (`dnsproxy: exchange failed ... i/o timeout`), rising to ~614 log events/hour.
+# Diagnosis that matters: the upstreams themselves were FINE — `dig @1.1.1.1`
+# from the Pi answered in 3 ms throughout, and a retry from inside the adguard
+# netns succeeded 6/6. So this is intermittent UDP loss on the egress path, not
+# a dead resolver, and the fix is to stop letting one lost packet become a
+# 20-second user-visible hang. Three independent layers, cheapest first:
+#
+#   1. upstream_mode: parallel — query every upstream AT ONCE and take the first
+#      answer. This is the direct cause fix. With the default (load_balance) a
+#      loss costs upstream_timeout (10 s), then the next upstream is tried for
+#      another 10 s → the exact 20.00 s durations in the log. In parallel mode a
+#      single lost packet is invisible: the other upstream already answered.
+#      Cost: ~2x upstream query volume (~2.1k q/h here — negligible).
+#   2. fallback_dns — used only when every upstream fails. Previously EMPTY, so
+#      "both primaries lost the packet" had no recovery path at all. Deliberately
+#      a THIRD operator (Google) so a Cloudflare or Quad9 incident isn't fatal.
+#   3. cache_optimistic — serve the stale cached answer immediately and refresh
+#      in the background. Any name resolved before becomes immune to upstream
+#      latency entirely. This is what turns a slow resolver into an invisible one.
+#
+# Why this was never noticed: AdGuard's own `avg_processing_time` read 3.04 ms
+# while 12% of queries were hanging 20 s — the mean drowns the tail. Do not
+# trust that number; the SLI is the timeout COUNT (see the AdguardUpstreamFailures
+# rule in vmalert's dns-health rules), not the average.
+adguard_fallback_dns:
+  - "8.8.8.8"
+  - "8.8.4.4"
+
+# parallel | load_balance | fastest_addr. See the note above — `parallel` is the
+# fix for serial timeout stacking, not a performance tweak.
+adguard_upstream_mode: parallel
+
+# Seconds AdGuard waits on an upstream before giving up. Kept at the AdGuard
+# default; with parallel mode a single slow upstream no longer serialises.
+# 10s -> 3s (2026-09-03). With parallel upstreams over TCP-based
+# transports a healthy answer arrives well inside 3s; the old 10s only
+# governed how long a LAN client hung when every upstream lost a packet.
+adguard_upstream_timeout: 3
+
+# Stale-while-revalidate. Requires cache_enabled (default true upstream).
+adguard_cache_optimistic: true
+
+# Local DNS domain (legacy primary; the full set lives in
+# homelab_internal_domains — group_vars/all/main.yml). Kept for the OCI label.
+adguard_local_domain: example
+
+# Pi IP address for local DNS rewrites
+adguard_host_ip: "{{ ansible_facts['default_ipv4']['address'] }}"
+
+# Local DNS rewrite entries — one `*.<domain>` wildcard per internal domain
+# (→ Pi IP). Driven by homelab_internal_domains so adding/renaming a domain is
+# a one-line change there; falls back to the single legacy domain if unset.
+adguard_dns_rewrites: >-
+  {{ (homelab_internal_domains | default([adguard_local_domain]))
+     | map('regex_replace', '^(.+)$', '*.\1')
+     | map('community.general.dict_kv', 'domain') | list }}
+
+# Container memory limit (requires kernel cgroup_enable=memory)
+adguard_mem_limit: 256M
+
+# --- Container security hardening ---
+
+# PID limit — AdGuard runs DNS, HTTP UI, and stats workers (Go binary).
+adguard_pids_limit: 200
+
+# Read-only root filesystem; /tmp via tmpfs. The data dir bind mount stays writable
+# (AdGuard writes config + filter cache + logs there).
+adguard_read_only: true
+adguard_tmpfs_size: 64m
+
+# Linux capabilities. Drop all, re-add NET_BIND_SERVICE — AdGuard binds ports 53
+# (DNS) and 80 (HTTP UI) INSIDE the container, both privileged.
+adguard_cap_drop:
+  - ALL
+adguard_cap_add:
+  - NET_BIND_SERVICE
+
+# OCI image labels (applied to the container).
+adguard_oci_labels:
+  org.opencontainers.image.title: adguard
+  org.opencontainers.image.description: "AdGuard Home — LAN DNS server with ad-blocking and *.example rewrites"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/adguard/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://adguard.com/adguard-home/"
+
+# --- Custom filtering rules ("user rules") ------------------------------------
+# The API has no merge endpoint: /control/filtering/set_rules REPLACES the whole
+# user-rules block. So this list is the single source of truth — edit it here,
+# never in the AdGuard UI, or the next `make adguard` silently reverts the UI.
+#
+# tabii (TRT's streaming service) refuses to play and prints "Tarayıcında reklam
+# engelleyici olduğunu tespit ettik" whenever its Google IMA pre-roll request
+# fails — and a DNS-blocked ad server is exactly that failure, so the player
+# never starts. These exceptions are HOSTNAME-scoped on purpose: allowlisting
+# `||doubleclick.net^` wholesale would disable a large slice of the blocklist,
+# while these eight names are only the IMA/GPT video-ad path.
+#
+# Trade-off to know before adding more: an exception is GLOBAL — it applies to
+# every LAN client and every site, so display ads served through GPT come back
+# elsewhere too. Append `$client=192.0.2.102` (IP, CIDR, or an AdGuard client
+# name) to a rule to scope it to one device instead.
+adguard_allowlist_rules:
+  - "@@||imasdk.googleapis.com^" # Google IMA SDK — the video-ad player itself
+  - "@@||securepubads.g.doubleclick.net^" # GPT ad request — the one tabii probes
+  - "@@||pubads.g.doubleclick.net^"
+  - "@@||googleads.g.doubleclick.net^"
+  - "@@||static.doubleclick.net^"
+  - "@@||stats.g.doubleclick.net^"
+  - "@@||pagead2.googlesyndication.com^"
+  - "@@||tpc.googlesyndication.com^"
+
+# Extra blocking rules, if any. Same file-is-truth caveat as above.
+adguard_blocklist_rules: []
+
+adguard_user_rules: "{{ adguard_allowlist_rules + adguard_blocklist_rules }}"

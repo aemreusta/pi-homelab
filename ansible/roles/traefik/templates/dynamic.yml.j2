@@ -1,0 +1,220 @@
+# Traefik dynamic configuration
+# Managed by Ansible — do not edit manually
+
+http:
+  routers:
+{% for svc in traefik_services %}
+{# One router rule matching this service across EVERY internal domain
+   (homelab_internal_domains) → Host(`svc.example`) || Host(`svc.example.org`). #}
+{% set svc_hosts = homelab_internal_domains | default(['homelab']) | map('regex_replace', '^', 'Host(`' ~ svc.name ~ '.') | map('regex_replace', '$', '`)') | join(' || ') %}
+{# Forward-auth (Authelia) on this service's hostname routers when flagged. #}
+{% set svc_auth = (svc.auth | default(false)) and (traefik_forward_auth_enabled | default(false)) %}
+{# A single-label internal domain (bare `example`) can't hold an SSO session
+   cookie, so gated services split their routers: cookie-capable domains
+   (example.org) are gated; single-label domains redirect to the primary domain. #}
+{% set cookie_domains = homelab_internal_domains | default(['homelab']) | select('search', '[.]') | list %}
+{% set nolabel_domains = homelab_internal_domains | default(['homelab']) | reject('search', '[.]') | list %}
+{% set svc_cookie_hosts = cookie_domains | map('regex_replace', '^', 'Host(`' ~ svc.name ~ '.') | map('regex_replace', '$', '`)') | join(' || ') %}
+{% set svc_nolabel_hosts = nolabel_domains | map('regex_replace', '^', 'Host(`' ~ svc.name ~ '.') | map('regex_replace', '$', '`)') | join(' || ') %}
+{% if not (traefik_force_https_redirect | default(false)) %}
+    # LAN HTTP router (dual-stack during rollout). Once
+    # traefik_force_https_redirect is true, the web entrypoint 301s to HTTPS
+    # before routing, so these are omitted. No HSTS on plaintext (RFC 6797 §7.2).
+    {{ svc.name }}:
+      rule: "{{ svc_hosts }}"
+      entryPoints:
+        - web
+      service: {{ svc.name }}
+{% if svc_auth or (traefik_security_headers | default(true)) %}
+      middlewares:
+{% if svc_auth %}
+        - authelia
+{% endif %}
+{% if traefik_security_headers | default(true) %}
+        - security-headers
+{% endif %}
+{% endif %}
+{% endif %}
+{% if traefik_internal_ca_enabled | default(true) %}
+{% if svc_auth %}
+    # Gated (Authelia) — cookie-capable domains only.
+    {{ svc.name }}-https:
+      rule: "{{ svc_cookie_hosts }}"
+      entryPoints:
+        - websecure
+      service: {{ svc.name }}
+      tls: {}
+      middlewares:
+        - authelia
+{% if traefik_security_headers | default(true) %}
+        - security-headers-tls
+{% endif %}
+{% if svc_nolabel_hosts %}
+    # Single-label .example can't hold the SSO cookie → redirect to the primary
+    # domain (where it IS gated). Keeps internal .example bookmarks working.
+    {{ svc.name }}-https-legacy:
+      rule: "{{ svc_nolabel_hosts }}"
+      entryPoints:
+        - websecure
+      service: {{ svc.name }}
+      tls: {}
+      middlewares:
+        - to-primary-domain
+{% if traefik_security_headers | default(true) %}
+        - security-headers-tls
+{% endif %}
+{% endif %}
+{% else %}
+    {{ svc.name }}-https:
+      rule: "{{ svc_hosts }}"
+      entryPoints:
+        - websecure
+      service: {{ svc.name }}
+      tls: {}
+{% if traefik_security_headers | default(true) %}
+      middlewares:
+        - security-headers-tls
+{% endif %}
+{% endif %}
+{% endif %}
+{% endfor %}
+
+    # Dashboard
+{% set dash_hosts = homelab_internal_domains | default(['homelab']) | map('regex_replace', '^', 'Host(`traefik.') | map('regex_replace', '$', '`)') | join(' || ') %}
+{% if not (traefik_force_https_redirect | default(false)) %}
+    traefik-dashboard:
+      rule: "{{ dash_hosts }}"
+      entryPoints:
+        - web
+      service: api@internal
+{% if traefik_dashboard_htpasswd | length > 0 or traefik_security_headers | default(true) %}
+      middlewares:
+{% if traefik_dashboard_htpasswd | length > 0 %}
+        - dashboard-auth
+{% endif %}
+{% if traefik_security_headers | default(true) %}
+        - security-headers
+{% endif %}
+{% endif %}
+{% endif %}
+{% if traefik_internal_ca_enabled | default(true) %}
+    traefik-dashboard-https:
+      rule: "{{ dash_hosts }}"
+      entryPoints:
+        - websecure
+      service: api@internal
+      tls: {}
+{% if traefik_dashboard_htpasswd | length > 0 or traefik_security_headers | default(true) %}
+      middlewares:
+{% if traefik_dashboard_htpasswd | length > 0 %}
+        - dashboard-auth
+{% endif %}
+{% if traefik_security_headers | default(true) %}
+        - security-headers-tls
+{% endif %}
+{% endif %}
+{% endif %}
+
+# Removed 2026-08-04 (P0 security fix): the Tailscale path-prefix routers
+# (Host(traefik_tailscale_fqdn) && PathPrefix(/svc)) never carried the
+# `authelia` middleware — svc_auth is scoped to the per-service router loop
+# above and was never recomputed here, so the gated *arr/filebrowser UIs were
+# reachable over Tailscale with SSO fully bypassed while gated on the LAN.
+# A per-router fix isn't viable: every one of these routers shares ONE host
+# (traefik_tailscale_fqdn) differentiated only by path, but Authelia's
+# session cookie + access_control rules are domain-scoped to
+# homelab_internal_domains — gating this host would 403 everyone (no
+# access_control rule matches it, default_policy: deny), not gate them.
+# Superseded by https://<svc>.example.internal over Tailscale (already
+# resolves via the tailscale_dns dnsmasq role to the Pi's Tailscale IP),
+# which reuses the existing, already-gated LAN HTTPS routers verbatim —
+# no new cookie-domain plumbing. Old /svc-prefixed bookmarks now 404.
+
+  middlewares:
+{% if traefik_security_headers | default(true) %}
+    # NOTE: security-headers and security-headers-tls share the first 4 fields.
+    # If you add a header, add it to BOTH. HSTS lives ONLY on the -tls variant
+    # (attached to websecure routers) — never on plaintext HTTP (RFC 6797 §7.2).
+    security-headers:
+      headers:
+        frameDeny: true
+        browserXssFilter: true
+        contentTypeNosniff: true
+        customFrameOptionsValue: "SAMEORIGIN"
+    security-headers-tls:
+      headers:
+        frameDeny: true
+        browserXssFilter: true
+        contentTypeNosniff: true
+        customFrameOptionsValue: "SAMEORIGIN"
+        forceSTSHeader: true
+        stsSeconds: {{ traefik_hsts_seconds | default(86400) }}
+        stsIncludeSubdomains: true
+{% endif %}
+{% if traefik_forward_auth_enabled | default(false) %}
+    # Authelia forward-auth. Attached (above) only to routers of services flagged
+    # `auth: true` in traefik_services. Unauthenticated browser requests are 302'd
+    # to the Authelia portal (auth.<domain>); on success Authelia sets the session
+    # cookie and the request is replayed with the Remote-* identity headers.
+    authelia:
+      forwardAuth:
+        address: "{{ traefik_authelia_address }}"
+        trustForwardHeader: true
+        authResponseHeaders:
+          - "Remote-User"
+          - "Remote-Name"
+          - "Remote-Email"
+          - "Remote-Groups"
+    # Redirect a single-label internal host (e.g. sonarr.example, which can't hold
+    # an SSO cookie → 400 at the authz endpoint) to the primary domain
+    # (sonarr.example.org), where the gate works. Attached only to *-https-legacy.
+    to-primary-domain:
+      redirectRegex:
+        regex: "^https?://([^/.]+)\\.[^/.]+(/.*)?$"
+        replacement: "https://${1}.{{ homelab_internal_domains[0] }}${2}"
+        permanent: false
+{% endif %}
+{% if traefik_dashboard_htpasswd | length > 0 %}
+    dashboard-auth:
+      basicAuth:
+        users:
+          - "{{ traefik_dashboard_htpasswd }}"
+{% endif %}
+  services:
+{% for svc in traefik_services %}
+    {{ svc.name }}:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:{{ svc.port }}"
+{% endfor %}
+
+tls:
+{% if traefik_internal_ca_enabled | default(true) %}
+  # Present the *.example wildcard for any SNI-less / unmatched request so clients
+  # never see Traefik's built-in self-signed default.
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/homelab.crt
+        keyFile: /certs/homelab.key
+{% endif %}
+  options:
+    default:
+      minVersion: {{ traefik_tls_min_version }}
+      cipherSuites:
+{% for suite in traefik_tls_cipher_suites %}
+        - {{ suite }}
+{% endfor %}
+      curvePreferences:
+{% for curve in traefik_tls_curve_preferences %}
+        - {{ curve }}
+{% endfor %}
+  certificates:
+{% if traefik_internal_ca_enabled | default(true) %}
+    - certFile: /certs/homelab.crt
+      keyFile: /certs/homelab.key
+{% endif %}
+{% if traefik_tailscale_fqdn | length > 0 %}
+    - certFile: /certs/{{ traefik_tailscale_fqdn }}.crt
+      keyFile: /certs/{{ traefik_tailscale_fqdn }}.key
+{% endif %}

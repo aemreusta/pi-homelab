@@ -1,0 +1,37 @@
+---
+- name: Create node_exporter compose directory
+  ansible.builtin.file:
+    path: "{{ node_exporter_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+# Textfile collector directory: producers (e.g. tdarr-summary.sh) write
+# *.prom files here as docker_user; node_exporter reads via the existing
+# /:/host:ro,rslave mount with --collector.textfile.directory=/host/...
+# Must exist before container starts or the collector emits no metrics.
+- name: Create node_exporter textfile collector directory
+  ansible.builtin.file:
+    path: "{{ node_exporter_textfile_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+  become: true
+
+- name: Copy node_exporter docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ node_exporter_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart node_exporter
+
+- name: Start node_exporter container
+  community.docker.docker_compose_v2:
+    project_src: "{{ node_exporter_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

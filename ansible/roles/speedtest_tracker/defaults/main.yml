@@ -1,0 +1,97 @@
+---
+# Speedtest Tracker — hourly Ookla speedtest persisted to SQLite.
+# See docs/archive/prds/010-speedtest-tracker.md.
+
+speedtest_tracker_compose_dir: /home/{{ docker_user }}/docker/core/speedtest-tracker
+speedtest_tracker_config_dir: /home/{{ docker_user }}/docker/core/speedtest-tracker/config
+speedtest_tracker_tz: "{{ timezone }}"
+
+# Joins the existing `observability` network so vmagent can scrape
+# /api/v1/metrics/prometheus by service name (speedtest-tracker:80).
+speedtest_tracker_network: observability
+
+speedtest_tracker_image: "lscr.io/linuxserver/speedtest-tracker:latest"
+
+# Host port → container 80 (nginx + PHP-FPM)
+speedtest_tracker_port: 8765
+
+# PUID/PGID match host owner (UID/GID 1000)
+speedtest_tracker_puid: 1000
+speedtest_tracker_pgid: 1000
+
+# Laravel APP_KEY (32-char base64). Generate with:
+#   docker run --rm lscr.io/linuxserver/speedtest-tracker:latest \
+#     php artisan key:generate --show
+speedtest_tracker_app_key: "{{ vault_speedtest_app_key | default('') }}"
+
+# Initial admin login (filament/auth)
+speedtest_tracker_admin_email: "{{ vault_speedtest_admin_email | default('admin@raspberrypi.local') }}"
+speedtest_tracker_admin_password: "{{ vault_speedtest_admin_password | default('') }}"
+
+# Cron schedule. Moved off :00 to :30 (2026-06-23) — top-of-hour collided with
+# the pile-up of :00 jobs (notably a retired 15:00 library full-scan's tail),
+# starving the Ookla config fetch → ConfigurationError. :30 is a quiet window.
+# Opt-down to "30 */4 * * *" if Jellyfin streams collide with WAN saturation.
+speedtest_tracker_schedule: "30 * * * *"
+
+# Public domain — used by Filament for absolute URLs in admin panel.
+speedtest_tracker_app_url: "https://speedtest.{{ homelab_internal_domains[0] }}"
+
+# Pinned to the two most-reliable Istanbul servers (by successful-test history:
+# Turknet 11250 = 261 ok, Kapteyan 51661 = 121 ok over 30d). Auto-select makes
+# the Ookla CLI fetch the full server list every run, and that discovery fetch
+# is a failure point — 14 of 15 failures (2026-05/06) were the CLI's
+# "Could not retrieve or read configuration (ConfigurationError)". Pinning skips
+# server discovery + stabilises which server is measured. Residual transient
+# base-config failures are inherent to the Ookla CLI (no retry in the app); if
+# they still annoy, opt the schedule down to "0 */4 * * *" to cut exposure ~6x.
+speedtest_tracker_servers: "11250,51661"
+
+# Container memory limit (PHP-FPM + nginx + Laravel)
+speedtest_tracker_mem_limit: 384M
+
+# --- Container security hardening ---
+
+speedtest_tracker_pids_limit: 200
+
+# LinuxServer.io image: the s6 `init-folders` step runs as root and
+# mkdir/chowns /config, needing CHOWN/DAC_OVERRIDE/FOWNER + SETUID/SETGID to
+# drop to the abc user. cap_drop ALL with only NET_BIND_SERVICE fails s6 init
+# (`mkdir: Permission denied`, first-deploy bug 2026-05-30). Standard LSIO
+# cap set + NET_BIND_SERVICE for nginx on :80.
+# Prometheus integration — exposes /prometheus (speedtest_tracker_* metrics)
+# for vmagent to scrape. Stored in the settings DB (not an env var in this
+# image), so the role sets it idempotently via configure.yml. See roles/vmagent.
+speedtest_tracker_prometheus_enabled: true
+speedtest_tracker_configure_script: configure-integrations.php
+# SQLite WAL conversion script (configure.yml) — flips journal_mode=delete→wal
+# to stop "database is locked" under concurrent web/queue access. Persistent in
+# the DB header; idempotent.
+speedtest_tracker_wal_script: configure-sqlite-wal.php
+
+# Weekly ntfy summary (alerts.yml) — queries VictoriaMetrics for the window's
+# avg/min/max ↓/↑/ping and pushes a digest. Anomaly *alerting* is in vmalert;
+# this is the human-readable report. Sun 10:00.
+speedtest_tracker_vm_url: "http://127.0.0.1:8428"
+speedtest_tracker_report_window: "7d"
+speedtest_tracker_report_cron: { minute: "0", hour: "10", weekday: "0" }
+
+speedtest_tracker_cap_drop:
+  - ALL
+speedtest_tracker_cap_add:
+  - CHOWN
+  - DAC_OVERRIDE
+  - FOWNER
+  - SETGID
+  - SETUID
+  - NET_BIND_SERVICE   # binds 80 inside the container
+
+# read_only NOT enabled — Laravel writes to storage + framework cache.
+
+speedtest_tracker_oci_labels:
+  org.opencontainers.image.title: speedtest-tracker
+  org.opencontainers.image.description: "Speedtest Tracker — hourly ISP bandwidth log"
+  org.opencontainers.image.source: "https://github.com/aemreusta/raspi-homelab"
+  org.opencontainers.image.documentation: "https://github.com/aemreusta/raspi-homelab/blob/master/ansible/roles/speedtest_tracker/README.md"
+  org.opencontainers.image.vendor: "homelab"
+  org.opencontainers.image.url: "https://github.com/alexjustesen/speedtest-tracker"

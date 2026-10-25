@@ -1,0 +1,97 @@
+---
+- name: Create FileBrowser compose directory
+  ansible.builtin.file:
+    path: "{{ filebrowser_compose_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Create FileBrowser config directory
+  ansible.builtin.file:
+    path: "{{ filebrowser_config_dir }}"
+    state: directory
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0755"
+
+- name: Seed FileBrowser settings
+  ansible.builtin.template:
+    src: settings.json.j2
+    dest: "{{ filebrowser_config_dir }}/settings.json"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+    force: false
+  notify: Restart filebrowser
+
+- name: Copy FileBrowser docker-compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ filebrowser_compose_dir }}/docker-compose.yml"
+    owner: "{{ docker_user }}"
+    group: "{{ docker_user }}"
+    mode: "0644"
+  notify: Restart filebrowser
+
+# settings.json's auth.method=noauth is only read when FileBrowser SEEDS a
+# fresh database — it does not apply to an already-existing database.db
+# (found 2026-08-04: database predates the noauth setting, so it kept
+# prompting its own login on top of Authelia). `config set` needs exclusive
+# access to the bolt file (it times out against a running server), so the
+# container must be stopped for this block and is brought back up after —
+# GET→diff→set idempotency (TODO.md SSO section) avoids an unnecessary
+# stop/start on every deploy once already applied.
+- name: Check whether FileBrowser database already exists
+  ansible.builtin.stat:
+    path: "{{ filebrowser_config_dir }}/database.db"
+  register: filebrowser_db_stat
+
+# `not ansible_check_mode` is LOAD-BEARING, not tidiness (2026-08-04 RCA).
+# `docker_compose_v2: state: stopped` is a no-op under `--check` that still
+# reports `changed`, while a `check_mode: false` probe below it really runs
+# — against a container that is therefore still holding the bolt lock. The
+# probe then dies `Error: timeout`, and because the CD gates every deploy on
+# `ansible-playbook --check --diff` BEFORE apply, that failure bricked the
+# whole `deploy-v2026.08.04.1` tag into a rollback without ever reaching the
+# apply phase. Same family as the `uri`-skip class (design 040) with a
+# different accessor: a probe whose PRECONDITION is established by a task
+# check mode skips. Anything needing exclusive access to live state belongs
+# behind this gate; `tests/test_check_mode_probe_safety.py` holds it repo-wide.
+- name: Apply noauth to the pre-existing FileBrowser database
+  when: filebrowser_db_stat.stat.exists and not ansible_check_mode
+  block:
+    - name: Stop FileBrowser (exclusive bolt access for the config check/set below)
+      community.docker.docker_compose_v2:
+        project_src: "{{ filebrowser_compose_dir }}"
+        state: stopped
+      become: true
+      become_user: "{{ docker_user }}"
+
+    # Tolerated, not trusted: an unreadable config must not fail the deploy
+    # (that is the exact shape that just cost a tag). An empty stdout fails
+    # the regex below, so the worst case is an idempotent re-`set`, which
+    # DOES fail loudly if the database is genuinely inaccessible.
+    - name: Read current FileBrowser auth method
+      ansible.builtin.command:
+        cmd: >-
+          docker run --rm -v {{ filebrowser_config_dir }}:/config
+          filebrowser/filebrowser:latest config cat -d /config/database.db
+      register: filebrowser_config_cat
+      changed_when: false
+      failed_when: false
+
+    - name: Set FileBrowser auth method to noauth (Authelia is the real gate)
+      ansible.builtin.command:
+        cmd: >-
+          docker run --rm -v {{ filebrowser_config_dir }}:/config
+          filebrowser/filebrowser:latest config set --auth.method=noauth -d /config/database.db
+      when: not (filebrowser_config_cat.stdout | default('') is regex('Auth Method:\s+noauth'))
+      changed_when: true
+
+- name: Start FileBrowser container
+  community.docker.docker_compose_v2:
+    project_src: "{{ filebrowser_compose_dir }}"
+    state: present
+  become: true
+  become_user: "{{ docker_user }}"

@@ -1,0 +1,87 @@
+---
+# Off-site backup to Google Drive via rclone — design 043.
+#
+# WHY THIS EXISTS: five USB power outages on 2026-08-01/02 killed the
+# second-local-disk plan (docs/conventions/pi4-usb-power-budget.md). Backups
+# were left on the ROOT filesystem — the same disk they protect, which is also
+# the disk that keeps failing. Google Drive gives genuinely off-device,
+# off-site copies with no power budget to exceed.
+#
+# Account: backup-account@example.com (5 TB). Backup set is ~6 GiB/week.
+
+gdrive_backup_enabled: true
+
+# --- rclone binary -------------------------------------------------------
+# Debian Trixie ships 1.60.1 (2022). Google Drive's OAuth handling and the
+# chunked uploader have both moved on a lot since; use the upstream build and
+# PIN it, so a re-provision three months from now installs the same thing.
+gdrive_backup_rclone_version: v1.75.0
+gdrive_backup_rclone_arch: linux-arm64
+gdrive_backup_rclone_bin: /usr/local/bin/rclone
+# Release archives unpack to <stem>/rclone; hoisted so the download and install
+# tasks cannot drift apart.
+gdrive_backup_rclone_stem: "rclone-{{ gdrive_backup_rclone_version }}-{{ gdrive_backup_rclone_arch }}"
+
+# --- What to sync --------------------------------------------------------
+# backup_root by default, so this rides on top of the existing weekly backup
+# rather than duplicating its logic. The local run stays the fast restore path;
+# Drive is the copy that survives the Pi.
+gdrive_backup_source: "{{ backup_root | default('/srv/backups') }}"
+
+# --- Drive layout --------------------------------------------------------
+# One homelab/ tree, browsable from the Drive UI, so this account doubles as a
+# general storage channel rather than an opaque backup sink. Folders are
+# created idempotently on every run — Drive has no `mkdir -p` equivalent that
+# a plain sync would trigger.
+gdrive_backup_root_folder: homelab
+gdrive_backup_folders:
+  - backups
+  - movies
+  - documents
+  - archive
+
+gdrive_backup_remote: "gdrive:{{ gdrive_backup_root_folder }}/backups"
+
+# --- Encryption: NOT USED (operator decision, 2026-08-02) ----------------
+# An rclone `crypt` remote was built first, because the backup set contains
+# Postgres dumps, SQLite databases and service configs — i.e. credentials.
+# The operator chose plaintext instead: the account is single-owner and the
+# tree needs to stay browsable from the Drive UI for general storage use.
+# The residual risk is therefore account compromise, not Google. See
+# docs/design/043-offsite-backup-google-drive.md for the trade-off as accepted.
+
+# --- Schedule ------------------------------------------------------------
+# Sunday 05:00: the weekly backup starts 03:00 (~5 min) and docker-prune runs
+# 04:00, so this lands after both with room to spare.
+gdrive_backup_cron_minute: "0"
+gdrive_backup_cron_hour: "5"
+gdrive_backup_cron_weekday: "0"
+
+# Bandwidth cap. The upstream link is shared with everything else in the house;
+# an uncapped 6 GiB push saturates it. Empty string disables the cap.
+gdrive_backup_bwlimit: "4M"
+
+# rclone's own retries. Drive rate-limits aggressively on the shared client ID.
+gdrive_backup_transfers: 4
+gdrive_backup_checkers: 8
+# 64M upload chunks: the 8M default costs extra round-trips on the
+# multi-hundred-MB Postgres/SQLite dumps. Each concurrent transfer buffers a
+# chunk in RAM, so transfers x chunk_size is the memory cost — 4 x 64M on an
+# 8 GB Pi is fine, but do not raise both at once.
+gdrive_backup_chunk_size: 64M
+# Keep clear of Drive's per-second API quota, which is easy to trip on the
+# shared client ID.
+gdrive_backup_tpslimit: 8
+
+gdrive_backup_log: /var/log/homelab-gdrive-sync.log
+gdrive_backup_ntfy_url: "{{ ntfy_external_topic_url }}"
+gdrive_backup_textfile_dir: "{{ node_exporter_textfile_dir | default('/var/lib/node_exporter/textfile') }}"
+
+# Config lives root-only: it holds the Google OAuth refresh token.
+gdrive_backup_config_dir: /root/.config/rclone
+gdrive_backup_config_path: /root/.config/rclone/rclone.conf
+
+# Streamed logs and progress; no source/sync semantics change.
+gdrive_backup_go_binary: /usr/local/bin/homelab-agent
+gdrive_backup_detail_log: /var/log/homelab-gdrive-rclone.log
+gdrive_backup_last_success_file: /var/lib/homelab/gdrive-backup/last-success

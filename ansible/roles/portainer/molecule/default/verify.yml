@@ -1,0 +1,91 @@
+---
+- name: Verify — assert hardening directives are present in rendered files
+  hosts: localhost
+  gather_facts: false
+  vars:
+    sandbox: /tmp/molecule-portainer
+  tasks:
+
+    - name: Slurp docker-compose.yml
+      ansible.builtin.slurp:
+        src: "{{ sandbox }}/docker-compose.yml"
+      register: dc
+
+    - name: Decode docker-compose
+      ansible.builtin.set_fact:
+        compose_yaml: "{{ (dc.content | b64decode) | from_yaml }}"
+        compose_text: "{{ dc.content | b64decode }}"
+
+    - name: Assert security_opt no-new-privileges
+      ansible.builtin.assert:
+        that:
+          - "'no-new-privileges:true' in compose_yaml.services.portainer.security_opt"
+        fail_msg: "no-new-privileges:true missing from security_opt"
+
+    - name: Assert cap_drop ALL
+      ansible.builtin.assert:
+        that:
+          - "'ALL' in compose_yaml.services.portainer.cap_drop"
+        fail_msg: "cap_drop must include ALL"
+
+    - name: Assert read_only true
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.portainer.read_only | bool
+        fail_msg: "read_only must be true"
+
+    - name: Assert tmpfs has /tmp with size + hardening flags
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.portainer.tmpfs | length > 0
+          - compose_yaml.services.portainer.tmpfs[0] is search('^/tmp:')
+          - compose_yaml.services.portainer.tmpfs[0] is search('size=')
+          - compose_yaml.services.portainer.tmpfs[0] is search('noexec')
+          - compose_yaml.services.portainer.tmpfs[0] is search('nosuid')
+          - compose_yaml.services.portainer.tmpfs[0] is search('nodev')
+        fail_msg: "tmpfs /tmp missing or missing hardening flags"
+
+    - name: Assert pids_limit set and reasonable
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.portainer.pids_limit is defined
+          - compose_yaml.services.portainer.pids_limit | int > 0
+          - compose_yaml.services.portainer.pids_limit | int <= 1000
+        fail_msg: "pids_limit missing or out of range"
+
+    - name: Assert mem_limit set
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.portainer.mem_limit is defined
+        fail_msg: "mem_limit must be set"
+
+    - name: Assert healthcheck explicitly disabled (Portainer is scratch — no shell)
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.portainer.healthcheck is defined
+          - compose_yaml.services.portainer.healthcheck.disable | bool
+        fail_msg: "healthcheck must be disabled — Portainer image has no shell/wget/curl"
+
+    - name: Assert OCI labels present
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.portainer.labels['org.opencontainers.image.title'] is defined
+          - compose_yaml.services.portainer.labels['org.opencontainers.image.source'] is defined
+          - compose_yaml.services.portainer.labels['org.opencontainers.image.vendor'] is defined
+          - compose_yaml.services.portainer.labels['org.opencontainers.image.documentation'] is defined
+          - compose_yaml.services.portainer.labels['org.opencontainers.image.description'] is defined
+        fail_msg: "OCI image labels incomplete"
+
+    - name: Assert /data volume uses absolute path (no relative ./data)
+      ansible.builtin.assert:
+        that:
+          - compose_yaml.services.portainer.volumes is defined
+          - compose_text is not search('- \\./data:/data')
+          - compose_text is search('/data:/data')
+        fail_msg: "data volume must use absolute path, not relative ./data"
+
+    - name: Assert docker.sock mount present (Portainer needs it)
+      ansible.builtin.assert:
+        that:
+          - "'/var/run/docker.sock:/var/run/docker.sock' in compose_yaml.services.portainer.volumes"
+        fail_msg: "docker.sock mount missing — Portainer cannot manage containers without it"

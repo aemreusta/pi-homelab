@@ -1,0 +1,104 @@
+---
+# qBittorrent saves its settings on shutdown. Editing a running instance's
+# file loses changes, so edits happen stopped; the always block also restores
+# service after an error.
+- name: Wait for the active qBittorrent profile configuration
+  ansible.builtin.wait_for:
+    path: "{{ media_qbittorrent_config_dir }}/qBittorrent.conf"
+    state: present
+    timeout: 30
+
+# Probe first: the same edits in check mode against the saved profile. Until
+# 2026-10-16 every media deploy stopped and restarted qBittorrent (and every
+# running download) even when nothing differed; `changed_when: false` hid it.
+- name: Probe the qBittorrent default save path
+  ansible.builtin.replace:
+    path: "{{ media_qbittorrent_config_dir }}/qBittorrent.conf"
+    regexp: '=/downloads/'
+    replace: '=/data/downloads/'
+  check_mode: true
+  register: media_qbittorrent_savepath_probe
+
+- name: Probe the managed qBittorrent settings
+  ansible.builtin.lineinfile:
+    path: "{{ media_qbittorrent_config_dir }}/qBittorrent.conf"
+    regexp: "^{{ item.key | regex_escape() }}="
+    line: "{{ item.key }}={{ item.value }}"
+    insertafter: "{{ item.after }}"
+  loop: "{{ media_qbittorrent_managed_settings }}"
+  loop_control:
+    label: "{{ item.key }}"
+  check_mode: true
+  register: media_qbittorrent_settings_probe
+  diff: false
+
+- name: Probe the qBittorrent category bootstrap
+  ansible.builtin.stat:
+    path: "{{ media_qbittorrent_config_dir }}/categories.json"
+  register: media_qbittorrent_categories_probe
+
+- name: Configure the stopped qBittorrent profile
+  when: >-
+    media_qbittorrent_savepath_probe is changed
+    or media_qbittorrent_settings_probe is changed
+    or not media_qbittorrent_categories_probe.stat.exists
+  block:
+    - name: Stop qBittorrent before configuration changes
+      community.docker.docker_container:
+        name: qbittorrent
+        state: stopped
+
+    - name: Fix qBittorrent default save path
+      ansible.builtin.replace:
+        path: "{{ media_qbittorrent_config_dir }}/qBittorrent.conf"
+        regexp: '=/downloads/'
+        replace: '=/data/downloads/'
+
+    - name: Configure the managed qBittorrent settings
+      ansible.builtin.lineinfile:
+        path: "{{ media_qbittorrent_config_dir }}/qBittorrent.conf"
+        regexp: "^{{ item.key | regex_escape() }}="
+        line: "{{ item.key }}={{ item.value }}"
+        insertafter: "{{ item.after }}"
+      loop: "{{ media_qbittorrent_managed_settings }}"
+      loop_control:
+        label: "{{ item.key }}"
+      diff: false
+
+    # qBittorrent owns live category data, including recovery categories and
+    # per-category retention settings. Bootstrap new profiles only.
+    - name: Bootstrap active qBittorrent download categories
+      ansible.builtin.template:
+        src: qbittorrent-categories.json.j2
+        dest: "{{ media_qbittorrent_config_dir }}/categories.json"
+        owner: "{{ docker_user }}"
+        group: "{{ docker_user }}"
+        mode: "0644"
+        force: false
+  always:
+    - name: Start qBittorrent after configuration changes
+      community.docker.docker_container:
+        name: qbittorrent
+        state: started
+
+- name: Read live qBittorrent queue preferences
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ media_qbittorrent_ui_port }}/api/v2/app/preferences"
+    return_content: true
+  register: media_qbittorrent_preferences
+  until: media_qbittorrent_preferences.status | default(0) == 200
+  retries: 12
+  delay: 5
+  when: not ansible_check_mode
+  no_log: true
+
+- name: Verify qBittorrent applied the managed queue limits
+  ansible.builtin.assert:
+    that:
+      - media_qbittorrent_preferences.json.queueing_enabled
+      - media_qbittorrent_preferences.json.max_active_torrents | int == media_qbittorrent_max_active_torrents | int
+      - media_qbittorrent_preferences.json.max_active_downloads | int == media_qbittorrent_max_active_downloads | int
+      - media_qbittorrent_preferences.json.max_active_uploads | int == media_qbittorrent_max_active_uploads | int
+    fail_msg: "qBittorrent's live queue limits differ from the managed active profile"
+  when: not ansible_check_mode
+  no_log: true

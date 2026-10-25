@@ -1,0 +1,21 @@
+---
+# Bucket provisioning via the `mc` client bundled inside the MinIO image
+# (/usr/bin/mc) — no separate sidecar container needed.
+#
+# The alias is supplied inline through the MC_HOST_<alias> environment variable
+# (`MC_HOST_local`) instead of `mc alias set`, so mc needs no writable config
+# dir inside the container (it runs as 1000:1000 with no persistent $HOME) and
+# the credentials never appear in argv / process list / logs.
+#
+# Idempotent: `mc mb --ignore-existing` is a no-op when the bucket exists.
+
+- name: Create MinIO buckets (idempotent)
+  ansible.builtin.command:
+    cmd: >-
+      docker exec
+      -e MC_HOST_local=http://{{ minio_root_user }}:{{ minio_root_password }}@127.0.0.1:9000
+      minio mc --quiet mb --ignore-existing local/{{ item }}
+  loop: "{{ minio_buckets }}"
+  register: minio_mb
+  changed_when: "'created' in (minio_mb.stdout | default(''))"
+  no_log: true

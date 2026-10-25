@@ -1,0 +1,4 @@
+---
+- name: Include Fluent Bit deploy tasks
+  ansible.builtin.include_tasks: deploy.yml
+  tags: [fluentbit]

@@ -1,0 +1,69 @@
+---
+# Speedtest Tracker — Laravel app that runs Ookla speedtest on a cron.
+# https://github.com/alexjustesen/speedtest-tracker
+# Managed by Ansible — do not edit manually.
+
+services:
+  speedtest-tracker:
+    image: {{ speedtest_tracker_image }}
+    container_name: speedtest-tracker
+    restart: unless-stopped
+    # NO `init: true` — this is a linuxserver.io (s6-overlay) image. s6-overlay
+    # MUST be PID 1; docker's init (tini) demotes it → "s6-overlay-suexec: fatal:
+    # can only run as pid 1" crash loop (ExitCode 100). s6 already reaps zombies,
+    # so tini is redundant here. Verified 2026-06-07.
+    mem_limit: {{ speedtest_tracker_mem_limit }}
+    pids_limit: {{ speedtest_tracker_pids_limit }}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+{% for c in speedtest_tracker_cap_drop %}
+      - {{ c }}
+{% endfor %}
+{% if speedtest_tracker_cap_add | length > 0 %}
+    cap_add:
+{% for c in speedtest_tracker_cap_add %}
+      - {{ c }}
+{% endfor %}
+{% endif %}
+    labels:
+{% for k, v in speedtest_tracker_oci_labels.items() %}
+      {{ k }}: "{{ v }}"
+{% endfor %}
+    environment:
+      - TZ={{ speedtest_tracker_tz }}
+      - PUID={{ speedtest_tracker_puid }}
+      - PGID={{ speedtest_tracker_pgid }}
+      - APP_KEY={{ speedtest_tracker_app_key }}
+      - APP_URL={{ speedtest_tracker_app_url }}
+      - DB_CONNECTION=sqlite
+      - SPEEDTEST_SCHEDULE={{ speedtest_tracker_schedule }}
+{% if speedtest_tracker_servers | length > 0 %}
+      - SPEEDTEST_SERVERS={{ speedtest_tracker_servers }}
+{% endif %}
+      - ADMIN_EMAIL={{ speedtest_tracker_admin_email }}
+      - ADMIN_PASSWORD={{ speedtest_tracker_admin_password }}
+    ports:
+      - "{{ speedtest_tracker_port }}:80"
+    volumes:
+      - {{ speedtest_tracker_config_dir }}:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # /api/healthcheck is this version's health route (verified 2026-05-30:
+    # returns 200; the scaffolded /up is a Laravel-11 route this image lacks →
+    # 404 → permanently "unhealthy" despite the app being fine).
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1/api/healthcheck"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - {{ speedtest_tracker_network }}
+
+networks:
+  {{ speedtest_tracker_network }}:
+    external: true

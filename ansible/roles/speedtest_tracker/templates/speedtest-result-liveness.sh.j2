@@ -1,0 +1,73 @@
+#!/bin/bash
+# Speedtest result liveness check — managed by Ansible (speedtest_tracker role).
+# Queries the Speedtest Tracker SQLite DB for the last result status and 24h
+# failure count. Emits node_exporter textfile metrics so vmalert can detect:
+#   - Last test failed (speedtest_last_result_ok == 0)
+#   - Script stopped running (speedtest_result_liveness_last_run stale)
+#   - Failure spike (speedtest_failed_last_24h count)
+#
+# Runs every 5 min. Follows the atomic textfile emit pattern.
+
+set -uo pipefail
+
+DB="{{ speedtest_tracker_config_dir }}/database.sqlite"
+TEXTFILE_DIR="{{ common_node_exporter_textfile_dir | default('/var/lib/node_exporter/textfile') }}"
+TEXTFILE="${TEXTFILE_DIR}/speedtest_result_liveness.prom"
+
+# shellcheck source=/dev/null
+source /usr/local/lib/homelab/alert-lib.sh
+
+if [ ! -f "$DB" ]; then
+    alert_event "speedtest-result-liveness" db fail "path=${DB}"
+    exit 0
+fi
+
+# Query last result: timestamp (epoch), status (completed/failed), OK flag.
+# SQLite datetime is stored as "YYYY-MM-DD HH:MM:SS" — convert to epoch via
+# strftime so we can emit a Unix timestamp gauge for vmalert staleness checks.
+read -r _last_ts _last_status _last_ok _fail_24h < <(
+    sqlite3 -separator ' ' "$DB" \
+        "SELECT strftime('%s', created_at), status, CASE WHEN status = 'completed' THEN 1 ELSE 0 END, (SELECT COUNT(*) FROM results WHERE status = 'failed' AND created_at >= datetime('now', '-24 hours')) FROM results ORDER BY id DESC LIMIT 1;"
+) 2>/dev/null || {
+    alert_event "speedtest-result-liveness" query fail "db=${DB}"
+    exit 0
+}
+
+if [ -z "$_last_ts" ]; then
+    alert_event "speedtest-result-liveness" query fail "no_results"
+    exit 0
+fi
+
+alert_event "speedtest-result-liveness" query ok \
+    "status=${_last_status}" "ok=${_last_ok}" "fails_24h=${_fail_24h}"
+
+# ── Observability: atomic textfile emit (silent-cron hard rule) ──────────
+numeric() { case "$1" in ''|*[!0-9.]*) echo 0 ;; *) echo "$1" ;; esac; }
+now=$(date +%s)
+last_ts=$(numeric "$_last_ts")
+last_ok=$(numeric "$_last_ok")
+fail_24h=$(numeric "$_fail_24h")
+
+if [ -d "$TEXTFILE_DIR" ]; then
+    tmp="${TEXTFILE}.$$"
+    if {
+        echo "# HELP speedtest_result_liveness_last_run_unix_seconds Unix time of the last liveness check run."
+        echo "# TYPE speedtest_result_liveness_last_run_unix_seconds gauge"
+        echo "speedtest_result_liveness_last_run_unix_seconds ${now}"
+        echo "# HELP speedtest_last_result_timestamp Unix timestamp of the last speedtest result."
+        echo "# TYPE speedtest_last_result_timestamp gauge"
+        echo "speedtest_last_result_timestamp ${last_ts}"
+        echo "# HELP speedtest_last_result_ok 1 if the last speedtest result status is completed, 0 if failed."
+        echo "# TYPE speedtest_last_result_ok gauge"
+        echo "speedtest_last_result_ok ${last_ok}"
+        echo "# HELP speedtest_failed_last_24h Number of failed speedtest results in the last 24 hours."
+        echo "# TYPE speedtest_failed_last_24h gauge"
+        echo "speedtest_failed_last_24h ${fail_24h}"
+    } > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$TEXTFILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+fi
+
+exit 0

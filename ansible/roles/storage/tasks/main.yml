@@ -1,0 +1,47 @@
+---
+- name: Create storage directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ storage_owner }}"
+    group: "{{ storage_group }}"
+    mode: "0755"
+  loop: "{{ storage_directories }}"
+  tags: [storage]
+
+- name: Remove obsolete storage paths (rmdir — fails silently on non-empty)
+  ansible.builtin.command:
+    cmd: "rmdir {{ item }}"
+    removes: "{{ item }}"
+  loop: "{{ storage_obsolete_directories | default([]) }}"
+  register: storage_obsolete_rm
+  changed_when: storage_obsolete_rm.rc == 0
+  failed_when: false
+  tags: [storage]
+
+- name: Include second data disk (ssd2) tasks
+  ansible.builtin.include_tasks:
+    file: ssd2.yml
+    apply:
+      tags: [storage, ssd2]
+  tags: [storage, ssd2]
+
+- name: Stat hardlink-critical paths
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ storage_hardlink_paths }}"
+  register: storage_hardlink_stats
+  when: storage_enforce_single_fs | bool
+  tags: [storage]
+
+- name: Assert hardlink paths share a single filesystem
+  ansible.builtin.assert:
+    that:
+      - storage_hardlink_stats.results | map(attribute='stat.dev') | unique | list | length == 1
+    fail_msg: >-
+      {{ storage_hardlink_paths | join(' and ') }} live on different filesystems
+      (device IDs: {{ storage_hardlink_stats.results | map(attribute='stat.dev') | list }}).
+      Sonarr/Radarr hardlinks will fail with EXDEV. See docs/runbooks/002-boot-recovery.md.
+    success_msg: "Hardlink invariant OK — all paths share device {{ storage_hardlink_stats.results[0].stat.dev }}."
+  when: storage_enforce_single_fs | bool
+  tags: [storage]
